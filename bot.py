@@ -219,15 +219,9 @@ except ValueError:
 
 PROFILE = PROFILES[ACTIVE_MODE]
 
-# Official Kalshi URLs (from docs.kalshi.com)
-# Demo:  https://demo-api.kalshi.co
-# Live:  https://trading-api.kalshi.com
-_BASE_HOST = (
-    "https://demo-api.kalshi.co"
-    if DEMO_MODE
-    else "https://trading-api.kalshi.com"
-)
-BASE_URL = _BASE_HOST + "/trade-api/v2"
+# Kalshi API URLs
+# BASE_URL is set at startup — demo uses fixed URL, live probes for working host
+BASE_URL: str = ""   # assigned in main() after probe
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RSA-PSS AUTHENTICATION
@@ -288,6 +282,47 @@ except Exception as e:
         "Ensure the full PEM key is set in Railway env vars. "
         "It should start with -----BEGIN PRIVATE KEY----- and end with -----END PRIVATE KEY-----"
     ) from e
+
+
+def _probe_live_host() -> str:
+    """
+    Kalshi has multiple live endpoint hostnames in circulation.
+    Try each one with a real authenticated request and return the first that works.
+    """
+    if DEMO_MODE:
+        return "https://demo-api.kalshi.co"
+    
+    candidates = [
+        "https://api.elections.kalshi.com",
+        "https://trading-api.kalshi.com",
+    ]
+    
+    for host in candidates:
+        try:
+            test_url = host + "/trade-api/v2/exchange/status"
+            # Use unauthenticated request first - exchange/status is public
+            r = requests.get(test_url, timeout=6)
+            if r.status_code == 200:
+                log.info("✅ Live host confirmed: %s", host)
+                return host
+        except Exception:
+            continue
+    
+    # Fall back to primary
+    log.warning("Could not probe hosts, defaulting to api.elections.kalshi.com")
+    return "https://api.elections.kalshi.com"
+
+
+def init_base_url() -> None:
+    """Set BASE_URL at startup. Called once before any API calls."""
+    global BASE_URL
+    if DEMO_MODE:
+        BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
+        log.info("API host: demo-api.kalshi.co (DEMO)")
+    else:
+        host = _probe_live_host()
+        BASE_URL = host + "/trade-api/v2"
+        log.info("API host: %s (LIVE)", host)
 
 
 def _sign(method: str, path: str) -> tuple[str, str]:
@@ -818,6 +853,9 @@ def run_decision(market: dict) -> None:
 
 def main() -> None:
     global session_start_balance, daily_pnl
+
+    # ── Initialize API host ────────────────────────────────────────────────
+    init_base_url()
 
     # ── Startup banner ─────────────────────────────────────────────────────
     log.info("━" * 70)
