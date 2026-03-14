@@ -202,7 +202,7 @@ def _require(key: str) -> str:
     return val
 
 KALSHI_API_KEY_ID      = _require("KALSHI_API_KEY_ID")
-KALSHI_PRIVATE_KEY_PEM = _require("KALSHI_PRIVATE_KEY_PEM").replace("\\n", "\n")
+_RAW_PEM               = _require("KALSHI_PRIVATE_KEY_PEM")
 DEMO_MODE              = os.environ.get("DEMO_MODE", "true").lower() == "true"
 TRADE_SIZE_DOLLARS     = float(os.environ.get("TRADE_SIZE_DOLLARS", "10"))
 MIN_WIN_RATE           = float(os.environ.get("MIN_WIN_RATE", "0.45"))
@@ -233,10 +233,57 @@ BASE_URL = (
 #   KALSHI-ACCESS-SIGNATURE → base64(RSA-PSS-SHA256(timestamp + method + path))
 # ─────────────────────────────────────────────────────────────────────────────
 
-_private_key = serialization.load_pem_private_key(
-    KALSHI_PRIVATE_KEY_PEM.encode("utf-8"),
-    password=None,
-)
+def _normalize_pem(raw: str) -> str:
+    """
+    Bulletproof PEM normalizer. Handles every way Railway/env vars can
+    mangle a multi-line PEM key:
+      - Literal \\n characters (typed as backslash-n)
+      - Spaces instead of newlines
+      - The key body all on one line after the header
+      - Extra whitespace or carriage returns
+    """
+    # Step 1: replace any literal \n sequences with real newlines
+    pem = raw.replace("\\n", "\n").replace("\\r", "").replace("\r", "")
+
+    # Step 2: if there are no real newlines at all, the whole thing is one line
+    # — reconstruct proper PEM structure
+    if "\n" not in pem:
+        # Try splitting on the header/footer markers
+        pem = pem.replace("-----BEGIN PRIVATE KEY-----", "-----BEGIN PRIVATE KEY-----\n")
+        pem = pem.replace("-----END PRIVATE KEY-----", "\n-----END PRIVATE KEY-----")
+        pem = pem.replace("-----BEGIN RSA PRIVATE KEY-----", "-----BEGIN RSA PRIVATE KEY-----\n")
+        pem = pem.replace("-----END RSA PRIVATE KEY-----", "\n-----END RSA PRIVATE KEY-----")
+
+    # Step 3: extract header, body, footer and re-wrap body at 64 chars
+    lines = [l.strip() for l in pem.strip().splitlines() if l.strip()]
+    header = next((l for l in lines if l.startswith("-----BEGIN")), None)
+    footer = next((l for l in lines if l.startswith("-----END")), None)
+    if not header or not footer:
+        raise ValueError(
+            "KALSHI_PRIVATE_KEY_PEM does not contain a valid PEM header/footer. "
+            "Check that the full key was pasted into Railway."
+        )
+    body_lines = [l for l in lines if not l.startswith("-----")]
+    body = "".join(body_lines)
+    # Re-wrap at 64 characters per PEM spec
+    wrapped = "\n".join(body[i:i+64] for i in range(0, len(body), 64))
+    return f"{header}\n{wrapped}\n{footer}\n"
+
+
+KALSHI_PRIVATE_KEY_PEM = _normalize_pem(_RAW_PEM)
+
+try:
+    _private_key = serialization.load_pem_private_key(
+        KALSHI_PRIVATE_KEY_PEM.encode("utf-8"),
+        password=None,
+    )
+    log.info("✅ RSA private key loaded successfully.")
+except Exception as e:
+    raise ValueError(
+        f"Failed to load KALSHI_PRIVATE_KEY_PEM: {e}\n"
+        "Ensure the full PEM key is set in Railway env vars. "
+        "It should start with -----BEGIN PRIVATE KEY----- and end with -----END PRIVATE KEY-----"
+    ) from e
 
 
 def _sign(method: str, path: str) -> tuple[str, str]:
