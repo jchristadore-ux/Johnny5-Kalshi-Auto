@@ -219,11 +219,15 @@ except ValueError:
 
 PROFILE = PROFILES[ACTIVE_MODE]
 
-BASE_URL = (
-    "https://demo-api.kalshi.co/trade-api/v2"
+# Official Kalshi URLs (from docs.kalshi.com)
+# Demo:  https://demo-api.kalshi.co
+# Live:  https://trading-api.kalshi.com
+_BASE_HOST = (
+    "https://demo-api.kalshi.co"
     if DEMO_MODE
-    else "https://api.elections.kalshi.com/trade-api/v2"
+    else "https://trading-api.kalshi.com"
 )
+BASE_URL = _BASE_HOST + "/trade-api/v2"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # RSA-PSS AUTHENTICATION
@@ -287,9 +291,13 @@ except Exception as e:
 
 
 def _sign(method: str, path: str) -> tuple[str, str]:
-    """Return (timestamp_ms_str, base64_signature)."""
+    """Return (timestamp_ms_str, base64_signature).
+    Kalshi requires signing: timestamp + METHOD + /trade-api/v2/path
+    (full path, no query string, per official docs)
+    """
     ts_ms = str(int(time.time() * 1000))
-    msg = (ts_ms + method.upper() + path).encode("utf-8")
+    full_path = "/trade-api/v2" + path  # path passed in is already short e.g. /portfolio/balance
+    msg = (ts_ms + method.upper() + full_path).encode("utf-8")
     sig = _private_key.sign(
         msg,
         padding.PSS(
