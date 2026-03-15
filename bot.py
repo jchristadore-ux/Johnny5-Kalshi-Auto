@@ -110,14 +110,14 @@ PROFILES: dict[TraderMode, dict] = {
     # Never touches longshots. Posts maker orders, sits in book patiently.
     TraderMode.DOMAHHHH: {
         "label":             "DOMAHHHH",
-        "description":       "$980K profit. High-conviction. 60–92c contracts. Avoids all longshots.",
-        "min_price":         60,
+        "description":       "$980K profit. High-conviction. 55–92c contracts. Avoids all longshots.",
+        "min_price":         55,   # loosened from 60 — captures more valid BTC markets
         "max_price":         92,
         "kelly_frac":        0.40,
-        "ob_thresh":         0.65,
+        "ob_thresh":         0.60, # loosened from 0.65 — BTC markets are thinner than politics
         "vol_filter":        "both",
         "maker_only":        True,
-        "min_edge":          0.06,
+        "min_edge":          0.04, # loosened from 0.06 — easier to trigger first trades
         "cooldown":          120,
         "cross_market":      False,
     },
@@ -427,19 +427,61 @@ def resolve_open_orders() -> None:
 # MARKET DISCOVERY
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Known Kalshi BTC series tickers to try in order of preference
+BTC_SERIES = ["KXBTCD", "KXBTC", "BTC", "BTCUSD"]
+
 def get_active_btc_market() -> Optional[dict]:
-    """Return the nearest-expiry open BTC up/down market."""
+    """Return the nearest-expiry open BTC up/down market, trying multiple series tickers."""
+    for series in BTC_SERIES:
+        try:
+            data = _get("/markets", {"series_ticker": series, "status": "open", "limit": 20})
+            markets = data.get("markets", [])
+            if not markets:
+                log.debug("No markets for series %s", series)
+                continue
+            # Log what we found for debugging
+            log.info("Series %s: %d open markets found", series, len(markets))
+            for m in markets[:3]:
+                log.info("  → %s | bid=%s ask=%s | close=%s",
+                    m.get("ticker","?"),
+                    m.get("yes_bid","?"),
+                    m.get("yes_ask","?"),
+                    m.get("close_time","?")[:16] if m.get("close_time") else "?"
+                )
+            # Filter to markets with valid pricing
+            valid = [m for m in markets
+                     if m.get("yes_bid", 0) > 0
+                     and m.get("yes_ask", 0) > 0
+                     and m.get("yes_bid", 0) < m.get("yes_ask", 100)]
+            if not valid:
+                log.info("Series %s: markets found but no valid bid/ask pricing", series)
+                continue
+            valid.sort(key=lambda m: m.get("close_time", "9999"))
+            log.info("✅ Trading market: %s (bid=%d ask=%d)",
+                valid[0].get("ticker"), valid[0].get("yes_bid"), valid[0].get("yes_ask"))
+            return valid[0]
+        except Exception as e:
+            log.warning("Market discovery failed for series %s: %s", series, e)
+            continue
+
+    # Last resort: search all open markets for any BTC price direction market
     try:
-        data = _get("/markets", {"series_ticker": "KXBTCD", "status": "open", "limit": 20})
+        log.info("Trying broad market search for BTC...")
+        data = _get("/markets", {"status": "open", "limit": 100})
         markets = data.get("markets", [])
-        if not markets:
-            return None
-        # Sort by close_time ascending → pick soonest expiry
-        markets.sort(key=lambda m: m.get("close_time", "9999"))
-        return markets[0]
+        btc_markets = [m for m in markets if
+                       any(k in m.get("ticker","").upper() for k in ["BTC","BITCOIN"]) and
+                       m.get("yes_bid", 0) > 0 and m.get("yes_ask", 0) > 0]
+        if btc_markets:
+            btc_markets.sort(key=lambda m: m.get("close_time", "9999"))
+            log.info("Broad search found %d BTC markets. Using: %s",
+                len(btc_markets), btc_markets[0].get("ticker"))
+            return btc_markets[0]
+        log.info("Broad search: no BTC markets with valid pricing found")
     except Exception as e:
-        log.warning("Market discovery failed: %s", e)
-        return None
+        log.warning("Broad market search failed: %s", e)
+
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -737,7 +779,7 @@ def run_decision(market: dict) -> None:
 
     # Sanity check market prices
     if yes_bid <= 0 or yes_ask <= 0 or yes_bid >= yes_ask:
-        log.debug("Market price anomaly: bid=%d ask=%d. Skipping.", yes_bid, yes_ask)
+        log.warning("Market price anomaly on %s: bid=%d ask=%d. Skipping.", ticker, yes_bid, yes_ask)
         return
 
     yes_mid = (yes_bid + yes_ask) // 2
@@ -758,7 +800,8 @@ def run_decision(market: dict) -> None:
 
     # ── Guard: no OB signal ────────────────────────────────────────────────
     if direction == "NONE":
-        log.debug("No OB signal.")
+        log.info("No OB signal (yes=%.0f%% no=%.0f%% thresh=%.0f%%) — skipping.",
+            imbalance*100, (1-imbalance)*100, PROFILE["ob_thresh"]*100)
         return
 
     # ── Guard: cooldown ────────────────────────────────────────────────────
