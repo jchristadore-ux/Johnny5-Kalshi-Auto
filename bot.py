@@ -461,14 +461,18 @@ def get_active_btc_market() -> Optional[dict]:
             if not valid:
                 log.info("Series %s: markets found but no valid bid/ask pricing", series)
                 continue
-            valid.sort(key=lambda m: m.get("close_time", "9999"))
+            # Inject cent fields into all valid markets
+            for m in valid:
+                m["yes_bid"] = to_cents(m.get("yes_bid_dollars"))
+                m["yes_ask"] = to_cents(m.get("yes_ask_dollars"))
+                m["yes_mid"] = (m["yes_bid"] + m["yes_ask"]) // 2
+
+            # Prefer the market whose YES mid is closest to 50c — most active/balanced
+            # Markets near expiry are priced 5c or 95c with no edge
+            valid.sort(key=lambda m: abs(m["yes_mid"] - 50))
             m0 = valid[0]
-            bid_c = to_cents(m0.get("yes_bid_dollars"))
-            ask_c = to_cents(m0.get("yes_ask_dollars"))
-            # Inject integer cent fields so the rest of the bot works unchanged
-            m0["yes_bid"] = bid_c
-            m0["yes_ask"] = ask_c
-            log.info("✅ Trading market: %s (bid=%dc ask=%dc)", m0.get("ticker"), bid_c, ask_c)
+            log.info("✅ Trading market: %s (bid=%dc mid=%dc ask=%dc)",
+                m0.get("ticker"), m0["yes_bid"], m0["yes_mid"], m0["yes_ask"])
             return m0
         except Exception as e:
             log.warning("Market discovery failed for series %s: %s", series, e)
@@ -508,7 +512,16 @@ def get_active_btc_market() -> Optional[dict]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_order_book(ticker: str) -> dict:
-    return _get(f"/markets/{ticker}/orderbook")
+    data = _get(f"/markets/{ticker}/orderbook")
+    ob = data.get("orderbook", {})
+    yes_levels = ob.get("yes", [])
+    no_levels  = ob.get("no",  [])
+    log.info("OB raw │ yes_levels=%d no_levels=%d │ sample_yes=%s sample_no=%s",
+        len(yes_levels), len(no_levels),
+        str(yes_levels[:2]) if yes_levels else "[]",
+        str(no_levels[:2])  if no_levels  else "[]",
+    )
+    return data
 
 
 def calc_ob_imbalance(ob_data: dict) -> tuple[float, str]:
@@ -526,7 +539,8 @@ def calc_ob_imbalance(ob_data: dict) -> tuple[float, str]:
     no_depth  = sum(qty for _, qty in no_levels[:5])  if no_levels  else 0
     total = yes_depth + no_depth
 
-    if total < 10:  # not enough liquidity to trust the signal
+    if total < 2:  # not enough liquidity to trust the signal (lowered for thin BTC markets)
+        log.info("OB │ Total depth %d too thin. NONE.", total)
         return 0.5, "NONE"
 
     yes_ratio = yes_depth / total
