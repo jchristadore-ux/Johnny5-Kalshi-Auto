@@ -512,14 +512,20 @@ def get_active_btc_market() -> Optional[dict]:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_order_book(ticker: str) -> dict:
+    """
+    Kalshi orderbook API returns data under 'orderbook_fp' (fractional precision).
+    Format: { "orderbook_fp": { "yes_dollars": [[price_str, qty_str], ...],
+                                 "no_dollars":  [[price_str, qty_str], ...] } }
+    The legacy 'orderbook' key with integer cents is no longer populated.
+    """
     data = _get(f"/markets/{ticker}/orderbook")
-    ob = data.get("orderbook", {})
-    yes_levels = ob.get("yes", [])
-    no_levels  = ob.get("no",  [])
-    log.info("OB raw │ yes_levels=%d no_levels=%d │ sample_yes=%s sample_no=%s",
+    ob_fp = data.get("orderbook_fp", {})
+    yes_levels = ob_fp.get("yes_dollars", [])
+    no_levels  = ob_fp.get("no_dollars",  [])
+    log.info("OB │ yes=%d levels no=%d levels │ top_yes=%s top_no=%s",
         len(yes_levels), len(no_levels),
-        str(yes_levels[:2]) if yes_levels else "[]",
-        str(no_levels[:2])  if no_levels  else "[]",
+        str(yes_levels[:1]) if yes_levels else "[]",
+        str(no_levels[:1])  if no_levels  else "[]",
     )
     return data
 
@@ -527,25 +533,37 @@ def get_order_book(ticker: str) -> dict:
 def calc_ob_imbalance(ob_data: dict) -> tuple[float, str]:
     """
     Returns (imbalance_ratio, direction).
-    Calculates depth-weighted imbalance between YES and NO sides.
-    Direction is "YES", "NO", or "NONE" (no signal).
+    Parses orderbook_fp (fractional precision) format.
+    Quantities are strings like "10.00" — sum them as floats.
     """
-    ob = ob_data.get("orderbook", {})
-    yes_levels = ob.get("yes", [])  # [[price, qty], ...]
-    no_levels  = ob.get("no",  [])
+    ob_fp = ob_data.get("orderbook_fp", {})
+    yes_levels = ob_fp.get("yes_dollars", [])
+    no_levels  = ob_fp.get("no_dollars",  [])
 
-    # Use only top-5 levels to avoid stale deep book depth skewing signal
-    yes_depth = sum(qty for _, qty in yes_levels[:5]) if yes_levels else 0
-    no_depth  = sum(qty for _, qty in no_levels[:5])  if no_levels  else 0
-    total = yes_depth + no_depth
+    def depth(levels: list, n: int = 5) -> float:
+        total = 0.0
+        for entry in levels[:n]:
+            try:
+                # entry is [price_str, qty_str]
+                total += float(entry[1])
+            except (IndexError, TypeError, ValueError):
+                pass
+        return total
 
-    if total < 2:  # not enough liquidity to trust the signal (lowered for thin BTC markets)
-        log.info("OB │ Total depth %d too thin. NONE.", total)
+    yes_depth = depth(yes_levels)
+    no_depth  = depth(no_levels)
+    total     = yes_depth + no_depth
+
+    if total < 1.0:
+        log.info("OB │ Total depth %.1f too thin. NONE.", total)
         return 0.5, "NONE"
 
     yes_ratio = yes_depth / total
     no_ratio  = no_depth  / total
     thresh    = PROFILE["ob_thresh"]
+
+    log.info("OB │ yes_depth=%.1f no_depth=%.1f yes_ratio=%.1f%% thresh=%.0f%%",
+        yes_depth, no_depth, yes_ratio * 100, thresh * 100)
 
     if yes_ratio >= thresh:
         return yes_ratio, "YES"
@@ -558,19 +576,21 @@ def calc_ob_imbalance(ob_data: dict) -> tuple[float, str]:
 # SIGNAL 2: BTC VOLATILITY REGIME
 # ─────────────────────────────────────────────────────────────────────────────
 
-def fetch_btc_price() -> Optional[float]:
-    """Pull BTC spot from Binance public endpoint. No API key needed."""
+def update_btc_price_from_market(market: dict) -> None:
+    """
+    Derive BTC price signal from Kalshi's own market data.
+    We use the last_price_dollars field which tracks the last traded price.
+    This avoids needing Binance (which Railway blocks outbound to).
+    We store the mid-price as a proxy for BTC momentum — if YES is rising,
+    market participants are pricing BTC going up.
+    """
     try:
-        r = requests.get(
-            "https://api.binance.com/api/v3/ticker/price",
-            params={"symbol": "BTCUSDT"},
-            timeout=5,
-        )
-        r.raise_for_status()
-        return float(r.json()["price"])
-    except Exception as e:
-        log.debug("BTC price fetch: %s", e)
-        return None
+        mid = market.get("yes_mid", 0)
+        if mid > 0:
+            # Use yes_mid as a proxy price series — changes in this signal momentum
+            btc_prices.append(float(mid))
+    except Exception:
+        pass
 
 
 def calc_realized_vol() -> float:
@@ -957,17 +977,15 @@ def main() -> None:
         loop_start = time.time()
 
         try:
-            # 1. BTC price update
-            price = fetch_btc_price()
-            if price and price > 0:
-                btc_prices.append(price)
-
-            # 2. Market discovery
+            # 1. Market discovery first (we derive price signal from it)
             market = get_active_btc_market()
             if not market:
                 log.info("No open BTC market. Waiting %ds...", POLL_INTERVAL)
                 time.sleep(POLL_INTERVAL)
                 continue
+
+            # 2. Update price signal from Kalshi market data (Binance blocked on Railway)
+            update_btc_price_from_market(market)
 
             # 3. Decision
             run_decision(market)
