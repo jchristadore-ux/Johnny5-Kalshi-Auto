@@ -428,7 +428,8 @@ def resolve_open_orders() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Known Kalshi BTC series tickers to try in order of preference
-BTC_SERIES = ["KXBTCD", "KXBTC", "BTC", "BTCUSD"]
+# KXBTC15M = BTC up/down 15-min | KXBTC = BTC price target markets
+BTC_SERIES = ["KXBTC15M", "KXBTCD", "KXBTC"]
 
 def get_active_btc_market() -> Optional[dict]:
     """Return the nearest-expiry open BTC up/down market, trying multiple series tickers."""
@@ -444,22 +445,31 @@ def get_active_btc_market() -> Optional[dict]:
             for m in markets[:3]:
                 log.info("  → %s | bid=%s ask=%s | close=%s",
                     m.get("ticker","?"),
-                    m.get("yes_bid","?"),
-                    m.get("yes_ask","?"),
+                    m.get("yes_bid_dollars","?"),
+                    m.get("yes_ask_dollars","?"),
                     m.get("close_time","?")[:16] if m.get("close_time") else "?"
                 )
             # Filter to markets with valid pricing
+            # API returns yes_bid_dollars as string e.g. "0.5600" — convert to cents int
+            def to_cents(val):
+                try: return int(round(float(val) * 100))
+                except: return 0
             valid = [m for m in markets
-                     if m.get("yes_bid", 0) > 0
-                     and m.get("yes_ask", 0) > 0
-                     and m.get("yes_bid", 0) < m.get("yes_ask", 100)]
+                     if to_cents(m.get("yes_bid_dollars")) > 0
+                     and to_cents(m.get("yes_ask_dollars")) > 0
+                     and to_cents(m.get("yes_bid_dollars")) < to_cents(m.get("yes_ask_dollars"))]
             if not valid:
                 log.info("Series %s: markets found but no valid bid/ask pricing", series)
                 continue
             valid.sort(key=lambda m: m.get("close_time", "9999"))
-            log.info("✅ Trading market: %s (bid=%d ask=%d)",
-                valid[0].get("ticker"), valid[0].get("yes_bid"), valid[0].get("yes_ask"))
-            return valid[0]
+            m0 = valid[0]
+            bid_c = to_cents(m0.get("yes_bid_dollars"))
+            ask_c = to_cents(m0.get("yes_ask_dollars"))
+            # Inject integer cent fields so the rest of the bot works unchanged
+            m0["yes_bid"] = bid_c
+            m0["yes_ask"] = ask_c
+            log.info("✅ Trading market: %s (bid=%dc ask=%dc)", m0.get("ticker"), bid_c, ask_c)
+            return m0
         except Exception as e:
             log.warning("Market discovery failed for series %s: %s", series, e)
             continue
@@ -469,14 +479,23 @@ def get_active_btc_market() -> Optional[dict]:
         log.info("Trying broad market search for BTC...")
         data = _get("/markets", {"status": "open", "limit": 100})
         markets = data.get("markets", [])
+        def _cv(v):
+            try: return float(v)
+            except: return 0.0
         btc_markets = [m for m in markets if
                        any(k in m.get("ticker","").upper() for k in ["BTC","BITCOIN"]) and
-                       m.get("yes_bid", 0) > 0 and m.get("yes_ask", 0) > 0]
+                       _cv(m.get("yes_bid_dollars")) > 0 and _cv(m.get("yes_ask_dollars")) > 0]
         if btc_markets:
             btc_markets.sort(key=lambda m: m.get("close_time", "9999"))
-            log.info("Broad search found %d BTC markets. Using: %s",
-                len(btc_markets), btc_markets[0].get("ticker"))
-            return btc_markets[0]
+            m0 = btc_markets[0]
+            def _tc(v):
+                try: return int(round(float(v)*100))
+                except: return 0
+            m0["yes_bid"] = _tc(m0.get("yes_bid_dollars"))
+            m0["yes_ask"] = _tc(m0.get("yes_ask_dollars"))
+            log.info("Broad search found %d BTC markets. Using: %s (bid=%dc ask=%dc)",
+                len(btc_markets), m0.get("ticker"), m0["yes_bid"], m0["yes_ask"])
+            return m0
         log.info("Broad search: no BTC markets with valid pricing found")
     except Exception as e:
         log.warning("Broad market search failed: %s", e)
