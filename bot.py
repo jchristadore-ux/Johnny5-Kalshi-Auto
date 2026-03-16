@@ -1015,7 +1015,7 @@ def run_decision(market: dict) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    global session_start_balance, daily_pnl
+    global session_start_balance, daily_pnl, active_tickers
 
     # ── Initialize API host ────────────────────────────────────────────────
     init_base_url()
