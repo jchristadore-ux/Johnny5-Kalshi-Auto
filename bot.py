@@ -941,7 +941,39 @@ def run_decision(market: dict) -> None:
         )
 
     # ── Contract price and edge ────────────────────────────────────────────
-    contract_price = yes_mid if direction == "YES" else (100 - yes_mid)
+    # CRITICAL: Express the OB signal via whichever side costs ≤65c.
+    # Buying YES at 80c requires 80% win rate to break even — we only have ~68%.
+    # If OB says YES but YES costs 80c, buy NO at 20c instead.
+    # Same directional view, positive EV.
+    YES_BREAKEVEN_PRICE = int(os.environ.get("YES_BREAKEVEN_PRICE", "65"))
+
+    if direction == "YES":
+        if yes_mid <= YES_BREAKEVEN_PRICE:
+            trade_direction = "YES"
+            contract_price  = yes_mid
+        else:
+            # YES is expensive — flip to NO to express the same momentum
+            # differently: "market is moving, ride the NO side which is cheap"
+            # Actually: if OB says 87% YES depth, that means YES is winning.
+            # Buying expensive YES has negative EV. Better to skip entirely.
+            # Only flip to NO if the OB signal is actually NO-dominant.
+            log.info(
+                "Price guard │ YES at %dc exceeds breakeven %dc. Skipping expensive entry.",
+                yes_mid, YES_BREAKEVEN_PRICE
+            )
+            return
+    else:  # direction == "NO"
+        no_price = 100 - yes_mid
+        if no_price <= YES_BREAKEVEN_PRICE:
+            trade_direction = "NO"
+            contract_price  = no_price
+        else:
+            log.info(
+                "Price guard │ NO at %dc exceeds breakeven %dc. Skipping expensive entry.",
+                no_price, YES_BREAKEVEN_PRICE
+            )
+            return
+
     edge = calc_edge(win_prob, contract_price)
 
     if edge < PROFILE["min_edge"]:
@@ -951,40 +983,31 @@ def run_decision(market: dict) -> None:
         )
         return
 
-    # ── Kelly sizing ───────────────────────────────────────────────────────
+    # ── Kelly sizing (based on contract we're actually buying) ────────────
     bet = kelly_bet_size(win_prob, contract_price)
     if bet < 0.50:
         log.info("Kelly size │ $%.2f too small to place.", bet)
         return
 
     # ── Maker limit price ──────────────────────────────────────────────────
-    # Post 1 cent better than current best to sit inside the order book
-    # rather than crossing the spread (maker not taker).
-    if direction == "YES":
-        # Improve on YES bid by 1c, but stay below ask
+    if trade_direction == "YES":
         limit_price = max(1, min(yes_bid + 1, yes_ask - 1))
     else:
-        # For NO, we're paying (100 - limit_price) in YES terms
-        # Improve on NO equivalent
-        no_best = 100 - yes_ask   # best NO bid in cents
+        no_best = 100 - yes_ask
         limit_price = max(1, min(no_best + 1, 100 - yes_bid - 1))
 
     limit_price = max(1, min(99, limit_price))
 
-    # Final sanity: don't place if limit is worse than contract_price materially
     if abs(limit_price - contract_price) > 8:
-        log.info(
-            "Limit price │ %dc too far from mid %dc. Skipping.",
-            limit_price, contract_price,
-        )
+        log.info("Limit price │ %dc too far from mid %dc. Skipping.", limit_price, contract_price)
         return
 
     log.info(
         "📈 SIGNAL │ %s │ WinProb: %.1f%% │ Edge: %.2f%% │ Bet: $%.2f │ Limit: %dc │ WR: %.1f%%",
-        direction, win_prob * 100, edge * 100, bet, limit_price, wr * 100,
+        trade_direction, win_prob * 100, edge * 100, bet, limit_price, wr * 100,
     )
 
-    place_limit_order(ticker, direction, bet, limit_price)
+    place_limit_order(ticker, trade_direction, bet, limit_price)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
