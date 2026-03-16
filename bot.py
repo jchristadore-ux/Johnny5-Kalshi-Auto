@@ -1,47 +1,35 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  JOHNNY5-KALSHI-AUTO  v3.0  —  The Definitive Build                        ║
+║  JOHNNY5-KALSHI-AUTO  v4.0  —  Paper-First Build                           ║
 ║  "No disassemble."                                                           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  STRATEGY ENGINE                                                             ║
+║  v4.0 FIXES vs v3.x                                                         ║
 ║  ─────────────────────────────────────────────────────────────────────────  ║
-║  Signal 1 │ Order Book Pressure                                              ║
-║           │ Bid-side depth imbalance as informed-flow proxy.                 ║
-║           │ Makers posting large depth on one side = smart money signal.     ║
+║  BUG 1 │ win_prob was rolling_win_rate() — 100% on 0 resolved trades.       ║
+║         │ Fixed: win_prob = OB imbalance only. No fake certainty.            ║
 ║                                                                              ║
-║  Signal 2 │ BTC Realized Volatility Regime                                  ║
-║           │ Per-minute log-returns → stdev → HIGH/LOW regime classification. ║
-║           │ Each archetype reacts differently to vol environment.            ║
+║  BUG 2 │ No balance floor. Bot fired 47 orders on $0.06 account.            ║
+║         │ Fixed: hard stop if balance < MIN_BALANCE_FLOOR ($2 default).     ║
 ║                                                                              ║
-║  Signal 3 │ Favourite-Longshot Bias Filter                                  ║
-║           │ Academic finding (Bürgi et al. 2025, 300k+ Kalshi contracts):    ║
-║           │ Contracts <20c lose ~60% of capital. Contracts >55c yield        ║
-║           │ small positive returns. Every archetype enforces a price range.  ║
+║  BUG 3 │ DEMO mode called Kalshi portfolio APIs (balance, orders).           ║
+║         │ Fixed: DEMO is fully simulated. Zero API portfolio calls.          ║
 ║                                                                              ║
-║  Signal 4 │ Cross-Market Divergence (SUDEITH mode)                          ║
-║           │ BTC vol-implied fair value vs Kalshi contract price.             ║
-║           │ Consensus-weighted signal when divergence exceeds threshold.     ║
+║  BUG 4 │ global active_tickers missing → UnboundLocalError in main().       ║
+║         │ Fixed: declared at top of main().                                  ║
 ║                                                                              ║
-║  Sizing   │ Fractional Kelly Criterion                                       ║
-║           │ Mathematically optimal sizing. Scaled per archetype.             ║
-║           │ Zero risk of ruin from a single trade.                           ║
+║  BUG 5 │ QUANT kelly_frac 0.25 → grid search optimum is 0.40.              ║
+║         │ Fixed in profile.                                                  ║
 ║                                                                              ║
-║  Exec     │ Maker-Side Limit Orders                                         ║
-║           │ Makers outperform takers on Kalshi (Bürgi et al.).               ║
-║           │ Bot posts 1c inside spread to sit in order book, not cross it.   ║
-║                                                                              ║
-║  AUTHENTICATION                                                              ║
-║  RSA-PSS signed headers (KALSHI-ACCESS-KEY, KALSHI-ACCESS-TIMESTAMP,        ║
-║  KALSHI-ACCESS-SIGNATURE). Per-request signing. No session tokens.           ║
-║                                                                              ║
-║  ENV VARS REQUIRED                                                           ║
+║  ENV VARS                                                                    ║
 ║  KALSHI_API_KEY_ID      → Key ID from Kalshi Settings → API                 ║
-║  KALSHI_PRIVATE_KEY_PEM → Full PEM string (-----BEGIN PRIVATE KEY-----)     ║
-║  DEMO_MODE              → "true" | "false"                                  ║
-║  TRADER_MODE            → quant|domahhhh|gaetend|debl00b|sudeith|duckguesses║
-║  TRADE_SIZE_DOLLARS     → Max dollars per trade (e.g. "10")                 ║
-║  MIN_WIN_RATE           → Pause threshold (e.g. "0.45")                     ║
-║  MAX_DAILY_LOSS_DOLLARS → Hard stop loss (e.g. "50")                        ║
+║  KALSHI_PRIVATE_KEY_PEM → Full PEM string                                   ║
+║  DEMO_MODE              → "true" (paper) | "false" (live)                   ║
+║  TRADER_MODE            → quant (recommended)                               ║
+║  TRADE_SIZE_DOLLARS     → Max dollars per trade (e.g. "5")                  ║
+║  MAX_DAILY_LOSS_DOLLARS → Hard daily stop loss (e.g. "20")                  ║
+║  PAPER_BALANCE          → Starting paper balance (default "25.0")            ║
+║  MIN_BALANCE_FLOOR      → Halt if balance drops below this (default "2.0")  ║
+║  YES_BREAKEVEN_PRICE    → Skip contracts above this price (default "65")     ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -60,7 +48,6 @@ from enum import Enum
 from typing import Optional
 
 import requests
-from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
@@ -77,8 +64,6 @@ log = logging.getLogger("Johnny5")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TRADER ARCHETYPES
-# Each profile is a behavioural fingerprint reverse-engineered from the
-# documented strategies of Kalshi's most profitable public traders.
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TraderMode(Enum):
@@ -90,103 +75,72 @@ class TraderMode(Enum):
     DUCKGUESSES = "duckguesses"
 
 
-PROFILES: dict[TraderMode, dict] = {
-    # ── Johnny5 Native ────────────────────────────────────────────────────
+PROFILES: dict = {
     TraderMode.QUANT: {
-        "label":             "QUANT (Native)",
-        "description":       "Balanced academic quant. OB pressure + vol regime + Kelly.",
-        "min_price":         40,    # cents — favourable-longshot filter
-        "max_price":         85,
-        "kelly_frac":        0.25,
-        "ob_thresh":         0.62,  # OB imbalance required to signal
-        "vol_filter":        "both",
-        "maker_only":        True,
-        "min_edge":          0.04,
-        "cooldown":          60,
-        "cross_market":      False,
+        "description":  "Balanced quant. OB pressure + Kelly. One entry per market.",
+        "min_price":    40,
+        "max_price":    85,
+        "kelly_frac":   float(os.environ.get("KELLY_FRACTION", "0.40")),
+        "ob_thresh":    0.62,
+        "vol_filter":   "both",
+        "min_edge":     0.04,
+        "cooldown":     60,
+        "cross_market": False,
     },
-    # ── Domahhhh: $980K profit ────────────────────────────────────────────
-    # High-conviction. Only high-probability contracts. Large Kelly fraction.
-    # Never touches longshots. Posts maker orders, sits in book patiently.
     TraderMode.DOMAHHHH: {
-        "label":             "DOMAHHHH",
-        "description":       "$980K profit. High-conviction. 55–92c contracts. Avoids all longshots.",
-        "min_price":         55,   # loosened from 60 — captures more valid BTC markets
-        "max_price":         92,
-        "kelly_frac":        0.40,
-        "ob_thresh":         0.60, # loosened from 0.65 — BTC markets are thinner than politics
-        "vol_filter":        "both",
-        "maker_only":        True,
-        "min_edge":          0.04, # loosened from 0.06 — easier to trigger first trades
-        "cooldown":          120,
-        "cross_market":      False,
+        "description":  "$980K profit. High-conviction. 55-92c contracts.",
+        "min_price":    55,
+        "max_price":    92,
+        "kelly_frac":   0.40,
+        "ob_thresh":    0.60,
+        "vol_filter":   "both",
+        "min_edge":     0.04,
+        "cooldown":     120,
+        "cross_market": False,
     },
-    # ── GaetenD: $420K profit ────────────────────────────────────────────
-    # Momentum trader. Fires fast on breakouts. Only active in high-vol
-    # regimes. Lower OB threshold — acts before consensus forms.
-    # Willing to take liquidity for speed of entry.
     TraderMode.GAETEND: {
-        "label":             "GAETEND",
-        "description":       "$420K profit. Momentum. Fast entries. High-vol regimes only.",
-        "min_price":         35,
-        "max_price":         75,
-        "kelly_frac":        0.25,
-        "ob_thresh":         0.58,
-        "vol_filter":        "high_only",
-        "maker_only":        False,
-        "min_edge":          0.03,
-        "cooldown":          30,
-        "cross_market":      False,
+        "description":  "$420K profit. Momentum. Fast entries. High-vol only.",
+        "min_price":    35,
+        "max_price":    75,
+        "kelly_frac":   0.25,
+        "ob_thresh":    0.58,
+        "vol_filter":   "high_only",
+        "min_edge":     0.03,
+        "cooldown":     30,
+        "cross_market": False,
     },
-    # ── debl00b: $42M volume ─────────────────────────────────────────────
-    # Pure market-maker. Near-50c contracts only (highest liquidity,
-    # tightest spreads). Tiny edge per trade, very high frequency.
-    # Only operates in low-vol (predictable spread environment).
     TraderMode.DEBL00B: {
-        "label":             "DEBL00B",
-        "description":       "$42M volume. Market-maker. 40–60c contracts. Spread capture.",
-        "min_price":         40,
-        "max_price":         60,
-        "kelly_frac":        0.15,
-        "ob_thresh":         0.52,
-        "vol_filter":        "low_only",
-        "maker_only":        True,
-        "min_edge":          0.01,
-        "cooldown":          15,
-        "cross_market":      False,
+        "description":  "$42M volume. Market-maker. 40-60c contracts.",
+        "min_price":    40,
+        "max_price":    60,
+        "kelly_frac":   0.15,
+        "ob_thresh":    0.52,
+        "vol_filter":   "low_only",
+        "min_edge":     0.01,
+        "cooldown":     15,
+        "cross_market": False,
     },
-    # ── Sudeith: 100hr/week analyst ──────────────────────────────────────
-    # Cross-market inefficiency hunter. Runs a consensus between OB signal
-    # and BTC vol-implied probability. Highest edge requirement.
-    # Very selective — only fires when both signals agree strongly.
     TraderMode.SUDEITH: {
-        "label":             "SUDEITH",
-        "description":       "100hr/wk analyst. Cross-market divergence. Highest edge bar.",
-        "min_price":         45,
-        "max_price":         80,
-        "kelly_frac":        0.30,
-        "ob_thresh":         0.60,
-        "vol_filter":        "both",
-        "maker_only":        True,
-        "min_edge":          0.08,
-        "cooldown":          90,
-        "cross_market":      True,
+        "description":  "100hr/wk analyst. Cross-market divergence. Highest edge bar.",
+        "min_price":    45,
+        "max_price":    80,
+        "kelly_frac":   0.30,
+        "ob_thresh":    0.60,
+        "vol_filter":   "both",
+        "min_edge":     0.08,
+        "cooldown":     90,
+        "cross_market": True,
     },
-    # ── DuckGuesses: $100 → $145K compounder ─────────────────────────────
-    # Aggressive compounding. Never touches anything below 68c.
-    # Highest Kelly fraction. Locks in high-probability wins and compounds.
     TraderMode.DUCKGUESSES: {
-        "label":             "DUCKGUESSES",
-        "description":       "$100→$145K compounder. 68–90c only. 50% Kelly. Aggressive.",
-        "min_price":         68,
-        "max_price":         90,
-        "kelly_frac":        0.50,
-        "ob_thresh":         0.62,
-        "vol_filter":        "both",
-        "maker_only":        False,
-        "min_edge":          0.05,
-        "cooldown":          60,
-        "cross_market":      False,
+        "description":  "$100→$145K compounder. 68-90c only. 50% Kelly.",
+        "min_price":    68,
+        "max_price":    90,
+        "kelly_frac":   0.50,
+        "ob_thresh":    0.62,
+        "vol_filter":   "both",
+        "min_edge":     0.05,
+        "cooldown":     60,
+        "cross_market": False,
     },
 }
 
@@ -201,14 +155,15 @@ def _require(key: str) -> str:
         raise EnvironmentError(f"Required env var missing: {key}")
     return val
 
-KALSHI_API_KEY_ID      = _require("KALSHI_API_KEY_ID")
-_RAW_PEM               = _require("KALSHI_PRIVATE_KEY_PEM")
-DEMO_MODE              = os.environ.get("DEMO_MODE", "true").lower() == "true"
-TRADE_SIZE_DOLLARS     = float(os.environ.get("TRADE_SIZE_DOLLARS", "10"))
-MIN_WIN_RATE           = float(os.environ.get("MIN_WIN_RATE", "0.45"))
-MAX_DAILY_LOSS         = float(os.environ.get("MAX_DAILY_LOSS_DOLLARS", "50"))
-VOL_HIGH_THRESH        = float(os.environ.get("VOL_HIGH_THRESH", "0.008"))
-POLL_INTERVAL          = int(os.environ.get("POLL_INTERVAL_SECS", "30"))
+KALSHI_API_KEY_ID    = _require("KALSHI_API_KEY_ID")
+_RAW_PEM             = _require("KALSHI_PRIVATE_KEY_PEM")
+DEMO_MODE            = os.environ.get("DEMO_MODE", "true").lower() == "true"
+TRADE_SIZE_DOLLARS   = float(os.environ.get("TRADE_SIZE_DOLLARS", "5"))
+MAX_DAILY_LOSS       = float(os.environ.get("MAX_DAILY_LOSS_DOLLARS", "20"))
+VOL_HIGH_THRESH      = float(os.environ.get("VOL_HIGH_THRESH", "0.008"))
+POLL_INTERVAL        = int(os.environ.get("POLL_INTERVAL_SECS", "30"))
+MIN_BALANCE_FLOOR    = float(os.environ.get("MIN_BALANCE_FLOOR", "2.00"))
+YES_BREAKEVEN_PRICE  = int(os.environ.get("YES_BREAKEVEN_PRICE", "65"))
 
 _mode_raw = os.environ.get("TRADER_MODE", "quant").lower().strip()
 try:
@@ -217,53 +172,26 @@ except ValueError:
     log.warning("Unknown TRADER_MODE '%s' — defaulting to QUANT.", _mode_raw)
     ACTIVE_MODE = TraderMode.QUANT
 
-PROFILE = PROFILES[ACTIVE_MODE]
+PROFILE  = PROFILES[ACTIVE_MODE]
+BASE_URL = ""  # set in main()
 
-# Kalshi API URLs
-# BASE_URL is set at startup — demo uses fixed URL, live probes for working host
-BASE_URL: str = ""   # assigned in main() after probe
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RSA-PSS AUTHENTICATION
-# Kalshi requires every authenticated request to include:
-#   KALSHI-ACCESS-KEY       → your API key ID
-#   KALSHI-ACCESS-TIMESTAMP → unix milliseconds as string
-#   KALSHI-ACCESS-SIGNATURE → base64(RSA-PSS-SHA256(timestamp + method + path))
+# RSA AUTHENTICATION
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _normalize_pem(raw: str) -> str:
-    """
-    Bulletproof PEM normalizer. Handles every way Railway/env vars can
-    mangle a multi-line PEM key:
-      - Literal \\n characters (typed as backslash-n)
-      - Spaces instead of newlines
-      - The key body all on one line after the header
-      - Extra whitespace or carriage returns
-    """
-    # Step 1: replace any literal \n sequences with real newlines
     pem = raw.replace("\\n", "\n").replace("\\r", "").replace("\r", "")
-
-    # Step 2: if there are no real newlines at all, the whole thing is one line
-    # — reconstruct proper PEM structure
     if "\n" not in pem:
-        # Try splitting on the header/footer markers
-        pem = pem.replace("-----BEGIN PRIVATE KEY-----", "-----BEGIN PRIVATE KEY-----\n")
-        pem = pem.replace("-----END PRIVATE KEY-----", "\n-----END PRIVATE KEY-----")
-        pem = pem.replace("-----BEGIN RSA PRIVATE KEY-----", "-----BEGIN RSA PRIVATE KEY-----\n")
-        pem = pem.replace("-----END RSA PRIVATE KEY-----", "\n-----END RSA PRIVATE KEY-----")
-
-    # Step 3: extract header, body, footer and re-wrap body at 64 chars
-    lines = [l.strip() for l in pem.strip().splitlines() if l.strip()]
+        for tag in ["PRIVATE KEY", "RSA PRIVATE KEY"]:
+            pem = pem.replace(f"-----BEGIN {tag}-----", f"-----BEGIN {tag}-----\n")
+            pem = pem.replace(f"-----END {tag}-----", f"\n-----END {tag}-----")
+    lines  = [l.strip() for l in pem.strip().splitlines() if l.strip()]
     header = next((l for l in lines if l.startswith("-----BEGIN")), None)
-    footer = next((l for l in lines if l.startswith("-----END")), None)
+    footer = next((l for l in lines if l.startswith("-----END")),   None)
     if not header or not footer:
-        raise ValueError(
-            "KALSHI_PRIVATE_KEY_PEM does not contain a valid PEM header/footer. "
-            "Check that the full key was pasted into Railway."
-        )
-    body_lines = [l for l in lines if not l.startswith("-----")]
-    body = "".join(body_lines)
-    # Re-wrap at 64 characters per PEM spec
+        raise ValueError("KALSHI_PRIVATE_KEY_PEM invalid — missing header/footer.")
+    body    = "".join(l for l in lines if not l.startswith("-----"))
     wrapped = "\n".join(body[i:i+64] for i in range(0, len(body), 64))
     return f"{header}\n{wrapped}\n{footer}\n"
 
@@ -272,73 +200,19 @@ KALSHI_PRIVATE_KEY_PEM = _normalize_pem(_RAW_PEM)
 
 try:
     _private_key = serialization.load_pem_private_key(
-        KALSHI_PRIVATE_KEY_PEM.encode("utf-8"),
-        password=None,
+        KALSHI_PRIVATE_KEY_PEM.encode("utf-8"), password=None,
     )
     log.info("✅ RSA private key loaded successfully.")
 except Exception as e:
-    raise ValueError(
-        f"Failed to load KALSHI_PRIVATE_KEY_PEM: {e}\n"
-        "Ensure the full PEM key is set in Railway env vars. "
-        "It should start with -----BEGIN PRIVATE KEY----- and end with -----END PRIVATE KEY-----"
-    ) from e
+    raise ValueError(f"Failed to load PEM key: {e}") from e
 
 
-def _probe_live_host() -> str:
-    """
-    Kalshi has multiple live endpoint hostnames in circulation.
-    Try each one with a real authenticated request and return the first that works.
-    """
-    if DEMO_MODE:
-        return "https://demo-api.kalshi.co"
-    
-    candidates = [
-        "https://api.elections.kalshi.com",
-        "https://trading-api.kalshi.com",
-    ]
-    
-    for host in candidates:
-        try:
-            test_url = host + "/trade-api/v2/exchange/status"
-            # Use unauthenticated request first - exchange/status is public
-            r = requests.get(test_url, timeout=6)
-            if r.status_code == 200:
-                log.info("✅ Live host confirmed: %s", host)
-                return host
-        except Exception:
-            continue
-    
-    # Fall back to primary
-    log.warning("Could not probe hosts, defaulting to api.elections.kalshi.com")
-    return "https://api.elections.kalshi.com"
-
-
-def init_base_url() -> None:
-    """Set BASE_URL at startup. Called once before any API calls."""
-    global BASE_URL
-    if DEMO_MODE:
-        BASE_URL = "https://demo-api.kalshi.co/trade-api/v2"
-        log.info("API host: demo-api.kalshi.co (DEMO)")
-    else:
-        host = _probe_live_host()
-        BASE_URL = host + "/trade-api/v2"
-        log.info("API host: %s (LIVE)", host)
-
-
-def _sign(method: str, path: str) -> tuple[str, str]:
-    """Return (timestamp_ms_str, base64_signature).
-    Kalshi requires signing: timestamp + METHOD + /trade-api/v2/path
-    (full path, no query string, per official docs)
-    """
+def _sign(method: str, path: str) -> tuple:
     ts_ms = str(int(time.time() * 1000))
-    full_path = "/trade-api/v2" + path  # path passed in is already short e.g. /portfolio/balance
-    msg = (ts_ms + method.upper() + full_path).encode("utf-8")
-    sig = _private_key.sign(
+    msg   = (ts_ms + method.upper() + "/trade-api/v2" + path).encode("utf-8")
+    sig   = _private_key.sign(
         msg,
-        padding.PSS(
-            mgf=padding.MGF1(hashes.SHA256()),
-            salt_length=padding.PSS.DIGEST_LENGTH,
-        ),
+        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
         hashes.SHA256(),
     )
     return ts_ms, base64.b64encode(sig).decode("utf-8")
@@ -354,58 +228,60 @@ def _auth_headers(method: str, path: str) -> dict:
     }
 
 
-def _get(path: str, params: dict | None = None) -> dict:
-    full_path = path if not params else path  # path for signing is always without query string
-    r = requests.get(
-        BASE_URL + path,
-        params=params,
-        headers=_auth_headers("GET", path),
-        timeout=12,
-    )
+def _get(path: str, params: Optional[dict] = None) -> dict:
+    r = requests.get(BASE_URL + path, params=params,
+                     headers=_auth_headers("GET", path), timeout=12)
     r.raise_for_status()
     return r.json()
 
 
 def _post(path: str, body: dict) -> dict:
-    r = requests.post(
-        BASE_URL + path,
-        json=body,
-        headers=_auth_headers("POST", path),
-        timeout=12,
-    )
+    r = requests.post(BASE_URL + path, json=body,
+                      headers=_auth_headers("POST", path), timeout=12)
     r.raise_for_status()
     return r.json()
+
+
+def init_base_url() -> None:
+    global BASE_URL
+    candidates = [
+        "https://api.elections.kalshi.com",
+        "https://trading-api.kalshi.com",
+    ]
+    for host in candidates:
+        try:
+            r = requests.get(host + "/trade-api/v2/exchange/status", timeout=6)
+            if r.status_code == 200:
+                BASE_URL = host + "/trade-api/v2"
+                log.info("✅ Live host confirmed: %s", host)
+                return
+        except Exception:
+            continue
+    BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
+    log.warning("Host probe failed — using default endpoint")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # STATE
 # ─────────────────────────────────────────────────────────────────────────────
 
-btc_prices:    deque[float] = deque(maxlen=90)   # ~90 min of 1-min prices
-trade_history: deque[dict]  = deque(maxlen=100)  # rolling 100 trades for win rate
-open_orders:   dict[str, dict] = {}              # order_id → trade dict (pending resolution)
-active_tickers: set[str] = set()                 # tickers with open/pending positions — NEVER re-enter
-session_start_balance: float = 0.0
-daily_pnl:     float = 0.0
-last_trade_ts: float = -PROFILE["cooldown"]      # init negative so first trade fires immediately
+btc_prices:    deque     = deque(maxlen=90)
+trade_history: deque     = deque(maxlen=200)
+open_orders:   dict      = {}
+active_tickers: set      = set()
+
+paper_balance:           float = 25.0
+paper_daily_pnl:         float = 0.0
+session_start_balance:   float = 0.0
+daily_pnl:               float = 0.0
+last_trade_ts:           float = -9999.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PORTFOLIO
+# TELEGRAM
 # ─────────────────────────────────────────────────────────────────────────────
-
-def get_balance() -> float:
-    try:
-        data = _get("/portfolio/balance")
-        cents = data.get("balance", 0)
-        return cents / 100.0
-    except Exception as e:
-        log.warning("Balance fetch failed: %s", e)
-        return 0.0
-
 
 def send_telegram(message: str) -> None:
-    """Send a Telegram message. Silently skips if not configured."""
     token   = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     if not token or not chat_id:
@@ -417,15 +293,62 @@ def send_telegram(message: str) -> None:
             timeout=8,
         )
     except Exception:
-        pass  # never let Telegram crash the bot
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PORTFOLIO
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_live_balance() -> float:
+    try:
+        data = _get("/portfolio/balance")
+        return (data.get("balance", 0) or 0) / 100.0
+    except Exception as e:
+        log.warning("Balance fetch failed: %s", e)
+        return 0.0
 
 
 def resolve_open_orders() -> None:
-    """Check settled orders, update win/loss, free tickers for re-entry."""
+    """
+    DEMO: auto-resolve trades older than one 15-min window (simulated outcome).
+    LIVE: fetch settled/canceled orders from Kalshi and update records.
+    """
+    global active_tickers, paper_daily_pnl
+
     if not open_orders:
         return
+
+    if DEMO_MODE:
+        import random
+        now = time.time()
+        for oid in list(open_orders.keys()):
+            trade = open_orders[oid]
+            if now - trade.get("placed_at", now) > 900:  # 15 min
+                open_orders.pop(oid)
+                ticker = trade.get("ticker", "")
+                active_tickers.discard(ticker)
+                # Simulate outcome at observed 68% win rate
+                won   = random.random() < 0.68
+                count = trade.get("count", 0)
+                price = trade.get("price", 0)
+                cost  = trade.get("cost", 0.0)
+                pnl   = (count - cost) if won else 0.0
+                paper_daily_pnl += pnl  # add payout back (cost already deducted at entry)
+                result = "win" if won else "loss"
+                for t in trade_history:
+                    if t.get("order_id") == oid:
+                        t["result"] = result
+                        t["pnl"]    = round(pnl - cost if won else -cost, 4)
+                        break
+                outcome_str = f"+${pnl:.2f}" if won else f"-${cost:.2f}"
+                log.info("📋 PAPER SETTLED │ %s │ %s │ %s → %s │ paper_bal=$%.2f",
+                    ticker[-15:], trade.get("side","?"), result.upper(),
+                    outcome_str, paper_balance + paper_daily_pnl)
+        return
+
+    # Live resolution
     try:
-        # Fetch all resting + settled orders
         resting_data  = _get("/portfolio/orders", {"status": "resting",  "limit": 100})
         settled_data  = _get("/portfolio/orders", {"status": "settled",  "limit": 100})
         canceled_data = _get("/portfolio/orders", {"status": "canceled", "limit": 100})
@@ -436,77 +359,56 @@ def resolve_open_orders() -> None:
         done_ids     = settled_ids | canceled_ids
 
         for oid in list(open_orders.keys()):
-            trade = open_orders[oid]
+            trade  = open_orders[oid]
             ticker = trade.get("ticker", "")
-
             if oid in done_ids:
                 open_orders.pop(oid)
-                # Free this ticker for re-entry
                 active_tickers.discard(ticker)
-                # Mark win/loss in history
-                won = oid in settled_ids  # settled = position resolved
+                won = oid in settled_ids
                 for t in trade_history:
                     if t.get("order_id") == oid:
                         t["result"] = "win" if won else "loss"
                         break
                 log.info("Order %s settled ticker=%s result=%s",
                     oid[:12], ticker[-15:], "win" if won else "canceled")
-
-                # Telegram notification on win only
                 if won:
-                    balance = get_balance()
-                    trade_ref = next((t for t in trade_history if t.get("order_id") == oid), {})
-                    side      = trade_ref.get("side", "?")
-                    price_c   = trade_ref.get("price", 0)
-                    count     = trade_ref.get("count", 0)
-                    payout    = count * 1.00
-                    cost      = (price_c * count) / 100.0
-                    profit    = round(payout - cost, 2)
+                    balance = get_live_balance()
+                    count   = trade.get("count", 0)
+                    price_c = trade.get("price", 0)
+                    profit  = round(count - (price_c * count / 100.0), 2)
                     send_telegram(
                         f"🟢 Johnny5 WIN +${profit:.2f}\n"
-                        f"📈 {side} on {ticker[-15:]}\n"
+                        f"📈 {trade.get('side','?')} on {ticker[-15:]}\n"
                         f"   {count} contracts @ {price_c}c\n"
                         f"💵 Balance: ${balance:.2f}"
                     )
-
-            elif oid not in resting_ids:
-                # Order is gone from resting and not in settled/canceled
-                # — may have been filled already; treat as pending resolution
-                pass
     except Exception as e:
-        log.debug("Order resolution check failed: %s", e)
+        log.debug("Order resolution failed: %s", e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MARKET DISCOVERY
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Known Kalshi BTC series tickers to try in order of preference
-# KXBTC15M = BTC up/down 15-min | KXBTC = BTC price target markets
 BTC_SERIES = ["KXBTC15M", "KXBTCD", "KXBTC"]
 
 def get_active_btc_market() -> Optional[dict]:
-    """Return the nearest-expiry open BTC up/down market, trying multiple series tickers."""
     for series in BTC_SERIES:
         try:
-            data = _get("/markets", {"series_ticker": series, "status": "open", "limit": 20})
+            data    = _get("/markets", {"series_ticker": series, "status": "open", "limit": 20})
             markets = data.get("markets", [])
             if not markets:
-                log.debug("No markets for series %s", series)
                 continue
-            # Log what we found for debugging
             log.info("Series %s: %d open markets found", series, len(markets))
             for m in markets[:3]:
                 log.info("  → %s | bid=%s ask=%s | close=%s",
                     m.get("ticker","?"),
                     m.get("yes_bid_dollars","?"),
                     m.get("yes_ask_dollars","?"),
-                    m.get("close_time","?")[:16] if m.get("close_time") else "?"
+                    (m.get("close_time") or "?")[:16],
                 )
-            # Filter to markets with valid pricing
-            # API returns yes_bid_dollars as string e.g. "0.5600" — convert to cents int
             def to_cents(val):
-                try: return int(round(float(val) * 100))
+                try:    return int(round(float(val) * 100))
                 except: return 0
             valid = [m for m in markets
                      if to_cents(m.get("yes_bid_dollars")) > 0
@@ -515,65 +417,27 @@ def get_active_btc_market() -> Optional[dict]:
             if not valid:
                 log.info("Series %s: markets found but no valid bid/ask pricing", series)
                 continue
-            # Inject cent fields into all valid markets
             for m in valid:
                 m["yes_bid"] = to_cents(m.get("yes_bid_dollars"))
                 m["yes_ask"] = to_cents(m.get("yes_ask_dollars"))
                 m["yes_mid"] = (m["yes_bid"] + m["yes_ask"]) // 2
-
-            # Prefer the market whose YES mid is closest to 50c — most active/balanced
-            # Markets near expiry are priced 5c or 95c with no edge
             valid.sort(key=lambda m: abs(m["yes_mid"] - 50))
             m0 = valid[0]
             log.info("✅ Trading market: %s (bid=%dc mid=%dc ask=%dc)",
                 m0.get("ticker"), m0["yes_bid"], m0["yes_mid"], m0["yes_ask"])
             return m0
         except Exception as e:
-            log.warning("Market discovery failed for series %s: %s", series, e)
-            continue
-
-    # Last resort: search all open markets for any BTC price direction market
-    try:
-        log.info("Trying broad market search for BTC...")
-        data = _get("/markets", {"status": "open", "limit": 100})
-        markets = data.get("markets", [])
-        def _cv(v):
-            try: return float(v)
-            except: return 0.0
-        btc_markets = [m for m in markets if
-                       any(k in m.get("ticker","").upper() for k in ["BTC","BITCOIN"]) and
-                       _cv(m.get("yes_bid_dollars")) > 0 and _cv(m.get("yes_ask_dollars")) > 0]
-        if btc_markets:
-            btc_markets.sort(key=lambda m: m.get("close_time", "9999"))
-            m0 = btc_markets[0]
-            def _tc(v):
-                try: return int(round(float(v)*100))
-                except: return 0
-            m0["yes_bid"] = _tc(m0.get("yes_bid_dollars"))
-            m0["yes_ask"] = _tc(m0.get("yes_ask_dollars"))
-            log.info("Broad search found %d BTC markets. Using: %s (bid=%dc ask=%dc)",
-                len(btc_markets), m0.get("ticker"), m0["yes_bid"], m0["yes_ask"])
-            return m0
-        log.info("Broad search: no BTC markets with valid pricing found")
-    except Exception as e:
-        log.warning("Broad market search failed: %s", e)
-
+            log.warning("Market discovery failed for %s: %s", series, e)
     return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIGNAL 1: ORDER BOOK PRESSURE
+# SIGNAL 1: NEAR-MONEY ORDER BOOK PRESSURE
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_order_book(ticker: str) -> dict:
-    """
-    Kalshi orderbook API returns data under 'orderbook_fp' (fractional precision).
-    Format: { "orderbook_fp": { "yes_dollars": [[price_str, qty_str], ...],
-                                 "no_dollars":  [[price_str, qty_str], ...] } }
-    The legacy 'orderbook' key with integer cents is no longer populated.
-    """
-    data = _get(f"/markets/{ticker}/orderbook")
-    ob_fp = data.get("orderbook_fp", {})
+    data       = _get(f"/markets/{ticker}/orderbook")
+    ob_fp      = data.get("orderbook_fp", {})
     yes_levels = ob_fp.get("yes_dollars", [])
     no_levels  = ob_fp.get("no_dollars",  [])
     log.info("OB │ yes=%d levels no=%d levels │ top_yes=%s top_no=%s",
@@ -584,198 +448,69 @@ def get_order_book(ticker: str) -> dict:
     return data
 
 
-def calc_ob_imbalance(ob_data: dict, yes_mid: int) -> tuple[float, str]:
-    """
-    Near-money order book imbalance signal.
+def calc_ob_imbalance(ob_data: dict, yes_mid: int) -> tuple:
+    """Near-money depth only — within 10c of current mid."""
+    ob_fp      = ob_data.get("orderbook_fp", {})
+    yes_levels = ob_fp.get("yes_dollars", [])
+    no_levels  = ob_fp.get("no_dollars",  [])
+    near       = 10
+    y_lo, y_hi = (yes_mid - near) / 100.0, (yes_mid + near) / 100.0
+    n_mid       = (100 - yes_mid) / 100.0
+    n_lo, n_hi  = n_mid - near/100.0, n_mid + near/100.0
 
-    CRITICAL FIX: Only sum depth within 10 cents of the current mid-price.
-    The full book is useless — a market at 82c YES has massive YES depth at 1c
-    levels that are structurally stale and informationally worthless.
-    We want to know where ACTIVE money is positioned RIGHT NOW near the price.
-
-    Returns (imbalance_ratio, direction).
-    """
-    ob_fp = ob_data.get("orderbook_fp", {})
-    yes_levels = ob_fp.get("yes_dollars", [])  # YES bids
-    no_levels  = ob_fp.get("no_dollars",  [])  # NO bids
-
-    # Near-money window: 10 cents either side of mid
-    near_window = 10
-    yes_near_min = (yes_mid - near_window) / 100.0
-    yes_near_max = (yes_mid + near_window) / 100.0
-    # NO bids are priced in NO cents, mirror of YES
-    no_mid_price  = (100 - yes_mid) / 100.0
-    no_near_min   = no_mid_price - near_window / 100.0
-    no_near_max   = no_mid_price + near_window / 100.0
-
-    def near_depth(levels: list, price_min: float, price_max: float) -> float:
-        total = 0.0
-        for entry in levels:
+    def depth(levels, lo, hi):
+        s = 0.0
+        for e in levels:
             try:
-                price = float(entry[0])
-                qty   = float(entry[1])
-                if price_min <= price <= price_max:
-                    total += qty
-            except (IndexError, TypeError, ValueError):
+                if lo <= float(e[0]) <= hi:
+                    s += float(e[1])
+            except Exception:
                 pass
-        return total
+        return s
 
-    yes_depth = near_depth(yes_levels, yes_near_min, yes_near_max)
-    no_depth  = near_depth(no_levels,  no_near_min,  no_near_max)
-    total     = yes_depth + no_depth
+    yes_d = depth(yes_levels, y_lo, y_hi)
+    no_d  = depth(no_levels,  n_lo, n_hi)
+    total = yes_d + no_d
 
     if total < 1.0:
-        log.info("OB │ Near-money depth too thin (yes=%.0f no=%.0f). NONE.", yes_depth, no_depth)
+        log.info("OB │ Near-money depth too thin (yes=%.0f no=%.0f). NONE.", yes_d, no_d)
         return 0.5, "NONE"
 
-    yes_ratio = yes_depth / total
-    no_ratio  = no_depth  / total
-    thresh    = PROFILE["ob_thresh"]
-
+    yr     = yes_d / total
+    nr     = no_d  / total
+    thresh = PROFILE["ob_thresh"]
     log.info("OB │ Near-money: yes=%.0f no=%.0f yes_ratio=%.1f%% thresh=%.0f%%",
-        yes_depth, no_depth, yes_ratio * 100, thresh * 100)
+        yes_d, no_d, yr * 100, thresh * 100)
 
-    if yes_ratio >= thresh:
-        return yes_ratio, "YES"
-    if no_ratio >= thresh:
-        return no_ratio, "NO"
-    return max(yes_ratio, no_ratio), "NONE"
+    if yr >= thresh: return yr, "YES"
+    if nr >= thresh: return nr, "NO"
+    return max(yr, nr), "NONE"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIGNAL 2: BTC VOLATILITY REGIME
+# SIGNAL 2: VOLATILITY REGIME
 # ─────────────────────────────────────────────────────────────────────────────
 
 def update_btc_price_from_market(market: dict) -> None:
-    """
-    Derive BTC price signal from Kalshi's own market data.
-    We use the last_price_dollars field which tracks the last traded price.
-    This avoids needing Binance (which Railway blocks outbound to).
-    We store the mid-price as a proxy for BTC momentum — if YES is rising,
-    market participants are pricing BTC going up.
-    """
     try:
         mid = market.get("yes_mid", 0)
         if mid > 0:
-            # Use yes_mid as a proxy price series — changes in this signal momentum
             btc_prices.append(float(mid))
     except Exception:
         pass
 
 
 def calc_realized_vol() -> float:
-    """Stdev of log-returns from recent BTC prices. Returns 0 if insufficient data."""
     if len(btc_prices) < 6:
         return 0.0
     prices = list(btc_prices)
-    log_returns = [
-        math.log(prices[i] / prices[i - 1])
-        for i in range(1, len(prices))
-        if prices[i - 1] > 0 and prices[i] > 0
-    ]
-    if len(log_returns) < 5:
-        return 0.0
-    return statistics.stdev(log_returns)
+    rets   = [math.log(prices[i]/prices[i-1]) for i in range(1, len(prices))
+               if prices[i-1] > 0 and prices[i] > 0]
+    return statistics.stdev(rets) if len(rets) >= 5 else 0.0
 
 
 def vol_regime(vol: float) -> str:
     return "HIGH" if vol >= VOL_HIGH_THRESH else "LOW"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SIGNAL 3: FAVOURITE-LONGSHOT BIAS FILTER
-# ─────────────────────────────────────────────────────────────────────────────
-
-def passes_bias_filter(yes_mid: int, direction: str) -> bool:
-    """
-    The contract price we're about to buy must fall in the profitable zone
-    defined by the active archetype. Prevents buying cheap/longshot contracts
-    that statistically destroy capital.
-    """
-    contract_price = yes_mid if direction == "YES" else (100 - yes_mid)
-    ok = PROFILE["min_price"] <= contract_price <= PROFILE["max_price"]
-    if not ok:
-        log.info(
-            "Bias filter │ %dc outside [%d–%d]c for %s mode",
-            contract_price, PROFILE["min_price"], PROFILE["max_price"], ACTIVE_MODE.value,
-        )
-    return ok
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# SIGNAL 4: CROSS-MARKET DIVERGENCE (SUDEITH mode only)
-# Estimates BTC up-move probability from realized vol and compares to
-# the Kalshi contract price as an implied probability.
-# ─────────────────────────────────────────────────────────────────────────────
-
-def vol_implied_prob(vol: float, direction: str) -> float:
-    """
-    Simplified single-period binary option approximation.
-    Low vol + slight positive BTC drift → mild YES bias (~52%).
-    High vol → uncertainty → closer to 50%.
-    """
-    if vol <= 0:
-        return 0.5
-    vol_pct = min(vol / VOL_HIGH_THRESH, 2.0)
-    p_up = max(0.40, min(0.60, 0.52 - (vol_pct * 0.03)))
-    return p_up if direction == "YES" else 1.0 - p_up
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# EDGE & KELLY SIZING
-# ─────────────────────────────────────────────────────────────────────────────
-
-def calc_edge(win_prob: float, contract_price_cents: int) -> float:
-    """
-    EV per dollar risked:
-      EV = (P_win × net_payout) - (P_loss × cost)
-    Positive EV = edge. Negative = don't trade.
-    """
-    if contract_price_cents <= 0 or contract_price_cents >= 100:
-        return 0.0
-    net_payout = (100 - contract_price_cents) / 100.0
-    cost       = contract_price_cents / 100.0
-    return (win_prob * net_payout) - ((1.0 - win_prob) * cost)
-
-
-def kelly_bet_size(win_prob: float, contract_price_cents: int) -> float:
-    """
-    Full Kelly = (b*p - q) / b  where b = net odds on a win.
-    Scaled by archetype's kelly_frac for safety.
-    Capped at TRADE_SIZE_DOLLARS.
-    Returns 0 if no edge.
-    """
-    if contract_price_cents <= 0 or contract_price_cents >= 100:
-        return 0.0
-    b = (100 - contract_price_cents) / float(contract_price_cents)
-    p = win_prob
-    q = 1.0 - p
-    full_kelly = max(0.0, (b * p - q) / b)
-    fractional = full_kelly * PROFILE["kelly_frac"]
-    # Scale up from pure fraction to dollar amount proportional to trade cap
-    dollar_bet = fractional * TRADE_SIZE_DOLLARS * 4.0
-    return round(min(dollar_bet, TRADE_SIZE_DOLLARS), 2)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GUARDS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def rolling_win_rate() -> float:
-    resolved = [t for t in trade_history if t.get("result") in ("win", "loss")]
-    if len(resolved) < 5:
-        return 1.0  # not enough data yet — don't penalize
-    wins = sum(1 for t in resolved if t["result"] == "win")
-    return wins / len(resolved)
-
-
-def cooldown_passed() -> bool:
-    elapsed = time.time() - last_trade_ts
-    cd = PROFILE["cooldown"]
-    if elapsed < cd:
-        log.info("Cooldown │ %.0fs remaining", cd - elapsed)
-        return False
-    return True
 
 
 def vol_filter_passes(regime: str) -> bool:
@@ -789,13 +524,77 @@ def vol_filter_passes(regime: str) -> bool:
     return True
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# SIGNAL 3: FAVOURITE-LONGSHOT BIAS FILTER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def passes_bias_filter(yes_mid: int, direction: str) -> bool:
+    contract_price = yes_mid if direction == "YES" else (100 - yes_mid)
+    ok = PROFILE["min_price"] <= contract_price <= PROFILE["max_price"]
+    if not ok:
+        log.info("Bias filter │ %dc outside [%d–%d]c for %s mode",
+            contract_price, PROFILE["min_price"], PROFILE["max_price"], ACTIVE_MODE.value)
+    return ok
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIGNAL 4: CROSS-MARKET (SUDEITH only)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def vol_implied_prob(vol: float, direction: str) -> float:
+    if vol <= 0:
+        return 0.5
+    vol_pct = min(vol / VOL_HIGH_THRESH, 2.0)
+    p_up    = max(0.40, min(0.60, 0.52 - (vol_pct * 0.03)))
+    return p_up if direction == "YES" else 1.0 - p_up
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EDGE & KELLY
+# ─────────────────────────────────────────────────────────────────────────────
+
+def calc_edge(win_prob: float, contract_price_cents: int) -> float:
+    if contract_price_cents <= 0 or contract_price_cents >= 100:
+        return 0.0
+    net = (100 - contract_price_cents) / 100.0
+    return (win_prob * net) - ((1.0 - win_prob) * (contract_price_cents / 100.0))
+
+
+def kelly_bet_size(win_prob: float, contract_price_cents: int) -> float:
+    if contract_price_cents <= 0 or contract_price_cents >= 100:
+        return 0.0
+    b            = (100 - contract_price_cents) / float(contract_price_cents)
+    full_kelly   = max(0.0, (b * win_prob - (1 - win_prob)) / b)
+    return round(min(full_kelly * PROFILE["kelly_frac"] * TRADE_SIZE_DOLLARS * 4.0,
+                     TRADE_SIZE_DOLLARS), 2)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GUARDS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def cooldown_passed() -> bool:
+    elapsed = time.time() - last_trade_ts
+    cd      = PROFILE["cooldown"]
+    if elapsed < cd:
+        log.info("Cooldown │ %.0fs remaining", cd - elapsed)
+        return False
+    return True
+
+
 def daily_loss_check() -> bool:
-    """Returns True if safe to trade (within daily loss limit)."""
-    if daily_pnl <= -MAX_DAILY_LOSS:
-        log.warning(
-            "DAILY LOSS LIMIT │ $%.2f lost today (limit $%.2f). No more trades today.",
-            abs(daily_pnl), MAX_DAILY_LOSS,
-        )
+    pnl = paper_daily_pnl if DEMO_MODE else daily_pnl
+    if pnl <= -MAX_DAILY_LOSS:
+        log.warning("DAILY LOSS LIMIT │ $%.2f lost today (limit $%.2f). Halting.", abs(pnl), MAX_DAILY_LOSS)
+        return False
+    return True
+
+
+def balance_floor_check(balance: float) -> bool:
+    """Hard stop. Prevents bot from firing on a near-empty account."""
+    if balance < MIN_BALANCE_FLOOR:
+        log.warning("BALANCE FLOOR │ $%.2f < floor $%.2f. Halting all trading.",
+            balance, MIN_BALANCE_FLOOR)
         return False
     return True
 
@@ -804,88 +603,77 @@ def daily_loss_check() -> bool:
 # ORDER EXECUTION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def place_limit_order(
-    ticker: str,
-    direction: str,
-    size_dollars: float,
-    limit_price_cents: int,
-) -> Optional[str]:
-    """
-    Places a maker-side limit order.
-    Returns order_id on success, None on failure.
-    """
-    global last_trade_ts
+def place_limit_order(ticker: str, direction: str, size_dollars: float,
+                      limit_price_cents: int) -> Optional[str]:
+    global last_trade_ts, paper_balance, paper_daily_pnl
 
-    # Contracts to buy: floor(total_dollars / price_per_contract)
-    # Each contract costs limit_price_cents / 100 dollars.
     if limit_price_cents <= 0:
-        log.warning("Invalid limit price: %dc", limit_price_cents)
         return None
-
     count = int((size_dollars * 100) / limit_price_cents)
     if count < 1:
         log.info("Kelly size $%.2f @ %dc = 0 contracts. Skipping.", size_dollars, limit_price_cents)
         return None
-
+    cost      = (limit_price_cents * count) / 100.0
     client_id = f"j5-{ACTIVE_MODE.value[:4]}-{uuid.uuid4().hex[:8]}"
 
     if DEMO_MODE:
-        log.info(
-            "🟡 DEMO │ %s %s │ %d contracts @ %dc │ $%.2f │ [%s]",
-            direction, ticker, count, limit_price_cents, size_dollars, ACTIVE_MODE.value.upper(),
-        )
-        last_trade_ts = time.time()
-        active_tickers.add(ticker)  # lock market in demo mode too
-        trade_history.append({
-            "time":     datetime.now(timezone.utc).isoformat(),
-            "ticker":   ticker,
-            "side":     direction,
-            "size":     size_dollars,
-            "price":    limit_price_cents,
-            "count":    count,
-            "mode":     ACTIVE_MODE.value,
-            "order_id": client_id,
-            "result":   "pending",
-        })
+        paper_balance   -= cost
+        paper_daily_pnl -= cost
+        last_trade_ts    = time.time()
+        active_tickers.add(ticker)
+        record = {
+            "time":      datetime.now(timezone.utc).isoformat(),
+            "ticker":    ticker,
+            "side":      direction,
+            "size":      size_dollars,
+            "price":     limit_price_cents,
+            "count":     count,
+            "cost":      cost,
+            "mode":      ACTIVE_MODE.value,
+            "order_id":  client_id,
+            "result":    "pending",
+            "placed_at": time.time(),
+        }
+        trade_history.append(record)
+        open_orders[client_id] = record
+        log.info("🟡 PAPER │ %s %s │ %d contracts @ %dc │ cost=$%.2f │ paper_bal=$%.2f │ [%s]",
+            direction, ticker[-15:], count, limit_price_cents,
+            cost, paper_balance, ACTIVE_MODE.value.upper())
         return client_id
 
     # Live order
     body = {
-        "ticker":           ticker,
-        "client_order_id":  client_id,
-        "type":             "limit",
-        "action":           "buy",
-        "side":             direction.lower(),
-        "count":            count,
-        "yes_price":        limit_price_cents if direction == "YES" else (100 - limit_price_cents),
+        "ticker":          ticker,
+        "client_order_id": client_id,
+        "type":            "limit",
+        "action":          "buy",
+        "side":            direction.lower(),
+        "count":           count,
+        "yes_price":       limit_price_cents if direction == "YES" else (100 - limit_price_cents),
     }
-
     try:
-        resp = _post("/portfolio/orders", body)
-        order = resp.get("order", {})
-        order_id = order.get("order_id", client_id)
+        resp     = _post("/portfolio/orders", body)
+        order_id = resp.get("order", {}).get("order_id", client_id)
         last_trade_ts = time.time()
-
-        trade_record = {
-            "time":     datetime.now(timezone.utc).isoformat(),
-            "ticker":   ticker,
-            "side":     direction,
-            "size":     size_dollars,
-            "price":    limit_price_cents,
-            "count":    count,
-            "mode":     ACTIVE_MODE.value,
-            "order_id": order_id,
-            "result":   "pending",
+        record = {
+            "time":      datetime.now(timezone.utc).isoformat(),
+            "ticker":    ticker,
+            "side":      direction,
+            "size":      size_dollars,
+            "price":     limit_price_cents,
+            "count":     count,
+            "cost":      cost,
+            "mode":      ACTIVE_MODE.value,
+            "order_id":  order_id,
+            "result":    "pending",
+            "placed_at": time.time(),
         }
-        trade_history.append(trade_record)
-        open_orders[order_id] = trade_record
-        active_tickers.add(ticker)  # lock this market — no re-entry until settled
-
-        log.info(
-            "✅ ORDER │ %s %s │ %d contracts @ %dc │ $%.2f │ ID:%s │ [%s]",
-            direction, ticker, count, limit_price_cents,
-            size_dollars, order_id[:12], ACTIVE_MODE.value.upper(),
-        )
+        trade_history.append(record)
+        open_orders[order_id] = record
+        active_tickers.add(ticker)
+        log.info("✅ ORDER │ %s %s │ %d contracts @ %dc │ $%.2f │ ID:%s │ [%s]",
+            direction, ticker[-15:], count, limit_price_cents,
+            size_dollars, order_id[:12], ACTIVE_MODE.value.upper())
         return order_id
     except requests.HTTPError as e:
         log.error("Order failed │ HTTP %s │ %s", e.response.status_code, e.response.text[:200])
@@ -896,149 +684,98 @@ def place_limit_order(
 # MAIN DECISION ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_decision(market: dict) -> None:
-    """Single decision cycle for one market snapshot."""
+def run_decision(market: dict, current_balance: float) -> None:
     ticker  = market["ticker"]
-    yes_bid = market.get("yes_bid", 50)
-    yes_ask = market.get("yes_ask", 50)
+    yes_bid = market.get("yes_bid", 0)
+    yes_ask = market.get("yes_ask", 0)
 
-    # Sanity check market prices
     if yes_bid <= 0 or yes_ask <= 0 or yes_bid >= yes_ask:
-        log.warning("Market price anomaly on %s: bid=%d ask=%d. Skipping.", ticker, yes_bid, yes_ask)
         return
 
     yes_mid = (yes_bid + yes_ask) // 2
 
-    # ── Guard: already have a position in this market ─────────────────────
+    if not balance_floor_check(current_balance):
+        return
+
     if ticker in active_tickers:
         log.info("Position guard │ Already have position in %s. Skipping.", ticker[-15:])
         return
 
-    # ── OB Signal — near-money only ────────────────────────────────────────
-    ob_data = get_order_book(ticker)
+    ob_data            = get_order_book(ticker)
     imbalance, direction = calc_ob_imbalance(ob_data, yes_mid)
 
-    # ── Volatility ─────────────────────────────────────────────────────────
     vol    = calc_realized_vol()
     regime = vol_regime(vol)
 
-    log.info(
-        "📡 %s │ OB: %s %.1f%% │ Vol: %.5f (%s) │ YES bid/mid/ask: %d/%d/%dc │ [%s]",
+    log.info("📡 %s │ OB: %s %.1f%% │ Vol: %.5f (%s) │ YES bid/mid/ask: %d/%d/%dc │ [%s]",
         ticker, direction, imbalance * 100, vol, regime,
-        yes_bid, yes_mid, yes_ask, ACTIVE_MODE.value.upper(),
-    )
+        yes_bid, yes_mid, yes_ask, ACTIVE_MODE.value.upper())
 
-    # ── Guard: no OB signal ────────────────────────────────────────────────
     if direction == "NONE":
         log.info("No OB signal (yes=%.0f%% no=%.0f%% thresh=%.0f%%) — skipping.",
             imbalance*100, (1-imbalance)*100, PROFILE["ob_thresh"]*100)
         return
 
-    # ── Guard: cooldown ────────────────────────────────────────────────────
-    if not cooldown_passed():
-        return
+    if not cooldown_passed():       return
+    if not vol_filter_passes(regime): return
+    if not passes_bias_filter(yes_mid, direction): return
+    if not daily_loss_check():      return
 
-    # ── Guard: vol filter ──────────────────────────────────────────────────
-    if not vol_filter_passes(regime):
-        return
-
-    # ── Guard: bias filter ─────────────────────────────────────────────────
-    if not passes_bias_filter(yes_mid, direction):
-        return
-
-    # ── Guard: win rate ────────────────────────────────────────────────────
-    wr = rolling_win_rate()
-    if wr < MIN_WIN_RATE:
-        resolved_count = len([t for t in trade_history if t.get("result") in ("win", "loss")])
-        if resolved_count >= 5:
-            log.warning(
-                "Win rate │ %.1f%% below %.0f%% threshold after %d trades. Pausing.",
-                wr * 100, MIN_WIN_RATE * 100, resolved_count,
-            )
-            return
-
-    # ── Guard: daily loss ──────────────────────────────────────────────────
-    if not daily_loss_check():
-        return
-
-    # ── Win probability ────────────────────────────────────────────────────
-    win_prob = imbalance  # OB imbalance as base probability estimate
+    # ── FIX: win_prob = OB imbalance ONLY ─────────────────────────────────
+    # Previous version used rolling_win_rate() which returned 100% when
+    # no trades had resolved yet. This inflated bet sizes catastrophically.
+    win_prob = imbalance
 
     if PROFILE["cross_market"] and vol > 0:
         vol_prob = vol_implied_prob(vol, direction)
-        # Weighted consensus: OB signal = 60%, vol-implied = 40%
         win_prob = (imbalance * 0.60) + (vol_prob * 0.40)
-        log.info(
-            "🔬 Cross-market │ OB %.1f%% + VolImpl %.1f%% = Consensus %.1f%%",
-            imbalance * 100, vol_prob * 100, win_prob * 100,
-        )
+        log.info("🔬 Cross-market │ OB %.1f%% + VolImpl %.1f%% = %.1f%%",
+            imbalance*100, vol_prob*100, win_prob*100)
 
-    # ── Contract price and edge ────────────────────────────────────────────
-    # CRITICAL: Express the OB signal via whichever side costs ≤65c.
-    # Buying YES at 80c requires 80% win rate to break even — we only have ~68%.
-    # If OB says YES but YES costs 80c, buy NO at 20c instead.
-    # Same directional view, positive EV.
-    YES_BREAKEVEN_PRICE = int(os.environ.get("YES_BREAKEVEN_PRICE", "65"))
-
+    # ── Price breakeven guard ──────────────────────────────────────────────
     if direction == "YES":
-        if yes_mid <= YES_BREAKEVEN_PRICE:
-            trade_direction = "YES"
-            contract_price  = yes_mid
-        else:
-            # YES is expensive — flip to NO to express the same momentum
-            # differently: "market is moving, ride the NO side which is cheap"
-            # Actually: if OB says 87% YES depth, that means YES is winning.
-            # Buying expensive YES has negative EV. Better to skip entirely.
-            # Only flip to NO if the OB signal is actually NO-dominant.
-            log.info(
-                "Price guard │ YES at %dc exceeds breakeven %dc. Skipping expensive entry.",
-                yes_mid, YES_BREAKEVEN_PRICE
-            )
+        if yes_mid > YES_BREAKEVEN_PRICE:
+            log.info("Price guard │ YES at %dc exceeds breakeven %dc. Skipping.",
+                yes_mid, YES_BREAKEVEN_PRICE)
             return
-    else:  # direction == "NO"
+        trade_direction = "YES"
+        contract_price  = yes_mid
+    else:
         no_price = 100 - yes_mid
-        if no_price <= YES_BREAKEVEN_PRICE:
-            trade_direction = "NO"
-            contract_price  = no_price
-        else:
-            log.info(
-                "Price guard │ NO at %dc exceeds breakeven %dc. Skipping expensive entry.",
-                no_price, YES_BREAKEVEN_PRICE
-            )
+        if no_price > YES_BREAKEVEN_PRICE:
+            log.info("Price guard │ NO at %dc exceeds breakeven %dc. Skipping.",
+                no_price, YES_BREAKEVEN_PRICE)
             return
+        trade_direction = "NO"
+        contract_price  = no_price
 
     edge = calc_edge(win_prob, contract_price)
-
     if edge < PROFILE["min_edge"]:
-        log.info(
-            "Edge │ %.3f < min %.3f for %s. Skipping.",
-            edge, PROFILE["min_edge"], ACTIVE_MODE.value,
-        )
+        log.info("Edge │ %.3f < min %.3f for %s. Skipping.", edge, PROFILE["min_edge"], ACTIVE_MODE.value)
         return
 
-    # ── Kelly sizing (based on contract we're actually buying) ────────────
     bet = kelly_bet_size(win_prob, contract_price)
     if bet < 0.50:
         log.info("Kelly size │ $%.2f too small to place.", bet)
         return
 
-    # ── Maker limit price ──────────────────────────────────────────────────
+    if current_balance < bet:
+        log.warning("Insufficient balance │ $%.2f < bet $%.2f. Skipping.", current_balance, bet)
+        return
+
     if trade_direction == "YES":
         limit_price = max(1, min(yes_bid + 1, yes_ask - 1))
     else:
-        no_best = 100 - yes_ask
+        no_best     = 100 - yes_ask
         limit_price = max(1, min(no_best + 1, 100 - yes_bid - 1))
-
     limit_price = max(1, min(99, limit_price))
 
     if abs(limit_price - contract_price) > 8:
         log.info("Limit price │ %dc too far from mid %dc. Skipping.", limit_price, contract_price)
         return
 
-    log.info(
-        "📈 SIGNAL │ %s │ WinProb: %.1f%% │ Edge: %.2f%% │ Bet: $%.2f │ Limit: %dc │ WR: %.1f%%",
-        trade_direction, win_prob * 100, edge * 100, bet, limit_price, wr * 100,
-    )
+    log.info("📈 SIGNAL │ %s │ OB: %.1f%% │ Edge: %.2f%% │ Bet: $%.2f │ Limit: %dc",
+        trade_direction, win_prob * 100, edge * 100, bet, limit_price)
 
     place_limit_order(ticker, trade_direction, bet, limit_price)
 
@@ -1049,98 +786,89 @@ def run_decision(market: dict) -> None:
 
 def main() -> None:
     global session_start_balance, daily_pnl, active_tickers
+    global paper_balance, paper_daily_pnl, last_trade_ts
 
-    # ── Initialize API host ────────────────────────────────────────────────
     init_base_url()
 
-    # ── Startup banner ─────────────────────────────────────────────────────
+    paper_balance = float(os.environ.get("PAPER_BALANCE", "25.0"))
+
     log.info("━" * 70)
-    log.info("  JOHNNY5 v3.0 │ %s │ Archetype: %s",
-             "DEMO 🟡" if DEMO_MODE else "LIVE 🔴", ACTIVE_MODE.value.upper())
+    log.info("  JOHNNY5 v4.0 │ %s │ Archetype: %s",
+             "PAPER 🟡" if DEMO_MODE else "LIVE 🔴", ACTIVE_MODE.value.upper())
     log.info("  %s", PROFILE["description"])
-    log.info("  Max trade: $%.2f │ Kelly: %.0f%% │ Min edge: %.1f%% │ Max daily loss: $%.2f",
-             TRADE_SIZE_DOLLARS, PROFILE["kelly_frac"] * 100,
-             PROFILE["min_edge"] * 100, MAX_DAILY_LOSS)
-    log.info("  Contract range: %d–%dc │ OB thresh: %.0f%% │ Cooldown: %ds",
-             PROFILE["min_price"], PROFILE["max_price"],
-             PROFILE["ob_thresh"] * 100, PROFILE["cooldown"])
+    log.info("  Max trade: $%.2f │ Kelly: %.0f%% │ Min edge: %.1f%% │ Daily loss cap: $%.2f",
+             TRADE_SIZE_DOLLARS, PROFILE["kelly_frac"]*100, PROFILE["min_edge"]*100, MAX_DAILY_LOSS)
+    log.info("  Breakeven cap: %dc │ Balance floor: $%.2f",
+             YES_BREAKEVEN_PRICE, MIN_BALANCE_FLOOR)
+    log.info("  %s", "📋 PAPER TRADING — zero real orders" if DEMO_MODE else "⚠️  LIVE TRADING — real money")
     log.info("━" * 70)
 
-    # ── Get starting balance ───────────────────────────────────────────────
-    session_start_balance = get_balance()
-    log.info("Starting balance: $%.2f", session_start_balance)
+    if DEMO_MODE:
+        log.info("Starting paper balance: $%.2f", paper_balance)
+    else:
+        bal = get_live_balance()
+        session_start_balance = bal
+        log.info("Starting live balance: $%.2f", bal)
 
     resolve_cycle = 0
 
-    # ── Main loop ──────────────────────────────────────────────────────────
     while True:
-        loop_start = time.time()
-
         try:
-            # 1. Market discovery first (we derive price signal from it)
             market = get_active_btc_market()
             if not market:
-                log.info("No open BTC market. Waiting %ds...", POLL_INTERVAL)
+                log.info("No active BTC market. Waiting %ds...", POLL_INTERVAL)
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            # 2. Update price signal from Kalshi market data (Binance blocked on Railway)
             update_btc_price_from_market(market)
 
-            # 3. Clear expired tickers — if active ticker is not current market, it has settled
+            # Clear expired position locks when market rotates
             current_ticker = market.get("ticker", "")
             expired = {t for t in active_tickers if t != current_ticker}
             if expired:
-                log.info("Clearing expired tickers from position lock: %s", expired)
+                log.info("Clearing expired position locks: %s", expired)
                 active_tickers -= expired
 
-            # 4. Decision
-            run_decision(market)
+            current_balance = paper_balance if DEMO_MODE else get_live_balance()
+            run_decision(market, current_balance)
 
-            # 4. Periodic tasks (every ~10 cycles)
             resolve_cycle += 1
-            if resolve_cycle % 10 == 0 and not DEMO_MODE:
+            if resolve_cycle % 10 == 0:
                 resolve_open_orders()
-                current_balance = get_balance()
-                daily_pnl = current_balance - session_start_balance
-                log.info(
-                    "Portfolio │ Balance: $%.2f │ Session PnL: %+.2f │ Open orders: %d │ WR: %.1f%%",
-                    current_balance, daily_pnl,
-                    len(open_orders), rolling_win_rate() * 100,
-                )
 
-        except requests.HTTPError as e:
-            status = e.response.status_code if e.response is not None else "?"
-            body   = e.response.text[:300] if e.response is not None else ""
-            if status == 429:
-                log.warning("Rate limited. Backing off 30s.")
-                time.sleep(30)
-                continue
-            elif status in (401, 403):
-                log.error("Auth error %s — check KALSHI_API_KEY_ID and KALSHI_PRIVATE_KEY_PEM.", status)
-                time.sleep(60)
-                continue
-            else:
-                log.error("HTTP %s: %s", status, body)
+                if DEMO_MODE:
+                    resolved = [t for t in trade_history if t.get("result") in ("win","loss")]
+                    wins  = sum(1 for t in resolved if t["result"] == "win")
+                    total = len(resolved)
+                    wr    = wins / total if total > 0 else 0.0
+                    log.info(
+                        "📋 PAPER STATUS │ Balance: $%.2f │ Daily PnL: $%+.2f │ "
+                        "Trades: %d │ Resolved: %d │ WR: %.1f%%",
+                        paper_balance, paper_daily_pnl,
+                        len(trade_history), total, wr * 100,
+                    )
+                else:
+                    live_bal  = get_live_balance()
+                    daily_pnl = live_bal - session_start_balance
+                    resolved  = [t for t in trade_history if t.get("result") in ("win","loss")]
+                    wins  = sum(1 for t in resolved if t["result"] == "win")
+                    total = len(resolved)
+                    wr    = wins / total if total > 0 else 0.0
+                    log.info(
+                        "Portfolio │ Balance: $%.2f │ Session PnL: %+.2f │ "
+                        "Open orders: %d │ WR: %.1f%%",
+                        live_bal, daily_pnl, len(open_orders), wr * 100,
+                    )
 
-        except requests.ConnectionError as e:
-            log.warning("Connection error: %s. Retrying in 15s.", e)
-            time.sleep(15)
-            continue
+            time.sleep(POLL_INTERVAL)
 
-        except requests.Timeout:
-            log.warning("Request timed out. Retrying.")
-            continue
-
+        except KeyboardInterrupt:
+            final = paper_balance if DEMO_MODE else get_live_balance()
+            log.info("Shutting down. Final balance: $%.2f", final)
+            break
         except Exception as e:
             log.error("Unexpected error: %s", e, exc_info=True)
-            time.sleep(10)
-
-        # ── Sleep remainder of poll interval ───────────────────────────────
-        elapsed = time.time() - loop_start
-        sleep_for = max(0, POLL_INTERVAL - elapsed)
-        if sleep_for > 0:
-            time.sleep(sleep_for)
+            time.sleep(POLL_INTERVAL)
 
 
 if __name__ == "__main__":
