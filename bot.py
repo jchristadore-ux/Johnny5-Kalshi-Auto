@@ -384,6 +384,7 @@ def _post(path: str, body: dict) -> dict:
 btc_prices:    deque[float] = deque(maxlen=90)   # ~90 min of 1-min prices
 trade_history: deque[dict]  = deque(maxlen=100)  # rolling 100 trades for win rate
 open_orders:   dict[str, dict] = {}              # order_id → trade dict (pending resolution)
+active_tickers: set[str] = set()                 # tickers with open/pending positions — NEVER re-enter
 session_start_balance: float = 0.0
 daily_pnl:     float = 0.0
 last_trade_ts: float = -PROFILE["cooldown"]      # init negative so first trade fires immediately
@@ -404,21 +405,41 @@ def get_balance() -> float:
 
 
 def resolve_open_orders() -> None:
-    """Check resting orders and mark settled ones in trade_history."""
+    """Check settled orders, update win/loss, free tickers for re-entry."""
     if not open_orders:
         return
     try:
-        data = _get("/portfolio/orders", {"status": "settled", "limit": 50})
-        settled_ids = {o["order_id"] for o in data.get("orders", [])}
+        # Fetch all resting + settled orders
+        resting_data  = _get("/portfolio/orders", {"status": "resting",  "limit": 100})
+        settled_data  = _get("/portfolio/orders", {"status": "settled",  "limit": 100})
+        canceled_data = _get("/portfolio/orders", {"status": "canceled", "limit": 100})
+
+        resting_ids  = {o["order_id"] for o in resting_data.get("orders",  [])}
+        settled_ids  = {o["order_id"] for o in settled_data.get("orders",  [])}
+        canceled_ids = {o["order_id"] for o in canceled_data.get("orders", [])}
+        done_ids     = settled_ids | canceled_ids
+
         for oid in list(open_orders.keys()):
-            if oid in settled_ids:
-                trade = open_orders.pop(oid)
-                # Rough win/loss: if we held to settlement, check fill vs market result
-                # We mark "win" if order was filled (Kalshi returns filled status)
+            trade = open_orders[oid]
+            ticker = trade.get("ticker", "")
+
+            if oid in done_ids:
+                open_orders.pop(oid)
+                # Free this ticker for re-entry
+                active_tickers.discard(ticker)
+                # Mark win/loss in history
+                won = oid in settled_ids  # settled = position resolved
                 for t in trade_history:
                     if t.get("order_id") == oid:
-                        t["result"] = "win"  # settled = filled = win on prediction markets
+                        t["result"] = "win" if won else "loss"
                         break
+                log.info("Order %s settled ticker=%s result=%s",
+                    oid[:12], ticker[-15:], "win" if won else "canceled")
+
+            elif oid not in resting_ids:
+                # Order is gone from resting and not in settled/canceled
+                # — may have been filled already; treat as pending resolution
+                pass
     except Exception as e:
         log.debug("Order resolution check failed: %s", e)
 
@@ -530,39 +551,55 @@ def get_order_book(ticker: str) -> dict:
     return data
 
 
-def calc_ob_imbalance(ob_data: dict) -> tuple[float, str]:
+def calc_ob_imbalance(ob_data: dict, yes_mid: int) -> tuple[float, str]:
     """
+    Near-money order book imbalance signal.
+
+    CRITICAL FIX: Only sum depth within 10 cents of the current mid-price.
+    The full book is useless — a market at 82c YES has massive YES depth at 1c
+    levels that are structurally stale and informationally worthless.
+    We want to know where ACTIVE money is positioned RIGHT NOW near the price.
+
     Returns (imbalance_ratio, direction).
-    Parses orderbook_fp (fractional precision) format.
-    Quantities are strings like "10.00" — sum them as floats.
     """
     ob_fp = ob_data.get("orderbook_fp", {})
-    yes_levels = ob_fp.get("yes_dollars", [])
-    no_levels  = ob_fp.get("no_dollars",  [])
+    yes_levels = ob_fp.get("yes_dollars", [])  # YES bids
+    no_levels  = ob_fp.get("no_dollars",  [])  # NO bids
 
-    def depth(levels: list, n: int = 5) -> float:
+    # Near-money window: 10 cents either side of mid
+    near_window = 10
+    yes_near_min = (yes_mid - near_window) / 100.0
+    yes_near_max = (yes_mid + near_window) / 100.0
+    # NO bids are priced in NO cents, mirror of YES
+    no_mid_price  = (100 - yes_mid) / 100.0
+    no_near_min   = no_mid_price - near_window / 100.0
+    no_near_max   = no_mid_price + near_window / 100.0
+
+    def near_depth(levels: list, price_min: float, price_max: float) -> float:
         total = 0.0
-        for entry in levels[:n]:
+        for entry in levels:
             try:
-                # entry is [price_str, qty_str]
-                total += float(entry[1])
+                price = float(entry[0])
+                qty   = float(entry[1])
+                if price_min <= price <= price_max:
+                    total += qty
             except (IndexError, TypeError, ValueError):
                 pass
         return total
 
-    yes_depth = depth(yes_levels)
-    no_depth  = depth(no_levels)
+    yes_depth = near_depth(yes_levels, yes_near_min, yes_near_max)
+    no_depth  = near_depth(no_levels,  no_near_min,  no_near_max)
     total     = yes_depth + no_depth
 
     if total < 1.0:
-        log.info("OB │ Total depth %.1f too thin. NONE.", total)
+        log.info("OB │ Near-money depth too thin (yes=%.0f no=%.0f). NONE.", yes_depth, no_depth)
         return 0.5, "NONE"
 
     yes_ratio = yes_depth / total
     no_ratio  = no_depth  / total
     thresh    = PROFILE["ob_thresh"]
 
-    log.info("OB │ yes_depth=%.1f no_depth=%.1f yes_ratio=%.1f%% thresh=%.0f%%",
+    log.info("OB │ Near-money: yes=%.0f no=%.0f yes_ratio=%.1f%% thresh=%.0f%%",
         yes_depth, no_depth, yes_ratio * 100, thresh * 100)
 
     if yes_ratio >= thresh:
@@ -765,6 +802,7 @@ def place_limit_order(
             direction, ticker, count, limit_price_cents, size_dollars, ACTIVE_MODE.value.upper(),
         )
         last_trade_ts = time.time()
+        active_tickers.add(ticker)  # lock market in demo mode too
         trade_history.append({
             "time":     datetime.now(timezone.utc).isoformat(),
             "ticker":   ticker,
@@ -808,6 +846,7 @@ def place_limit_order(
         }
         trade_history.append(trade_record)
         open_orders[order_id] = trade_record
+        active_tickers.add(ticker)  # lock this market — no re-entry until settled
 
         log.info(
             "✅ ORDER │ %s %s │ %d contracts @ %dc │ $%.2f │ ID:%s │ [%s]",
@@ -837,9 +876,14 @@ def run_decision(market: dict) -> None:
 
     yes_mid = (yes_bid + yes_ask) // 2
 
-    # ── OB Signal ──────────────────────────────────────────────────────────
+    # ── Guard: already have a position in this market ─────────────────────
+    if ticker in active_tickers:
+        log.info("Position guard │ Already have position in %s. Skipping.", ticker[-15:])
+        return
+
+    # ── OB Signal — near-money only ────────────────────────────────────────
     ob_data = get_order_book(ticker)
-    imbalance, direction = calc_ob_imbalance(ob_data)
+    imbalance, direction = calc_ob_imbalance(ob_data, yes_mid)
 
     # ── Volatility ─────────────────────────────────────────────────────────
     vol    = calc_realized_vol()
@@ -987,7 +1031,14 @@ def main() -> None:
             # 2. Update price signal from Kalshi market data (Binance blocked on Railway)
             update_btc_price_from_market(market)
 
-            # 3. Decision
+            # 3. Clear expired tickers — if active ticker is not current market, it has settled
+            current_ticker = market.get("ticker", "")
+            expired = {t for t in active_tickers if t != current_ticker}
+            if expired:
+                log.info("Clearing expired tickers from position lock: %s", expired)
+                active_tickers -= expired
+
+            # 4. Decision
             run_decision(market)
 
             # 4. Periodic tasks (every ~10 cycles)
