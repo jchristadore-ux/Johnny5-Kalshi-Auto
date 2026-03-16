@@ -404,6 +404,22 @@ def get_balance() -> float:
         return 0.0
 
 
+def send_telegram(message: str) -> None:
+    """Send a Telegram message. Silently skips if not configured."""
+    token   = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    if not token or not chat_id:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": message},
+            timeout=8,
+        )
+    except Exception:
+        pass  # never let Telegram crash the bot
+
+
 def resolve_open_orders() -> None:
     """Check settled orders, update win/loss, free tickers for re-entry."""
     if not open_orders:
@@ -435,6 +451,23 @@ def resolve_open_orders() -> None:
                         break
                 log.info("Order %s settled ticker=%s result=%s",
                     oid[:12], ticker[-15:], "win" if won else "canceled")
+
+                # Telegram notification on win only
+                if won:
+                    balance = get_balance()
+                    trade_ref = next((t for t in trade_history if t.get("order_id") == oid), {})
+                    side      = trade_ref.get("side", "?")
+                    price_c   = trade_ref.get("price", 0)
+                    count     = trade_ref.get("count", 0)
+                    payout    = count * 1.00
+                    cost      = (price_c * count) / 100.0
+                    profit    = round(payout - cost, 2)
+                    send_telegram(
+                        f"🟢 Johnny5 WIN +${profit:.2f}\n"
+                        f"📈 {side} on {ticker[-15:]}\n"
+                        f"   {count} contracts @ {price_c}c\n"
+                        f"💵 Balance: ${balance:.2f}"
+                    )
 
             elif oid not in resting_ids:
                 # Order is gone from resting and not in settled/canceled
