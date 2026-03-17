@@ -314,7 +314,7 @@ def resolve_open_orders() -> None:
     DEMO: auto-resolve trades older than one 15-min window (simulated outcome).
     LIVE: fetch settled/canceled orders from Kalshi and update records.
     """
-    global active_tickers, paper_daily_pnl
+    global active_tickers, paper_balance, paper_daily_pnl
 
     if not open_orders:
         return
@@ -331,20 +331,21 @@ def resolve_open_orders() -> None:
                 # Simulate outcome at observed 68% win rate
                 won   = random.random() < 0.68
                 count = trade.get("count", 0)
-                price = trade.get("price", 0)
                 cost  = trade.get("cost", 0.0)
-                pnl   = (count - cost) if won else 0.0
-                paper_daily_pnl += pnl  # add payout back (cost already deducted at entry)
+                pnl   = round((count - cost) if won else 0.0, 2)
+                # FIX: credit payout back to paper_balance (was only going to paper_daily_pnl)
+                paper_balance   += pnl
+                paper_daily_pnl += pnl
                 result = "win" if won else "loss"
                 for t in trade_history:
                     if t.get("order_id") == oid:
                         t["result"] = result
-                        t["pnl"]    = round(pnl - cost if won else -cost, 4)
+                        t["pnl"]    = round(pnl if won else -cost, 4)
                         break
                 outcome_str = f"+${pnl:.2f}" if won else f"-${cost:.2f}"
                 log.info("📋 PAPER SETTLED │ %s │ %s │ %s → %s │ paper_bal=$%.2f",
                     ticker[-15:], trade.get("side","?"), result.upper(),
-                    outcome_str, paper_balance + paper_daily_pnl)
+                    outcome_str, paper_balance)
         return
 
     # Live resolution
