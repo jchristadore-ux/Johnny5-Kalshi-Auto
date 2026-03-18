@@ -167,7 +167,7 @@ MAX_DAILY_LOSS       = float(os.environ.get("MAX_DAILY_LOSS_DOLLARS", "20"))
 VOL_HIGH_THRESH      = float(os.environ.get("VOL_HIGH_THRESH", "0.008"))
 POLL_INTERVAL        = int(os.environ.get("POLL_INTERVAL_SECS", "30"))
 MIN_BALANCE_FLOOR    = float(os.environ.get("MIN_BALANCE_FLOOR", "2.00"))
-YES_BREAKEVEN_PRICE  = int(os.environ.get("YES_BREAKEVEN_PRICE", "65"))
+YES_BREAKEVEN_PRICE  = int(os.environ.get("YES_BREAKEVEN_PRICE", "67"))  # raised from 65 to capture near-edge entries
 
 _mode_raw = os.environ.get("TRADER_MODE", "quant").lower().strip()
 try:
@@ -684,11 +684,15 @@ def balance_floor_check(balance: float) -> bool:
 
 
 def spread_check(yes_bid: int, yes_ask: int) -> bool:
-    """Skip if spread is too tight to post a maker order inside."""
+    """
+    KXBTC15M almost always has a 1c spread — that IS the normal market.
+    The old 2c minimum was blocking 80%+ of valid trade opportunities.
+    We only block on zero/crossed spread which means broken book.
+    With a 1c spread, we post the limit at ask-price and sit as maker.
+    """
     spread = yes_ask - yes_bid
-    min_s  = PROFILE.get("min_spread", 2)
-    if spread < min_s:
-        log.info("Spread │ %dc < min %dc. Cannot post maker. Skipping.", spread, min_s)
+    if spread <= 0:
+        log.info("Spread │ %dc — crossed/zero spread. Skipping.", spread)
         return False
     return True
 
@@ -867,8 +871,9 @@ def run_decision(market: dict, current_balance: float) -> None:
 
     # ── Kelly sizing ───────────────────────────────────────────────────────
     bet = kelly_bet_size(win_prob, contract_price, current_balance)
-    if bet < 0.50:
-        log.info("Kelly │ $%.2f too small. Skipping.", bet)
+    # Floor: $0.25 so bot can still trade when balance is low (e.g. $2-5)
+    if bet < 0.25:
+        log.info("Kelly │ $%.2f too small to trade. Skipping.", bet)
         return
 
     if current_balance < bet:
