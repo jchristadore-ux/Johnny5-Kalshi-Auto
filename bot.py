@@ -166,7 +166,7 @@ TRADE_SIZE_DOLLARS   = float(os.environ.get("TRADE_SIZE_DOLLARS", "5"))
 MAX_DAILY_LOSS       = float(os.environ.get("MAX_DAILY_LOSS_DOLLARS", "20"))
 VOL_HIGH_THRESH      = float(os.environ.get("VOL_HIGH_THRESH", "0.008"))
 POLL_INTERVAL        = int(os.environ.get("POLL_INTERVAL_SECS", "30"))
-MIN_BALANCE_FLOOR    = float(os.environ.get("MIN_BALANCE_FLOOR", "2.00"))
+MIN_BALANCE_FLOOR    = float(os.environ.get("MIN_BALANCE_FLOOR", "5.00"))  # raised: no micro-bets below $5
 YES_BREAKEVEN_PRICE  = int(os.environ.get("YES_BREAKEVEN_PRICE", "67"))  # raised from 65 to capture near-edge entries
 
 _mode_raw = os.environ.get("TRADER_MODE", "quant").lower().strip()
@@ -273,9 +273,10 @@ active_tickers: set  = set()
 paper_balance:         float = 25.0
 paper_daily_pnl:       float = 0.0
 session_start_balance: float = 0.0
+session_stop_threshold: float = 0.0  # halt if balance drops below this (set at boot)
 daily_pnl:             float = 0.0
 last_trade_ts:         float = -9999.0
-last_daily_summary_ts: float = 0.0   # for 8pm daily Telegram summary
+last_daily_summary_ts: float = 0.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -667,10 +668,25 @@ def cooldown_passed() -> bool:
 
 def daily_loss_check(balance: float) -> bool:
     pnl = paper_daily_pnl if DEMO_MODE else daily_pnl
+    # Hard dollar cap
     if pnl <= -MAX_DAILY_LOSS:
         log.warning("DAILY LOSS LIMIT │ $%.2f lost (cap $%.2f). Halting.",
             abs(pnl), MAX_DAILY_LOSS)
         telegram_halt(f"Daily loss cap ${MAX_DAILY_LOSS:.0f} hit. PnL: ${pnl:.2f}", balance)
+        return False
+    # Session stop: halt if balance drops below 50% of session start
+    # Prevents grinding $0.25 micro-bets into the floor on a bad run.
+    if session_stop_threshold > 0 and balance < session_stop_threshold:
+        log.warning(
+            "SESSION STOP │ Balance $%.2f < threshold $%.2f (50%% of start). "
+            "Halting to preserve capital for next session.",
+            balance, session_stop_threshold,
+        )
+        telegram_halt(
+            f"Session stop hit. Balance ${balance:.2f} < ${session_stop_threshold:.2f}. "
+            f"Halting. Reload to restart.",
+            balance,
+        )
         return False
     return True
 
@@ -905,7 +921,7 @@ def run_decision(market: dict, current_balance: float) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    global session_start_balance, daily_pnl, active_tickers
+    global session_start_balance, session_stop_threshold, daily_pnl, active_tickers
     global paper_balance, paper_daily_pnl, last_trade_ts, last_daily_summary_ts
 
     init_base_url()
@@ -925,11 +941,14 @@ def main() -> None:
 
     if DEMO_MODE:
         log.info("Starting paper balance: $%.2f", paper_balance)
+        session_stop_threshold = paper_balance * 0.50  # halt if 50% of start is lost
+        log.info("Session stop threshold: $%.2f (50%% of start)", session_stop_threshold)
         telegram_boot(paper_balance)
     else:
         bal = get_live_balance()
         session_start_balance = bal
-        log.info("Starting live balance: $%.2f", bal)
+        session_stop_threshold = bal * 0.50
+        log.info("Starting live balance: $%.2f | Session stop: $%.2f", bal, session_stop_threshold)
         telegram_boot(bal)
 
     resolve_cycle = 0
