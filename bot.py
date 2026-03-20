@@ -420,7 +420,9 @@ def btc_momentum_signal(ob_direction: str) -> tuple[str, float]:
     btc_direction = "yes" if move_pct > 0 else "no" if move_pct < 0 else "flat"
     ob_dir_lower  = ob_direction.lower()
 
-    if abs(move_pct) < 0.08:
+    # 0.20% threshold: requires a real $160+ BTC move, not $80 tick noise.
+    # Derived from the 0.3% HFT threshold scaled to our 30s poll interval.
+    if abs(move_pct) < 0.20:
         return "NEUTRAL", 0.0
 
     if btc_direction == ob_dir_lower:
@@ -1019,10 +1021,20 @@ def main() -> None:
                     losses = len(resolved) - wins
                     total = len(resolved)
                     wr    = wins / total if total > 0 else 0.0
+                    # Sharpe ratio: mean return / std of returns
+                    trade_pnls = [t.get("pnl", 0) for t in trade_history
+                                  if t.get("pnl") is not None and t.get("result") in ("win","loss")]
+                    if len(trade_pnls) >= 3:
+                        sr_mean = sum(trade_pnls) / len(trade_pnls)
+                        sr_std  = (sum((x - sr_mean)**2 for x in trade_pnls) / len(trade_pnls)) ** 0.5
+                        sharpe  = (sr_mean / sr_std) if sr_std > 0 else 0.0
+                        sharpe_str = f" │ Sharpe: {sharpe:.2f}"
+                    else:
+                        sharpe_str = ""
                     log.info(
                         "Portfolio │ Balance: $%.2f │ Session PnL: $%+.2f │ "
-                        "Open: %d │ WR: %.1f%%",
-                        live_bal, daily_pnl, len(open_orders), wr * 100,
+                        "Open: %d │ WR: %.1f%%%s",
+                        live_bal, daily_pnl, len(open_orders), wr * 100, sharpe_str,
                     )
 
                     # Daily summary Telegram at 8pm ET (~midnight UTC)
