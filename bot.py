@@ -458,7 +458,7 @@ def get_live_balance() -> float:
 
 
 def resolve_open_orders() -> None:
-    global active_tickers, paper_balance, paper_daily_pnl
+    global active_tickers, paper_balance, paper_daily_pnl, consecutive_losses
 
     if not open_orders:
         return
@@ -502,8 +502,6 @@ def resolve_open_orders() -> None:
     # This is because maker limit orders go: resting → filled → position → settled
     # The "settled" orders endpoint only catches unfilled orders that expired.
     try:
-        global consecutive_losses
-
         # ── Check positions (this is where wins/losses actually appear) ────
         pos_data = _get("/portfolio/positions", {"limit": 100, "settlement_status": "settled"})
         settled_positions = pos_data.get("market_positions", [])
