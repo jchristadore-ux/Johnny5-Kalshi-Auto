@@ -496,48 +496,79 @@ def resolve_open_orders() -> None:
                     outcome_str, paper_balance, consecutive_losses)
         return
 
-    # Live resolution
+    # Live resolution — dual strategy:
+    # 1. Check orders endpoint for canceled/expired-unfilled orders (cleanup)
+    # 2. Check positions endpoint for settled positions (actual win/loss)
+    # This is because maker limit orders go: resting → filled → position → settled
+    # The "settled" orders endpoint only catches unfilled orders that expired.
     try:
-        resting_data  = _get("/portfolio/orders", {"status": "resting",  "limit": 100})
-        settled_data  = _get("/portfolio/orders", {"status": "settled",  "limit": 100})
-        canceled_data = _get("/portfolio/orders", {"status": "canceled", "limit": 100})
+        global consecutive_losses
 
-        resting_ids  = {o["order_id"] for o in resting_data.get("orders",  [])}
-        settled_ids  = {o["order_id"] for o in settled_data.get("orders",  [])}
-        canceled_ids = {o["order_id"] for o in canceled_data.get("orders", [])}
-        done_ids     = settled_ids | canceled_ids
+        # ── Check positions (this is where wins/losses actually appear) ────
+        pos_data = _get("/portfolio/positions", {"limit": 100, "settlement_status": "settled"})
+        settled_positions = pos_data.get("market_positions", [])
 
-        for oid in list(open_orders.keys()):
-            trade  = open_orders[oid]
-            ticker = trade.get("ticker", "")
-            if oid in done_ids:
-                open_orders.pop(oid)
+        for pos in settled_positions:
+            ticker = pos.get("market_ticker", "")
+            # Match against our open_orders by ticker
+            matched_oid = None
+            for oid, trade in list(open_orders.items()):
+                if trade.get("ticker", "") == ticker:
+                    matched_oid = oid
+                    break
+
+            if matched_oid:
+                trade   = open_orders.pop(matched_oid)
                 active_tickers.discard(ticker)
-                won    = oid in settled_ids
-                count  = trade.get("count", 0)
-                price_c = trade.get("price", 0)
-                cost   = trade.get("cost", 0.0)
-                pnl    = round(count - cost, 2) if won else 0.0
+                # Kalshi position: realized_pnl tells us net result
+                realized = pos.get("realized_pnl", 0) or 0
+                realized_dollars = realized / 100.0  # Kalshi returns cents
+                won   = realized_dollars > 0
+                count = trade.get("count", 0)
+                cost  = trade.get("cost", 0.0)
+                pnl   = round(realized_dollars, 2)
                 result = "win" if won else "loss"
                 for t in trade_history:
-                    if t.get("order_id") == oid:
+                    if t.get("order_id") == matched_oid:
                         t["result"] = result
-                        t["pnl"]    = round(pnl if won else -cost, 4)
+                        t["pnl"]    = pnl
                         break
-                log.info("Order %s %s ticker=%s pnl=$%.2f",
-                    oid[:12], result, ticker[-15:], pnl if won else -cost)
+                log.info("✅ SETTLED │ %s │ %s │ pnl=$%.2f",
+                    ticker[-15:], result.upper(), pnl)
                 balance = get_live_balance()
-                # Update streak counter
                 if won:
                     consecutive_losses = 0
                     telegram_win(ticker, trade.get("side","?"),
-                                 count, price_c, pnl, balance)
+                                 count, trade.get("price", 0), pnl, balance)
                 else:
                     consecutive_losses += 1
                     log.info("Streak │ %d consecutive losses", consecutive_losses)
                     telegram_loss(ticker, trade.get("side","?"), cost, balance)
+
+        # ── Also clean up canceled/expired-unfilled orders ─────────────────
+        canceled_data = _get("/portfolio/orders", {"status": "canceled", "limit": 100})
+        canceled_ids  = {o["order_id"] for o in canceled_data.get("orders", [])}
+        for oid in list(open_orders.keys()):
+            trade  = open_orders[oid]
+            ticker = trade.get("ticker", "")
+            if oid in canceled_ids:
+                open_orders.pop(oid)
+                active_tickers.discard(ticker)
+                log.info("Order %s canceled (unfilled) │ %s", oid[:12], ticker[-15:])
+
+        # ── Time-based cleanup: if order is >20 min old and market has closed,
+        #    remove from tracking (position settled but ID match failed)
+        now = time.time()
+        stale = [oid for oid, t in open_orders.items()
+                 if now - t.get("placed_at", now) > 1200]  # 20 min
+        for oid in stale:
+            trade = open_orders.pop(oid)
+            ticker = trade.get("ticker", "")
+            active_tickers.discard(ticker)
+            log.info("Stale order purged │ %s (>20min old, market closed)", ticker[-15:])
+
     except Exception as e:
-        log.debug("Order resolution failed: %s", e)
+        log.warning("Order resolution error: %s", e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -972,7 +1003,12 @@ def main() -> None:
         bal = get_live_balance()
         session_start_balance = bal
         session_stop_threshold = bal * 0.50
+        # Clear any stale in-memory state from prior session
+        open_orders.clear()
+        active_tickers.clear()
+        consecutive_losses = 0
         log.info("Starting live balance: $%.2f | Session stop: $%.2f", bal, session_stop_threshold)
+        log.info("State cleared — fresh session start")
         telegram_boot(bal)
 
     resolve_cycle = 0
@@ -1023,14 +1059,16 @@ def main() -> None:
                     wr    = wins / total if total > 0 else 0.0
                     # Sharpe ratio: mean return / std of returns
                     trade_pnls = [t.get("pnl", 0) for t in trade_history
-                                  if t.get("pnl") is not None and t.get("result") in ("win","loss")]
+                                  if t.get("pnl") is not None
+                                  and t.get("result") in ("win","loss")
+                                  and t.get("pnl") != 0]  # exclude unresolved
                     if len(trade_pnls) >= 3:
                         sr_mean = sum(trade_pnls) / len(trade_pnls)
                         sr_std  = (sum((x - sr_mean)**2 for x in trade_pnls) / len(trade_pnls)) ** 0.5
                         sharpe  = (sr_mean / sr_std) if sr_std > 0 else 0.0
                         sharpe_str = f" │ Sharpe: {sharpe:.2f}"
                     else:
-                        sharpe_str = ""
+                        sharpe_str = f" │ Sharpe: n/a ({len(trade_pnls)} resolved)"
                     log.info(
                         "Portfolio │ Balance: $%.2f │ Session PnL: $%+.2f │ "
                         "Open: %d │ WR: %.1f%%%s",
