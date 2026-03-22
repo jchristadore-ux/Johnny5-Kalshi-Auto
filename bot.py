@@ -798,6 +798,13 @@ def place_limit_order(ticker: str, direction: str, size_dollars: float,
         log.info("🟡 PAPER │ %s %s │ %d contracts @ %dc │ cost=$%.2f │ bal=$%.2f │ [%s]",
             direction, ticker[-15:], count, limit_price_cents,
             cost, paper_balance, ACTIVE_MODE.value.upper())
+        tg.send_trade_entry_notification(
+            ticker=ticker,
+            direction=direction,
+            cost=cost,
+            price_cents=limit_price_cents,
+            balance=paper_balance,
+        )
         return client_id
 
     # Live order — maker limit only
@@ -833,6 +840,14 @@ def place_limit_order(ticker: str, direction: str, size_dollars: float,
         log.info("✅ ORDER │ %s %s │ %d contracts @ %dc │ $%.2f │ ID:%s │ [%s]",
             direction, ticker[-15:], count, limit_price_cents,
             size_dollars, order_id[:12], ACTIVE_MODE.value.upper())
+        live_bal = get_live_balance()
+        tg.send_trade_entry_notification(
+            ticker=ticker,
+            direction=direction,
+            cost=cost,
+            price_cents=limit_price_cents,
+            balance=live_bal,
+        )
         return order_id
     except requests.HTTPError as e:
         log.error("Order failed │ HTTP %s │ %s", e.response.status_code, e.response.text[:200])
@@ -1087,7 +1102,7 @@ def main() -> None:
         except KeyboardInterrupt:
             final = paper_balance if DEMO_MODE else get_live_balance()
             log.info("Shutting down. Final balance: $%.2f", final)
-            send_telegram(f"🛑 Johnny5 stopped. Final balance: ${final:.2f}")
+            tg.send_telegram_message(f"🛑 Johnny5 stopped. Final balance: ${final:.2f}")
             break
         except Exception as e:
             log.error("Unexpected error: %s", e, exc_info=True)

@@ -84,6 +84,44 @@ def send_telegram_message(text: str) -> bool:
     return _send_raw(text)
 
 
+def send_trade_entry_notification(
+    ticker: str,
+    direction: str,
+    cost: float,
+    price_cents: int,
+    balance: float,
+    timestamp: Optional[datetime] = None,
+) -> None:
+    """
+    Send a trade entry alert when a position is opened.
+
+    Args:
+        ticker:      Market ticker, e.g. "KXBTC15M-26MAR2200"
+        direction:   "YES" (→ UP) or "NO" (→ DOWN)
+        cost:        Dollar cost of the trade
+        price_cents: Limit price in cents
+        balance:     Current account balance after cost deducted
+        timestamp:   Entry time; defaults to now (UTC)
+    """
+    if not _telegram_enabled:
+        return
+
+    ts  = (timestamp or datetime.now(timezone.utc)).strftime("%Y-%m-%d %H:%M:%S UTC")
+    pos = "UP" if direction.upper() == "YES" else "DOWN"
+
+    msg = (
+        f"🟡 TRADE ENTERED\n"
+        f"📊 Market:    {ticker}\n"
+        f"📍 Position:  {pos}\n"
+        f"💵 Cost:      ${cost:.2f}\n"
+        f"🎯 Price:     {price_cents}¢\n"
+        f"🏦 Balance:   ${balance:,.2f}\n"
+        f"⏱  Time:      {ts}"
+    )
+
+    send_telegram_message(msg)
+
+
 def send_win_notification(
     profit: float,
     balance: float,
