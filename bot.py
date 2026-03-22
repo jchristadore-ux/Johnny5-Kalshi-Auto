@@ -49,7 +49,6 @@ import base64
 import logging
 import math
 import os
-import statistics
 import time
 import uuid
 from collections import deque
@@ -453,12 +452,16 @@ def resolve_open_orders() -> None:
                 won   = random.random() < 0.685  # observed signal accuracy
                 count = trade.get("count", 0)
                 cost  = trade.get("cost", 0.0)
-                pnl   = round(count - cost, 2) if won else 0.0
-                # Credit payout to balance, daily, and running PnL
-                trade_pnl    = pnl if won else -cost
-                paper_balance   += pnl
+                # Net PnL: win → profit = full payout minus what we paid
+                #          loss → we already deducted cost at entry, no extra credit
+                trade_pnl = round(count - cost, 2) if won else -cost
+                # Balance: add full contract payout on win (cost was deducted at entry).
+                # On loss, balance stays at the post-entry value (cost already gone).
+                if won:
+                    paper_balance += count   # return of principal + profit
                 paper_daily_pnl += trade_pnl
                 running_pnl     += trade_pnl
+                pnl = trade_pnl if won else 0.0  # for outcome_str below
                 result = "win" if won else "loss"
                 for t in trade_history:
                     if t.get("order_id") == oid:
@@ -649,8 +652,11 @@ def calc_ob_imbalance(ob_data: dict, yes_mid: int) -> tuple:
     no_d  = depth(no_levels,  n_lo, n_hi)
     total = yes_d + no_d
 
-    if total < 1.0:
-        log.info("OB │ Near-money depth too thin (yes=%.0f no=%.0f). NONE.", yes_d, no_d)
+    # Require at least $5 near-money depth before trusting the imbalance ratio.
+    # At $1 the ratio is noise — a single $0.60 order swings it to 60%+.
+    if total < 5.0:
+        log.info("OB │ Near-money depth too thin (yes=$%.0f no=$%.0f total=$%.0f < $5). NONE.",
+                 yes_d, no_d, total)
         return 0.5, "NONE"
 
     yr     = yes_d / total
@@ -776,9 +782,12 @@ def place_limit_order(ticker: str, direction: str, size_dollars: float,
     client_id = f"j5-{ACTIVE_MODE.value[:4]}-{uuid.uuid4().hex[:8]}"
 
     if DEMO_MODE:
-        paper_balance   -= cost
-        paper_daily_pnl -= cost
-        last_trade_ts    = time.time()
+        paper_balance -= cost
+        # Do NOT touch paper_daily_pnl here — cost is only "reserved" until
+        # settlement.  Debiting it at entry AND at settlement produces
+        # double-counting: losses get charged twice, wins under-report profit.
+        # paper_daily_pnl is updated exclusively inside resolve_open_orders().
+        last_trade_ts = time.time()
         active_tickers.add(ticker)
         record = {
             "time":      datetime.now(timezone.utc).isoformat(),
@@ -882,6 +891,10 @@ def run_decision(market: dict, current_balance: float) -> None:
     # After MAX_CONSEC_LOSSES, skip one window to let the regime reset,
     # then clear the counter so trading can resume. Without the reset here
     # the bot enters a deadlock: no trades → no wins → streak never clears.
+    # NOTE: 'global consecutive_losses' is required — assigning to it here
+    # without this declaration would make Python treat the entire function's
+    # consecutive_losses as a local, causing UnboundLocalError at the check.
+    global consecutive_losses
     MAX_CONSEC_LOSSES = int(os.environ.get("MAX_CONSEC_LOSSES", "3"))
     if consecutive_losses >= MAX_CONSEC_LOSSES:
         log.info(
