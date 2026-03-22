@@ -354,12 +354,16 @@ def telegram_daily_summary(balance: float, pnl: float, wins: int,
 # Fallback: use Kalshi market mid-price as proxy.
 # ─────────────────────────────────────────────────────────────────────────────
 
-_btc_feed_failed = False   # flag to stop retrying after persistent failure
+_btc_feed_backoff_until: float = 0.0   # retry BTC feed after this timestamp
 
 def fetch_btc_price() -> Optional[float]:
-    """Fetch BTC/USD from Kraken public ticker. Returns None on failure."""
-    global _btc_feed_failed
-    if _btc_feed_failed:
+    """Fetch BTC/USD from Kraken public ticker, Coinbase as fallback.
+
+    On persistent failure, backs off for 5 minutes before retrying.
+    This prevents log spam while still recovering when the feed comes back.
+    """
+    global _btc_feed_backoff_until
+    if time.time() < _btc_feed_backoff_until:
         return None
     try:
         r = requests.get(
@@ -385,9 +389,9 @@ def fetch_btc_price() -> Optional[float]:
             return float(r.json()["data"]["amount"])
     except Exception:
         pass
-    # Mark as failed after persistent errors to avoid log spam
-    log.debug("BTC price feed unavailable — using Kalshi mid as proxy")
-    _btc_feed_failed = True
+    # Both feeds failed — back off 5 min to avoid log spam, then retry
+    log.debug("BTC price feed unavailable — backing off 5 min before retry")
+    _btc_feed_backoff_until = time.time() + 300
     return None
 
 
@@ -433,15 +437,16 @@ def btc_momentum_signal(ob_direction: str) -> tuple[str, float]:
 
 
 def update_btc_price(market: dict) -> None:
-    """Update BTC price — try Kraken first, fall back to market mid."""
+    """Update BTC price from Kraken/Coinbase. Skip update if both fail.
+
+    We intentionally do NOT fall back to the Kalshi market mid-price.
+    A binary option's mid-price (e.g. 50c) is not a proxy for BTC spot —
+    appending mid*1000 to btc_prices would corrupt the momentum signal by
+    mixing a fundamentally different data stream into the price history.
+    """
     price = fetch_btc_price()
     if price and price > 1000:
         btc_prices.append(price)
-    else:
-        # Use Kalshi market mid as proxy (price direction still informative)
-        mid = market.get("yes_mid", 0)
-        if mid > 0:
-            btc_prices.append(float(mid) * 1000)  # scale to look like BTC price
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -689,8 +694,8 @@ def kelly_bet_size(win_prob: float, contract_price_cents: int,
         return 0.0
     b          = (100 - contract_price_cents) / float(contract_price_cents)
     full_kelly = max(0.0, (b * win_prob - (1 - win_prob)) / b)
-    # Scale: kelly_frac of full kelly, capped at trade limit and 20% of balance
-    bet = full_kelly * PROFILE["kelly_frac"] * TRADE_SIZE_DOLLARS * 4.0
+    # Proper fractional Kelly: fraction of actual bankroll, capped at trade limit
+    bet = full_kelly * PROFILE["kelly_frac"] * balance
     return round(min(bet, TRADE_SIZE_DOLLARS, balance * 0.20), 2)
 
 
@@ -871,15 +876,16 @@ def run_decision(market: dict, current_balance: float) -> None:
     if not daily_loss_check(current_balance):     return
 
     # ── Streak filter ──────────────────────────────────────────────────────
-    # After 3 consecutive losses, skip the next market window to let the
-    # regime reset. Simulation shows this cuts worst-case losses ~40%
-    # with minimal impact on average P&L.
+    # After MAX_CONSEC_LOSSES, skip one window to let the regime reset,
+    # then clear the counter so trading can resume. Without the reset here
+    # the bot enters a deadlock: no trades → no wins → streak never clears.
     MAX_CONSEC_LOSSES = int(os.environ.get("MAX_CONSEC_LOSSES", "3"))
     if consecutive_losses >= MAX_CONSEC_LOSSES:
         log.info(
-            "Streak filter │ %d consecutive losses. Skipping market to let regime reset.",
+            "Streak filter │ %d consecutive losses. Skipping one window, resetting counter.",
             consecutive_losses,
         )
+        consecutive_losses = 0
         return
 
     # ── OB Signal ─────────────────────────────────────────────────────────
@@ -1033,7 +1039,7 @@ def main() -> None:
             run_decision(market, current_balance)
 
             resolve_cycle += 1
-            if resolve_cycle % 10 == 0:
+            if resolve_cycle % 3 == 0:
                 resolve_open_orders()
 
                 if DEMO_MODE:
