@@ -61,6 +61,8 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
+import telegram_utils as tg   # WIN-only notification module (validates at startup)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -275,35 +277,24 @@ paper_daily_pnl:       float = 0.0
 session_start_balance: float = 0.0
 session_stop_threshold: float = 0.0  # halt if balance drops below this (set at boot)
 daily_pnl:             float = 0.0
+running_pnl:           float = 0.0   # cumulative session PnL across all settled trades
 last_trade_ts:         float = -9999.0
 last_daily_summary_ts: float = 0.0
 consecutive_losses:    int   = 0      # streak filter: pause after 3 in a row
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TELEGRAM — all event types
+# TELEGRAM — thin wrappers routed through telegram_utils
+#
+# Trade WIN alerts are sent exclusively via tg.send_win_notification().
+# Loss notifications are intentionally omitted — only high-signal WIN events
+# generate messages.  Halt and daily-summary messages are retained because
+# they are operational (not trade-result) notifications.
 # ─────────────────────────────────────────────────────────────────────────────
-
-def send_telegram(message: str) -> None:
-    token   = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-    if not token or not chat_id:
-        return
-    try:
-        r = requests.post(
-            f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": message},
-            timeout=8,
-        )
-        if r.status_code != 200:
-            log.debug("Telegram error: %s", r.text[:100])
-    except Exception:
-        pass
-
 
 def telegram_boot(balance: float) -> None:
     mode = "📋 PAPER" if DEMO_MODE else "🔴 LIVE"
-    send_telegram(
+    tg.send_telegram_message(
         f"🤖 Johnny5 v5.0 STARTED\n"
         f"Mode: {mode} | Archetype: {ACTIVE_MODE.value.upper()}\n"
         f"Balance: ${balance:.2f} | Max bet: ${TRADE_SIZE_DOLLARS:.2f}\n"
@@ -311,28 +302,10 @@ def telegram_boot(balance: float) -> None:
     )
 
 
-def telegram_win(ticker: str, side: str, count: int, price_c: int,
-                 profit: float, balance: float) -> None:
-    send_telegram(
-        f"🟢 WIN +${profit:.2f}\n"
-        f"📈 {side} on {ticker[-15:]}\n"
-        f"   {count}x @ {price_c}c\n"
-        f"💵 Balance: ${balance:.2f}"
-    )
-
-
-def telegram_loss(ticker: str, side: str, loss: float, balance: float) -> None:
-    if DEMO_MODE:
-        return  # silent in paper mode
-    send_telegram(
-        f"🔴 LOSS -${loss:.2f}\n"
-        f"📉 {side} on {ticker[-15:]}\n"
-        f"💵 Balance: ${balance:.2f}"
-    )
-
-
 def telegram_halt(reason: str, balance: float) -> None:
-    send_telegram(f"⚠️ Johnny5 HALTED\nReason: {reason}\nBalance: ${balance:.2f}")
+    tg.send_telegram_message(
+        f"⚠️ Johnny5 HALTED\nReason: {reason}\nBalance: ${balance:.2f}"
+    )
 
 
 def telegram_daily_summary(balance: float, pnl: float, wins: int,
@@ -340,7 +313,7 @@ def telegram_daily_summary(balance: float, pnl: float, wins: int,
     total = wins + losses
     wr    = wins / total * 100 if total > 0 else 0.0
     emoji = "📈" if pnl >= 0 else "📉"
-    send_telegram(
+    tg.send_telegram_message(
         f"{emoji} Daily Summary\n"
         f"P&L: ${pnl:+.2f} | Balance: ${balance:.2f}\n"
         f"Trades: {total} | WR: {wr:.0f}% ({wins}W/{losses}L)"
@@ -463,7 +436,7 @@ def get_live_balance() -> float:
 
 
 def resolve_open_orders() -> None:
-    global active_tickers, paper_balance, paper_daily_pnl, consecutive_losses
+    global active_tickers, paper_balance, paper_daily_pnl, consecutive_losses, running_pnl
 
     if not open_orders:
         return
@@ -481,19 +454,28 @@ def resolve_open_orders() -> None:
                 count = trade.get("count", 0)
                 cost  = trade.get("cost", 0.0)
                 pnl   = round(count - cost, 2) if won else 0.0
-                # FIXED: credit payout to BOTH paper_balance AND paper_daily_pnl
+                # Credit payout to balance, daily, and running PnL
+                trade_pnl    = pnl if won else -cost
                 paper_balance   += pnl
-                paper_daily_pnl += pnl
+                paper_daily_pnl += trade_pnl
+                running_pnl     += trade_pnl
                 result = "win" if won else "loss"
                 for t in trade_history:
                     if t.get("order_id") == oid:
                         t["result"] = result
-                        t["pnl"]    = round(pnl if won else -cost, 4)
+                        t["pnl"]    = round(trade_pnl, 4)
                         break
                 outcome_str = f"+${pnl:.2f}" if won else f"-${cost:.2f}"
-                # Update streak counter in paper mode too
                 if won:
                     consecutive_losses = 0
+                    # WIN alert — include running PnL so paper sessions are trackable
+                    tg.send_win_notification(
+                        profit=pnl,
+                        balance=paper_balance,
+                        running_pnl=running_pnl,
+                        ticker=ticker,
+                        direction=trade.get("side", "YES"),
+                    )
                 else:
                     consecutive_losses += 1
                 log.info("📋 PAPER SETTLED │ %s │ %s │ %s → %s │ paper_bal=$%.2f │ streak=%d",
@@ -530,6 +512,7 @@ def resolve_open_orders() -> None:
                 count = trade.get("count", 0)
                 cost  = trade.get("cost", 0.0)
                 pnl   = round(realized_dollars, 2)
+                running_pnl += pnl
                 result = "win" if won else "loss"
                 for t in trade_history:
                     if t.get("order_id") == matched_oid:
@@ -541,12 +524,17 @@ def resolve_open_orders() -> None:
                 balance = get_live_balance()
                 if won:
                     consecutive_losses = 0
-                    telegram_win(ticker, trade.get("side","?"),
-                                 count, trade.get("price", 0), pnl, balance)
+                    # WIN-only notification — losses are intentionally silent
+                    tg.send_win_notification(
+                        profit=pnl,
+                        balance=balance,
+                        running_pnl=running_pnl,
+                        ticker=ticker,
+                        direction=trade.get("side", "YES"),
+                    )
                 else:
                     consecutive_losses += 1
-                    log.info("Streak │ %d consecutive losses", consecutive_losses)
-                    telegram_loss(ticker, trade.get("side","?"), cost, balance)
+                    log.info("Loss │ $%.2f │ streak=%d", cost, consecutive_losses)
 
         # ── Also clean up canceled/expired-unfilled orders ─────────────────
         canceled_data = _get("/portfolio/orders", {"status": "canceled", "limit": 100})
@@ -981,7 +969,8 @@ def run_decision(market: dict, current_balance: float) -> None:
 
 def main() -> None:
     global session_start_balance, session_stop_threshold, daily_pnl, active_tickers
-    global paper_balance, paper_daily_pnl, last_trade_ts, last_daily_summary_ts, consecutive_losses
+    global paper_balance, paper_daily_pnl, last_trade_ts, last_daily_summary_ts
+    global consecutive_losses, running_pnl
 
     init_base_url()
 
@@ -997,6 +986,14 @@ def main() -> None:
              YES_BREAKEVEN_PRICE, MIN_BALANCE_FLOOR, PROFILE.get("min_spread", 2))
     log.info("  %s", "📋 PAPER — zero real orders" if DEMO_MODE else "⚠️  LIVE — real money")
     log.info("━" * 70)
+
+    # ── Telegram: validate credentials, then send boot message ───────────────
+    # validate_telegram_connection() sends a connectivity test and enables the
+    # module. telegram_boot() follows with session-specific details.
+    # The bot continues whether or not Telegram is reachable.
+    tg.validate_telegram_connection()
+
+    running_pnl = 0.0   # reset cumulative PnL at session start
 
     if DEMO_MODE:
         log.info("Starting paper balance: $%.2f", paper_balance)
