@@ -49,7 +49,6 @@ import base64
 import logging
 import math
 import os
-import statistics
 import time
 import uuid
 from collections import deque
@@ -279,6 +278,7 @@ session_stop_threshold: float = 0.0  # halt if balance drops below this (set at 
 daily_pnl:             float = 0.0
 last_trade_ts:         float = -9999.0
 last_daily_summary_ts: float = 0.0
+last_heartbeat_ts:     float = 0.0    # 15-min Telegram status heartbeat
 consecutive_losses:    int   = 0      # streak filter: pause after 3 in a row
 last_signal_desc:      str   = "none yet"  # for heartbeat
 last_heartbeat_ts:     float = 0.0         # timestamp of last heartbeat
@@ -632,8 +632,11 @@ def calc_ob_imbalance(ob_data: dict, yes_mid: int) -> tuple:
     no_d  = depth(no_levels,  n_lo, n_hi)
     total = yes_d + no_d
 
-    if total < 1.0:
-        log.info("OB │ Near-money depth too thin (yes=%.0f no=%.0f). NONE.", yes_d, no_d)
+    # Require at least $5 near-money depth before trusting the imbalance ratio.
+    # At $1 the ratio is noise — a single $0.60 order swings it to 60%+.
+    if total < 5.0:
+        log.info("OB │ Near-money depth too thin (yes=$%.0f no=$%.0f total=$%.0f < $5). NONE.",
+                 yes_d, no_d, total)
         return 0.5, "NONE"
 
     yr     = yes_d / total
@@ -760,9 +763,12 @@ def place_limit_order(ticker: str, direction: str, size_dollars: float,
     client_id = f"j5-{ACTIVE_MODE.value[:4]}-{uuid.uuid4().hex[:8]}"
 
     if DEMO_MODE:
-        paper_balance   -= cost
-        paper_daily_pnl -= cost
-        last_trade_ts    = time.time()
+        paper_balance -= cost
+        # Do NOT touch paper_daily_pnl here — cost is only "reserved" until
+        # settlement.  Debiting it at entry AND at settlement produces
+        # double-counting: losses get charged twice, wins under-report profit.
+        # paper_daily_pnl is updated exclusively inside resolve_open_orders().
+        last_trade_ts = time.time()
         active_tickers.add(ticker)
         record = {
             "time":      datetime.now(timezone.utc).isoformat(),
@@ -1083,7 +1089,19 @@ def main() -> None:
                         live_bal, daily_pnl, len(open_orders), wr * 100, sharpe_str,
                     )
 
-                    # Daily summary Telegram at 8pm ET (~midnight UTC)
+                    # 15-min heartbeat — confirms bot is alive during live sessions
+                    if time.time() - last_heartbeat_ts >= 900:
+                        last_heartbeat_ts = time.time()
+                        wr_pct = wr * 100
+                        tg.send_telegram_message(
+                            f"💓 Johnny5 alive\n"
+                            f"🏦 Balance:  ${live_bal:,.2f}\n"
+                            f"📈 PnL:      ${daily_pnl:+.2f}\n"
+                            f"📊 WR:       {wr_pct:.0f}% ({wins}W/{losses}L)\n"
+                            f"🔄 Open:     {len(open_orders)}"
+                        )
+
+                    # Daily summary Telegram at midnight UTC (~8pm ET)
                     now_utc_hour = datetime.now(timezone.utc).hour
                     if now_utc_hour == 0 and time.time() - last_daily_summary_ts > 3600:
                         last_daily_summary_ts = time.time()
