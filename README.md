@@ -1,17 +1,44 @@
-# Johnny5-Kalshi-Auto v3.0
+# Johnny5-Kalshi-Auto v5.2.0
 
-> The definitive Kalshi quant trading bot. Order Book Pressure + Volatility Regime Switching + Fractional Kelly + Maker-Side Execution + 5 Elite Trader Archetypes.
+> Production quant bot for Kalshi 15-minute BTC up/down prediction markets.
+> Near-money order book pressure + BTC momentum confirmation + fractional Kelly sizing.
 
 ---
 
-## What's New in v3.0
+## Strategy
 
-- **Correct authentication**: RSA-PSS signed requests (the only auth Kalshi's v2 API accepts). Previous versions used deprecated email/password login — this was a critical bug that would have caused silent auth failures.
-- **Favourite-longshot bias filter**: Academic research (Bürgi et al. 2025) proves Kalshi contracts below ~20c lose ~60% of capital. Every archetype enforces a price range filter.
-- **Maker-side limit orders**: Makers consistently outperform takers on Kalshi. Bot posts limit orders 1 cent inside the spread — never crosses it.
-- **Position resolution loop**: Bot polls settled orders and resolves win/loss for accurate rolling win rate tracking.
-- **Daily loss hard stop**: Fetches real balance on startup and enforces a max daily loss dollar limit.
-- **Rate limit / error resilience**: Exponential backoff on 429, graceful handling of 401/403, connection errors, timeouts.
+### Signal 1 — Near-Money OB Pressure (primary edge)
+Measures dollar depth within ±10 cents of the current mid-price on the YES/NO order book. If ≥62% of near-money depth sits on one side, smart money is positioned there. Requires ≥$5 total depth to prevent single resting orders from manufacturing false signals.
+
+### Signal 2 — BTC Momentum Confirmation
+Fetches live BTC/USD price from Kraken (Coinbase fallback). If BTC moved ≥0.20% in the same direction as the OB signal in the last 2 minutes → AGREE (boosts win probability). If BTC moved against the OB signal → CONFLICT (trade skipped). Flat market → NEUTRAL (no adjustment).
+
+### Signal 3 — Price Breakeven Guard
+Only enters contracts priced ≤67 cents. At 68.5% historical win rate, the mathematical breakeven is 68 cents. This ensures positive expected value on every trade.
+
+### Signal 4 — Bias Filter
+Skips contracts priced <35 cents or >65 cents. Academic research (Bürgi et al. 2025) confirms Kalshi contracts below ~20 cents lose ~60% of capital on average.
+
+### Sizing — Fractional Kelly
+`f* = (b×p - q) / b` where b = net odds, p = OB win probability, q = 1-p.
+Kelly fraction: 35% (grid-search optimal). Capped at TRADE_SIZE_DOLLARS and 20% of balance.
+
+### Execution — Maker Limit Orders
+Posts limit orders one cent inside the best bid/ask. Kalshi makers pay zero fee. Takers pay ~1% of winnings. Fee drag on taker orders: ~$5+/day at scale.
+
+---
+
+## Risk Controls
+
+| Control | Behavior |
+|---|---|
+| Balance floor | Halts if balance < MIN_BALANCE_FLOOR ($5 default) |
+| Session stop | Halts if balance drops below 50% of session-start balance |
+| Daily loss cap | Halts if session P&L ≤ -MAX_DAILY_LOSS_DOLLARS |
+| Position guard | One entry per market ticker, no re-entry until expiry |
+| Expiry guard | Skips contracts priced >85c or <15c (near-certain outcome, zero EV) |
+| Spread guard | Skips zero/crossed spreads (broken book) |
+| Streak filter | After 3 consecutive losses, skips one window then resets counter |
 
 ---
 
@@ -19,136 +46,86 @@
 
 | File | Purpose |
 |---|---|
-| `bot.py` | The trading bot — runs on Railway |
+| `bot.py` | Main trading bot — runs on Railway |
+| `telegram_utils.py` | Telegram notification module |
 | `requirements.txt` | Python dependencies |
 | `railway.toml` | Railway deployment config |
-| `control-panel.html` | Open locally — AI-powered control panel |
-| `README.md` | This file |
 
 ---
 
-## Step-by-Step Setup
+## Setup
 
-### Step 1: Create the GitHub Repository
+### Step 1 — Kalshi RSA API Keys
+1. Log into kalshi.com → Settings → API Keys → Create New Key
+2. Save the Key ID (UUID format) and download the PEM file
+3. The PEM looks like: `-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----`
 
-1. Go to **github.com** → click **New** → name it `Johnny5-Kalshi-Auto`
-2. Set to Public or Private (your choice)
-3. Do NOT initialize with README (you'll upload the files)
+### Step 2 — GitHub Repo
+Upload all four files to a new GitHub repo. Commit to `main`.
 
-### Step 2: Upload the Files
+### Step 3 — Railway
+1. New Project → Deploy from GitHub Repo → select your repo
+2. Variables tab → add all variables below
 
-In your new GitHub repo, click **Add file → Upload files** and upload:
-- `bot.py`
-- `requirements.txt`
-- `railway.toml`
-- `README.md`
+### Step 4 — Telegram Bot (optional but strongly recommended)
+1. Message @BotFather on Telegram → `/newbot` → follow prompts → save the token
+2. Message your bot once, then visit `https://api.telegram.org/bot<TOKEN>/getUpdates`
+3. Copy the `chat.id` value
 
-Commit directly to `main`.
+---
 
-### Step 3: Get Your Kalshi RSA API Keys
+## Environment Variables
 
-**This is different from your email/password. You need RSA keys.**
-
-1. Log into [kalshi.com](https://kalshi.com)
-2. Go to **Settings → API Keys** (or **Account → Profile → API Keys**)
-3. Click **Create New API Key**
-4. Kalshi will generate:
-   - A **Key ID** (looks like `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`)
-   - A **Private Key PEM file** (download it — you only get it once)
-5. Open the `.txt` or `.pem` file. It looks like:
-   ```
-   -----BEGIN PRIVATE KEY-----
-   MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQC...
-   -----END PRIVATE KEY-----
-   ```
-6. Save both values securely.
-
-### Step 4: Connect to Railway
-
-1. Go to [railway.app](https://railway.app)
-2. Click **New Project → Deploy from GitHub Repo**
-3. Select `Johnny5-Kalshi-Auto`
-4. Railway will detect `railway.toml` and configure automatically
-
-### Step 5: Set Environment Variables in Railway
-
-Go to your Railway project → **Variables** tab → add each of these:
-
-| Variable | Value | Notes |
+| Variable | Default | Notes |
 |---|---|---|
-| `KALSHI_API_KEY_ID` | Your Key ID from Step 3 | Required |
-| `KALSHI_PRIVATE_KEY_PEM` | The full PEM string | Paste the entire `-----BEGIN...END-----` block. Replace newlines with `\n` if needed |
-| `DEMO_MODE` | `true` | Change to `false` for live trading |
-| `TRADER_MODE` | `quant` | Options: `quant`, `domahhhh`, `gaetend`, `debl00b`, `sudeith`, `duckguesses` |
-| `TRADE_SIZE_DOLLARS` | `10` | Max dollars per trade |
-| `MAX_DAILY_LOSS_DOLLARS` | `50` | Hard stop loss per day |
-| `MIN_WIN_RATE` | `0.45` | Pause if rolling win rate drops below this |
-| `POLL_INTERVAL_SECS` | `30` | How often to scan markets |
-| `VOL_HIGH_THRESH` | `0.008` | BTC log-return stdev threshold for HIGH vol regime |
-| `GITHUB_TOKEN` | Your GitHub PAT | For control panel auto-deploy |
-
-**Note on PEM newlines**: Railway may strip newlines from multi-line env vars. Replace actual newlines with `\n` in one long string:
-```
------BEGIN PRIVATE KEY-----\nMIIEvgIBADA...\n-----END PRIVATE KEY-----
-```
-The bot handles `\n` → newline conversion automatically.
-
-### Step 6: Deploy
-
-Railway will auto-deploy when you push to `main`. To trigger manually, click **Deploy** in the Railway dashboard.
-
-### Step 7: Open the Control Panel
-
-Open `control-panel.html` in your browser (just double-click it). It runs entirely locally — no server needed.
-
-Enter your GitHub token, select an archetype, adjust sliders, and click **Push Params to GitHub** to update config without touching code.
-
-To make code changes: type a plain-English instruction in the AI Command box and click **Generate + Deploy**.
+| `KALSHI_API_KEY_ID` | required | UUID from Kalshi Settings → API Keys |
+| `KALSHI_PRIVATE_KEY_PEM` | required | Full PEM. Replace newlines with `\n` if needed |
+| `DEMO_MODE` | `true` | Set `false` for live trading |
+| `TRADER_MODE` | `quant` | Only `quant` is recommended for live |
+| `TRADE_SIZE_DOLLARS` | `5` | Max dollars per trade |
+| `MAX_DAILY_LOSS_DOLLARS` | `20` | Hard stop loss per session |
+| `MIN_BALANCE_FLOOR` | `5` | Halt if balance drops below this |
+| `YES_BREAKEVEN_PRICE` | `67` | Skip contracts above this price (cents) |
+| `KELLY_FRACTION` | `0.35` | Grid-search optimal — do not raise without backtesting |
+| `MAX_CONSEC_LOSSES` | `3` | Streak filter threshold |
+| `PAPER_BALANCE` | `25.0` | Starting balance in paper mode |
+| `POLL_INTERVAL_SECS` | `30` | Market scan frequency |
+| `TELEGRAM_BOT_TOKEN` | optional | From @BotFather |
+| `TELEGRAM_CHAT_ID` | optional | Your Telegram chat ID |
 
 ---
 
-## Trader Archetypes
+## Telegram Alerts
 
-| Mode | Based On | Contract Range | Kelly | Edge Bar | Vol |
-|---|---|---|---|---|---|
-| `quant` | Native quant | 40–85c | 25% | 4% | Any |
-| `domahhhh` | $980K profit | 60–92c | 40% | 6% | Any |
-| `gaetend` | $420K profit | 35–75c | 25% | 3% | High only |
-| `debl00b` | $42M volume | 40–60c | 15% | 1% | Low only |
-| `sudeith` | 100hr/wk analyst | 45–80c | 30% | 8% | Any |
-| `duckguesses` | $100→$145K | 68–90c | 50% | 5% | Any |
-
-**Start with `domahhhh` mode** — strongest documented results, most intuitive behavior.
+| Event | Fires |
+|---|---|
+| Boot | Always (includes balance, caps, version) |
+| Heartbeat | Every 15 minutes (balance, P&L, open orders, last signal) |
+| Trade entered | Every live order placed (OB%, edge%, cost) |
+| WIN | Every settled winning trade |
+| LOSS | Every settled losing trade (live mode only) |
+| HALT | Session stop, daily loss cap, balance floor |
+| Daily summary | Midnight UTC (~8pm ET) |
+| Shutdown | On manual stop |
 
 ---
 
-## Strategy Explained
+## Version History
 
-### Signal 1: Order Book Pressure
-Measures depth-weighted imbalance across top-5 levels of the YES/NO order book. If ≥X% of depth sits on one side, smart money is positioned there — we follow. Threshold varies by archetype.
-
-### Signal 2: BTC Volatility Regime
-Pulls live BTC price from Binance (no key needed). Calculates realized volatility from log-returns over last 90 minutes. Classifies regime as HIGH or LOW. Some archetypes only trade in specific regimes.
-
-### Signal 3: Favourite-Longshot Bias Filter
-Academic finding: Kalshi contracts priced below ~20c lose approximately 60% of invested capital on average. High-priced contracts (>55c) have positive expected value. Every archetype defines a profitable price range — trades outside it are rejected.
-
-### Signal 4: Cross-Market Consensus (SUDEITH mode)
-Blends OB pressure (60% weight) with a BTC vol-implied probability estimate (40% weight). Only fires when both signals agree. Highest edge requirement of all archetypes.
-
-### Sizing: Fractional Kelly Criterion
-Kelly formula: `f* = (b*p - q) / b` where b = net odds, p = win probability, q = 1-p.
-Each archetype applies a fraction (15%–50%) to ensure no single trade can significantly damage the account.
-
-### Execution: Maker Limit Orders
-Bot posts limit orders 1 cent inside the current best bid/ask. This places the bot on the maker side of the transaction. Academic data confirms makers consistently outperform takers on Kalshi.
+| Version | Key Changes |
+|---|---|
+| v5.2.0 | BOT_VERSION tag; no Kalshi mid proxy in BTC feed; OB depth floor $5; streak filter deadlock fix; paper_daily_pnl loss tracking; running_pnl for accurate session P&L; WIN alerts in paper mode |
+| v5.1.x | Telegram heartbeat + entry/loss alerts; positions endpoint for resolution; stale order cleanup; global consecutive_losses fix |
+| v5.0 | Session stop (50% halt); BTC momentum 0.20% threshold; spread guard fixed (1c markets allowed); Kelly 35%; balance floor $5 |
+| v4.0 | win_prob = OB imbalance only (not rolling win rate); balance floor; paper mode fully simulated |
+| v3.0 | RSA-PSS auth; near-money OB filter ±10c; maker limit orders; favourite-longshot bias filter |
 
 ---
 
 ## Risk Disclosures
 
-- All trading involves risk. Past strategy performance does not guarantee future results.
-- Always start with `DEMO_MODE=true` to verify behavior before going live.
-- Set `MAX_DAILY_LOSS_DOLLARS` conservatively. The bot enforces this as a hard stop.
-- Kalshi markets can be illiquid, especially near expiry. Limit orders may not fill.
+- All trading involves risk of capital loss.
 - The 15-minute BTC markets on Kalshi launched December 2025 — historical data is limited.
+- Past win rates do not guarantee future performance.
+- Start with DEMO_MODE=true and verify behavior before trading real money.
+- Set MAX_DAILY_LOSS_DOLLARS conservatively relative to your account size.
