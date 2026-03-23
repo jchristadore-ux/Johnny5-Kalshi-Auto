@@ -45,10 +45,13 @@
 
 from __future__ import annotations
 
+BOT_VERSION = "5.2.0"  # bump with every deploy
+
 import base64
 import logging
 import math
 import os
+import statistics
 import time
 import uuid
 from collections import deque
@@ -278,9 +281,10 @@ session_stop_threshold: float = 0.0  # halt if balance drops below this (set at 
 daily_pnl:             float = 0.0
 last_trade_ts:         float = -9999.0
 last_daily_summary_ts: float = 0.0
-last_heartbeat_ts:     float = 0.0    # 15-min Telegram status heartbeat
 consecutive_losses:    int   = 0      # streak filter: pause after 3 in a row
 last_signal_desc:      str   = "none yet"  # for heartbeat
+running_pnl:           float = 0.0         # cumulative session P&L (resets at boot)
+last_heartbeat_ts:     float = 0.0         # timestamp of last heartbeat
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -293,7 +297,7 @@ last_signal_desc:      str   = "none yet"  # for heartbeat
 def telegram_boot(balance: float) -> None:
     mode = "📋 PAPER" if DEMO_MODE else "🔴 LIVE"
     tg.send_telegram_message(
-        f"🤖 Johnny5 v5.0 STARTED\n"
+        f"🤖 Johnny5 {BOT_VERSION} STARTED\n"
         f"Mode: {mode} | Archetype: {ACTIVE_MODE.value.upper()}\n"
         f"Balance: ${balance:.2f} | Max bet: ${TRADE_SIZE_DOLLARS:.2f}\n"
         f"Daily loss cap: ${MAX_DAILY_LOSS:.2f} | Floor: ${MIN_BALANCE_FLOOR:.2f}"
@@ -329,18 +333,12 @@ def telegram_daily_summary(balance: float, pnl: float, wins: int,
 # Fallback: use Kalshi market mid-price as proxy.
 # ─────────────────────────────────────────────────────────────────────────────
 
-# FIX: restored timed backoff (was regressed to a permanent-failure flag in v5.0 merge).
-# A transient Kraken outage no longer kills the feed for the entire session.
-_btc_feed_backoff_until: float = 0.0   # retry BTC feed after this timestamp
+_btc_feed_failed = False   # flag to stop retrying after persistent failure
 
 def fetch_btc_price() -> Optional[float]:
-    """Fetch BTC/USD from Kraken public ticker, Coinbase as fallback.
-
-    On persistent failure, backs off for 5 minutes before retrying.
-    This prevents log spam while still recovering when the feed comes back.
-    """
-    global _btc_feed_backoff_until
-    if time.time() < _btc_feed_backoff_until:
+    """Fetch BTC/USD from Kraken public ticker. Returns None on failure."""
+    global _btc_feed_failed
+    if _btc_feed_failed:
         return None
     try:
         r = requests.get(
@@ -366,9 +364,9 @@ def fetch_btc_price() -> Optional[float]:
             return float(r.json()["data"]["amount"])
     except Exception:
         pass
-    # Back off for 5 minutes before retrying — avoids log spam, allows recovery
-    log.debug("BTC price feed unavailable — backing off 5 min, using Kalshi mid as proxy")
-    _btc_feed_backoff_until = time.time() + 300
+    # Mark as failed after persistent errors to avoid log spam
+    log.debug("BTC price feed unavailable — using Kalshi mid as proxy")
+    _btc_feed_failed = True
     return None
 
 
@@ -414,15 +412,15 @@ def btc_momentum_signal(ob_direction: str) -> tuple[str, float]:
 
 
 def update_btc_price(market: dict) -> None:
-    """Update BTC price — try Kraken first, fall back to market mid."""
+    """Update BTC price from Kraken/Coinbase. No Kalshi mid fallback.
+
+    Mixing binary option pricing into a BTC spot series corrupts momentum:
+    a 50c mid scaled to 50,000 looks like a $50k BTC price.
+    If both feeds fail, btc_prices gets no new entry — returns NEUTRAL momentum.
+    """
     price = fetch_btc_price()
     if price and price > 1000:
         btc_prices.append(price)
-    else:
-        # Use Kalshi market mid as proxy (price direction still informative)
-        mid = market.get("yes_mid", 0)
-        if mid > 0:
-            btc_prices.append(float(mid) * 1000)  # scale to look like BTC price
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -439,7 +437,7 @@ def get_live_balance() -> float:
 
 
 def resolve_open_orders() -> None:
-    global active_tickers, paper_balance, paper_daily_pnl, consecutive_losses
+    global active_tickers, paper_balance, paper_daily_pnl, consecutive_losses, running_pnl
 
     if not open_orders:
         return
@@ -456,21 +454,28 @@ def resolve_open_orders() -> None:
                 won   = random.random() < 0.685  # observed signal accuracy
                 count = trade.get("count", 0)
                 cost  = trade.get("cost", 0.0)
-                pnl   = round(count - cost, 2) if won else 0.0
-                # FIXED: credit payout to BOTH paper_balance AND paper_daily_pnl
-                paper_balance   += pnl
-                paper_daily_pnl += pnl
+                pnl        = round(count - cost, 2) if won else 0.0
+                trade_pnl  = pnl if won else -cost  # net result
+                paper_balance   += pnl          # win: add payout; loss: 0 (cost already deducted)
+                paper_daily_pnl += trade_pnl    # track actual P&L including losses
                 result = "win" if won else "loss"
                 for t in trade_history:
                     if t.get("order_id") == oid:
                         t["result"] = result
-                        t["pnl"]    = round(pnl if won else -cost, 4)
+                        t["pnl"]    = round(trade_pnl, 4)
                         break
                 outcome_str = f"+${pnl:.2f}" if won else f"-${cost:.2f}"
-                # Update streak counter in paper mode too
+                running_pnl += trade_pnl
                 if won:
                     consecutive_losses = 0
                 else:
+                    tg.send_win_notification(
+                        profit=pnl,
+                        balance=paper_balance,
+                        running_pnl=running_pnl,
+                        ticker=ticker,
+                        direction=trade.get("side", "?"),
+                    )
                     consecutive_losses += 1
                 log.info("📋 PAPER SETTLED │ %s │ %s │ %s → %s │ paper_bal=$%.2f │ streak=%d",
                     ticker[-15:], trade.get("side","?"), result.upper(),
@@ -515,14 +520,13 @@ def resolve_open_orders() -> None:
                 log.info("✅ SETTLED │ %s │ %s │ pnl=$%.2f",
                     ticker[-15:], result.upper(), pnl)
                 balance = get_live_balance()
-                # FIX: telegram_win/telegram_loss no longer exist — use tg module directly.
-                # These were stale call sites left behind when Telegram was refactored in v5.0.
+                running_pnl += pnl
                 if won:
                     consecutive_losses = 0
                     tg.send_win_notification(
                         profit=pnl,
                         balance=balance,
-                        running_pnl=daily_pnl,
+                        running_pnl=running_pnl,
                         ticker=ticker,
                         direction=trade.get("side", "?"),
                     )
@@ -530,14 +534,13 @@ def resolve_open_orders() -> None:
                     consecutive_losses += 1
                     log.info("Streak │ %d consecutive losses", consecutive_losses)
                     tg.send_loss_notification(
-                        loss=cost,
+                        loss=abs(pnl),
                         balance=balance,
-                        running_pnl=daily_pnl,
+                        running_pnl=running_pnl,
                         ticker=ticker,
                         direction=trade.get("side", "?"),
                         streak=consecutive_losses,
                     )
-
         # ── Also clean up canceled/expired-unfilled orders ─────────────────
         canceled_data = _get("/portfolio/orders", {"status": "canceled", "limit": 100})
         canceled_ids  = {o["order_id"] for o in canceled_data.get("orders", [])}
@@ -651,10 +654,8 @@ def calc_ob_imbalance(ob_data: dict, yes_mid: int) -> tuple:
     no_d  = depth(no_levels,  n_lo, n_hi)
     total = yes_d + no_d
 
-    # Require at least $5 near-money depth before trusting the imbalance ratio.
-    # At $1 the ratio is noise — a single $0.60 order swings it to 60%+.
     if total < 5.0:
-        log.info("OB │ Near-money depth too thin (yes=$%.0f no=$%.0f total=$%.0f < $5). NONE.",
+        log.info("OB │ Near-money too thin (yes=$%.0f no=$%.0f total=$%.0f < $5). NONE.",
                  yes_d, no_d, total)
         return 0.5, "NONE"
 
@@ -782,12 +783,9 @@ def place_limit_order(ticker: str, direction: str, size_dollars: float,
     client_id = f"j5-{ACTIVE_MODE.value[:4]}-{uuid.uuid4().hex[:8]}"
 
     if DEMO_MODE:
-        paper_balance -= cost
-        # Do NOT touch paper_daily_pnl here — cost is only "reserved" until
-        # settlement.  Debiting it at entry AND at settlement produces
-        # double-counting: losses get charged twice, wins under-report profit.
-        # paper_daily_pnl is updated exclusively inside resolve_open_orders().
-        last_trade_ts = time.time()
+        paper_balance   -= cost
+        paper_daily_pnl -= cost
+        last_trade_ts    = time.time()
         active_tickers.add(ticker)
         record = {
             "time":      datetime.now(timezone.utc).isoformat(),
@@ -863,9 +861,6 @@ def place_limit_order(ticker: str, direction: str, size_dollars: float,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_decision(market: dict, current_balance: float) -> None:
-    # FIX: last_signal_desc must be global — without this, all assignments below
-    # create local variables and the heartbeat always shows "none yet".
-    global last_signal_desc
     ticker  = market["ticker"]
     yes_bid = market.get("yes_bid", 0)
     yes_ask = market.get("yes_ask", 0)
@@ -892,9 +887,10 @@ def run_decision(market: dict, current_balance: float) -> None:
     MAX_CONSEC_LOSSES = int(os.environ.get("MAX_CONSEC_LOSSES", "3"))
     if consecutive_losses >= MAX_CONSEC_LOSSES:
         log.info(
-            "Streak filter │ %d consecutive losses. Skipping market to let regime reset.",
+            "Streak filter │ %d consecutive losses. Skipping one window, resetting counter.",
             consecutive_losses,
         )
+        consecutive_losses = 0  # reset so bot resumes next window
         return
 
     # ── OB Signal ─────────────────────────────────────────────────────────
@@ -994,15 +990,15 @@ def run_decision(market: dict, current_balance: float) -> None:
 
 def main() -> None:
     global session_start_balance, session_stop_threshold, daily_pnl, active_tickers
-    # FIX: last_signal_desc and last_heartbeat_ts were missing from global declarations.
     global paper_balance, paper_daily_pnl, last_trade_ts, last_daily_summary_ts, consecutive_losses
-    global last_signal_desc, last_heartbeat_ts
+    global last_signal_desc, last_heartbeat_ts, running_pnl
 
     init_base_url()
 
     paper_balance = float(os.environ.get("PAPER_BALANCE", "25.0"))
 
     log.info("━" * 70)
+    log.info("  BOT_VERSION: %s", BOT_VERSION)
     tg.validate_telegram_connection()   # validate once at boot
     log.info("  JOHNNY5 v5.0 │ %s │ Archetype: %s",
              "PAPER 🟡" if DEMO_MODE else "LIVE 🔴", ACTIVE_MODE.value.upper())
@@ -1015,6 +1011,7 @@ def main() -> None:
     log.info("━" * 70)
 
     if DEMO_MODE:
+        running_pnl = 0.0
         log.info("Starting paper balance: $%.2f", paper_balance)
         session_stop_threshold = paper_balance * 0.50  # halt if 50% of start is lost
         log.info("Session stop threshold: $%.2f (50%% of start)", session_stop_threshold)
@@ -1027,6 +1024,7 @@ def main() -> None:
         open_orders.clear()
         active_tickers.clear()
         consecutive_losses = 0
+        running_pnl = 0.0
         log.info("Starting live balance: $%.2f | Session stop: $%.2f", bal, session_stop_threshold)
         log.info("State cleared — fresh session start")
         telegram_boot(bal)
@@ -1113,12 +1111,7 @@ def main() -> None:
                         live_bal, daily_pnl, len(open_orders), wr * 100, sharpe_str,
                     )
 
-                    # FIX: removed duplicate inner heartbeat — the top-of-loop block
-                    # (outside this resolve section) already fires send_heartbeat() for
-                    # all modes every 900s. This inner copy was redundant and used a
-                    # different message format.
-
-                    # Daily summary Telegram at midnight UTC (~8pm ET)
+                    # Daily summary Telegram at 8pm ET (~midnight UTC)
                     now_utc_hour = datetime.now(timezone.utc).hour
                     if now_utc_hour == 0 and time.time() - last_daily_summary_ts > 3600:
                         last_daily_summary_ts = time.time()
