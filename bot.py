@@ -45,13 +45,11 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "5.2.0"  # bump with every deploy
+BOT_VERSION = "5.2.1"  # bump with every deploy
 
 import base64
 import logging
-import math
 import os
-import statistics
 import time
 import uuid
 from collections import deque
@@ -333,12 +331,18 @@ def telegram_daily_summary(balance: float, pnl: float, wins: int,
 # Fallback: use Kalshi market mid-price as proxy.
 # ─────────────────────────────────────────────────────────────────────────────
 
-_btc_feed_failed = False   # flag to stop retrying after persistent failure
+# FIX v5.2.1: restored timed backoff (v5.2.0 regressed this to a permanent-failure flag).
+# A transient Kraken outage now backs off 5 min then retries, instead of dying for the session.
+_btc_feed_backoff_until: float = 0.0
 
 def fetch_btc_price() -> Optional[float]:
-    """Fetch BTC/USD from Kraken public ticker. Returns None on failure."""
-    global _btc_feed_failed
-    if _btc_feed_failed:
+    """Fetch BTC/USD from Kraken public ticker, Coinbase as fallback.
+
+    On persistent failure, backs off for 5 minutes before retrying.
+    This prevents log spam while still recovering when the feed comes back.
+    """
+    global _btc_feed_backoff_until
+    if time.time() < _btc_feed_backoff_until:
         return None
     try:
         r = requests.get(
@@ -364,9 +368,9 @@ def fetch_btc_price() -> Optional[float]:
             return float(r.json()["data"]["amount"])
     except Exception:
         pass
-    # Mark as failed after persistent errors to avoid log spam
-    log.debug("BTC price feed unavailable — using Kalshi mid as proxy")
-    _btc_feed_failed = True
+    # Back off for 5 minutes before retrying — avoids log spam, allows recovery
+    log.debug("BTC price feed unavailable — backing off 5 min, using NEUTRAL momentum")
+    _btc_feed_backoff_until = time.time() + 300
     return None
 
 
@@ -468,7 +472,7 @@ def resolve_open_orders() -> None:
                 running_pnl += trade_pnl
                 if won:
                     consecutive_losses = 0
-                else:
+                    # FIX v5.2.1: WIN notification was in the else (loss) branch — swapped
                     tg.send_win_notification(
                         profit=pnl,
                         balance=paper_balance,
@@ -476,7 +480,16 @@ def resolve_open_orders() -> None:
                         ticker=ticker,
                         direction=trade.get("side", "?"),
                     )
+                else:
                     consecutive_losses += 1
+                    tg.send_loss_notification(
+                        loss=abs(trade_pnl),
+                        balance=paper_balance,
+                        running_pnl=running_pnl,
+                        ticker=ticker,
+                        direction=trade.get("side", "?"),
+                        streak=consecutive_losses,
+                    )
                 log.info("📋 PAPER SETTLED │ %s │ %s │ %s → %s │ paper_bal=$%.2f │ streak=%d",
                     ticker[-15:], trade.get("side","?"), result.upper(),
                     outcome_str, paper_balance, consecutive_losses)
@@ -861,6 +874,11 @@ def place_limit_order(ticker: str, direction: str, size_dollars: float,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_decision(market: dict, current_balance: float) -> None:
+    # FIX v5.2.1: consecutive_losses and last_signal_desc must be global here.
+    # Without this, the streak-filter reset wrote to a local variable — global stayed
+    # at 3+ and the bot permanently skipped every trade window after the first streak.
+    # last_signal_desc was similarly stuck at "none yet" in all heartbeats.
+    global consecutive_losses, last_signal_desc
     ticker  = market["ticker"]
     yes_bid = market.get("yes_bid", 0)
     yes_ask = market.get("yes_ask", 0)
