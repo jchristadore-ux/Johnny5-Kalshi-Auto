@@ -476,6 +476,7 @@ def resolve_open_orders() -> None:
                     tg.send_win_notification(
                         profit=pnl,
                         balance=paper_balance,
+                        daily_pnl=paper_daily_pnl,
                         running_pnl=running_pnl,
                         ticker=ticker,
                         direction=trade.get("side", "?"),
@@ -539,6 +540,7 @@ def resolve_open_orders() -> None:
                     tg.send_win_notification(
                         profit=pnl,
                         balance=balance,
+                        daily_pnl=balance - session_start_balance,
                         running_pnl=running_pnl,
                         ticker=ticker,
                         direction=trade.get("side", "?"),
