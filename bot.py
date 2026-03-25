@@ -279,7 +279,7 @@ daily_pnl:             float = 0.0
 running_pnl:           float = 0.0   # cumulative session PnL across all settled trades
 last_trade_ts:         float = -9999.0
 last_daily_summary_ts: float = 0.0
-last_heartbeat_ts:     float = 0.0    # 4-hour Telegram status heartbeat
+last_heartbeat_ts:     float = 0.0    # 15-min Telegram status heartbeat
 consecutive_losses:    int   = 0      # streak filter: pause after 3 in a row
 
 
@@ -1095,8 +1095,8 @@ def main() -> None:
                         live_bal, daily_pnl, len(open_orders), wr * 100, sharpe_str,
                     )
 
-                    # 4-hour heartbeat — confirms bot is alive during live sessions
-                    if time.time() - last_heartbeat_ts >= 14400:  # 4 hours
+                    # 15-min heartbeat — confirms bot is alive during live sessions
+                    if time.time() - last_heartbeat_ts >= 900:  # 15 min
                         last_heartbeat_ts = time.time()
                         wr_pct = wr * 100
                         tg.send_telegram_message(

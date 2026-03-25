@@ -13,7 +13,7 @@ Design rules:
 
 Notification policy:
   - WIN trades:  send_win_notification (balance, daily PnL, running PnL)
-  - Heartbeat:   send_telegram_message every 4 hours (status only)
+  - Heartbeat:   send_telegram_message every 15 minutes (status only)
   - Operational: boot, halt, shutdown, daily summary
   - Suppressed:  trade entries, losses, break-evens
 """
