@@ -10,6 +10,12 @@ Design rules:
   - Never raises an exception — all errors are logged and swallowed
   - Never sends for losses, entries, or break-evens
   - All credentials come from environment variables; nothing is hardcoded
+
+Notification policy:
+  - WIN trades:  send_win_notification (balance, daily PnL, running PnL)
+  - Heartbeat:   send_telegram_message every 4 hours (status only)
+  - Operational: boot, halt, shutdown, daily summary
+  - Suppressed:  trade entries, losses, break-evens
 """
 
 import logging
@@ -84,47 +90,10 @@ def send_telegram_message(text: str) -> bool:
     return _send_raw(text)
 
 
-def send_trade_entry_notification(
-    ticker: str,
-    direction: str,
-    cost: float,
-    price_cents: int,
-    balance: float,
-    timestamp: Optional[datetime] = None,
-) -> None:
-    """
-    Send a trade entry alert when a position is opened.
-
-    Args:
-        ticker:      Market ticker, e.g. "KXBTC15M-26MAR2200"
-        direction:   "YES" (→ UP) or "NO" (→ DOWN)
-        cost:        Dollar cost of the trade
-        price_cents: Limit price in cents
-        balance:     Current account balance after cost deducted
-        timestamp:   Entry time; defaults to now (UTC)
-    """
-    if not _telegram_enabled:
-        return
-
-    ts  = (timestamp or datetime.now(timezone.utc)).strftime("%Y-%m-%d %H:%M:%S UTC")
-    pos = "UP" if direction.upper() == "YES" else "DOWN"
-
-    msg = (
-        f"🟡 TRADE ENTERED\n"
-        f"📊 Market:    {ticker}\n"
-        f"📍 Position:  {pos}\n"
-        f"💵 Cost:      ${cost:.2f}\n"
-        f"🎯 Price:     {price_cents}¢\n"
-        f"🏦 Balance:   ${balance:,.2f}\n"
-        f"⏱  Time:      {ts}"
-    )
-
-    send_telegram_message(msg)
-
-
 def send_win_notification(
     profit: float,
     balance: float,
+    daily_pnl: float,
     running_pnl: float,
     ticker: str,
     direction: str,
@@ -136,7 +105,8 @@ def send_win_notification(
     Args:
         profit:      Net profit from this trade, dollars (must be > 0)
         balance:     Current account balance after settlement
-        running_pnl: Cumulative session PnL including this trade
+        daily_pnl:   Session PnL (live balance minus session start balance)
+        running_pnl: Cumulative session PnL across all settled trades
         ticker:      Market ticker, e.g. "KXBTC15M-26MAR2200"
         direction:   "YES" (→ UP) or "NO" (→ DOWN)
         timestamp:   Settlement time; defaults to now (UTC)
@@ -149,18 +119,20 @@ def send_win_notification(
         log.debug("send_win_notification called with profit=%.4f — suppressed.", profit)
         return
 
-    ts  = (timestamp or datetime.now(timezone.utc)).strftime("%Y-%m-%d %H:%M:%S UTC")
-    pos = "UP" if direction.upper() == "YES" else "DOWN"
-    pnl_sign = "+" if running_pnl >= 0 else ""
+    ts       = (timestamp or datetime.now(timezone.utc)).strftime("%Y-%m-%d %H:%M:%S UTC")
+    pos      = "UP" if direction.upper() == "YES" else "DOWN"
+    d_sign   = "+" if daily_pnl   >= 0 else ""
+    r_sign   = "+" if running_pnl >= 0 else ""
 
     msg = (
         f"✅ WIN\n"
-        f"💰 Trade Profit:  +${profit:.2f}\n"
-        f"🏦 Balance:        ${balance:,.2f}\n"
-        f"📈 Session PnL:   {pnl_sign}${running_pnl:.2f}\n"
-        f"📊 Market:         {ticker}\n"
-        f"📍 Position:       {pos}\n"
-        f"⏱  Time:           {ts}"
+        f"💰 Trade Profit: +${profit:.2f}\n"
+        f"🏦 Balance:       ${balance:,.2f}\n"
+        f"📅 Daily PnL:    {d_sign}${daily_pnl:.2f}\n"
+        f"📈 Running PnL:  {r_sign}${running_pnl:.2f}\n"
+        f"📊 Market:        {ticker}\n"
+        f"📍 Position:      {pos}\n"
+        f"⏱  Time:          {ts}"
     )
 
     send_telegram_message(msg)

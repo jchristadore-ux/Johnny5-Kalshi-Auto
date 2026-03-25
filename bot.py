@@ -279,7 +279,7 @@ daily_pnl:             float = 0.0
 running_pnl:           float = 0.0   # cumulative session PnL across all settled trades
 last_trade_ts:         float = -9999.0
 last_daily_summary_ts: float = 0.0
-last_heartbeat_ts:     float = 0.0    # 15-min Telegram status heartbeat
+last_heartbeat_ts:     float = 0.0    # 4-hour Telegram status heartbeat
 consecutive_losses:    int   = 0      # streak filter: pause after 3 in a row
 
 
@@ -476,6 +476,7 @@ def resolve_open_orders() -> None:
                     tg.send_win_notification(
                         profit=pnl,
                         balance=paper_balance,
+                        daily_pnl=paper_daily_pnl,
                         running_pnl=running_pnl,
                         ticker=ticker,
                         direction=trade.get("side", "YES"),
@@ -529,9 +530,12 @@ def resolve_open_orders() -> None:
                 if won:
                     consecutive_losses = 0
                     # WIN-only notification — losses are intentionally silent
+                    # Compute daily_pnl from fresh balance; the module global is
+                    # only updated in main()'s poll loop so it would be stale here.
                     tg.send_win_notification(
                         profit=pnl,
                         balance=balance,
+                        daily_pnl=balance - session_start_balance,
                         running_pnl=running_pnl,
                         ticker=ticker,
                         direction=trade.get("side", "YES"),
@@ -808,13 +812,6 @@ def place_limit_order(ticker: str, direction: str, size_dollars: float,
         log.info("🟡 PAPER │ %s %s │ %d contracts @ %dc │ cost=$%.2f │ bal=$%.2f │ [%s]",
             direction, ticker[-15:], count, limit_price_cents,
             cost, paper_balance, ACTIVE_MODE.value.upper())
-        tg.send_trade_entry_notification(
-            ticker=ticker,
-            direction=direction,
-            cost=cost,
-            price_cents=limit_price_cents,
-            balance=paper_balance,
-        )
         return client_id
 
     # Live order — maker limit only
@@ -850,14 +847,6 @@ def place_limit_order(ticker: str, direction: str, size_dollars: float,
         log.info("✅ ORDER │ %s %s │ %d contracts @ %dc │ $%.2f │ ID:%s │ [%s]",
             direction, ticker[-15:], count, limit_price_cents,
             size_dollars, order_id[:12], ACTIVE_MODE.value.upper())
-        live_bal = get_live_balance()
-        tg.send_trade_entry_notification(
-            ticker=ticker,
-            direction=direction,
-            cost=cost,
-            price_cents=limit_price_cents,
-            balance=live_bal,
-        )
         return order_id
     except requests.HTTPError as e:
         log.error("Order failed │ HTTP %s │ %s", e.response.status_code, e.response.text[:200])
@@ -1023,7 +1012,7 @@ def main() -> None:
     tg.validate_telegram_connection()
 
     running_pnl       = 0.0   # reset cumulative PnL at session start
-    last_heartbeat_ts = 0.0   # force first heartbeat on next 15-min check
+    last_heartbeat_ts = 0.0   # force first heartbeat on next check
 
     if DEMO_MODE:
         log.info("Starting paper balance: $%.2f", paper_balance)
@@ -1106,8 +1095,8 @@ def main() -> None:
                         live_bal, daily_pnl, len(open_orders), wr * 100, sharpe_str,
                     )
 
-                    # 15-min heartbeat — confirms bot is alive during live sessions
-                    if time.time() - last_heartbeat_ts >= 900:
+                    # 4-hour heartbeat — confirms bot is alive during live sessions
+                    if time.time() - last_heartbeat_ts >= 14400:  # 4 hours
                         last_heartbeat_ts = time.time()
                         wr_pct = wr * 100
                         tg.send_telegram_message(
