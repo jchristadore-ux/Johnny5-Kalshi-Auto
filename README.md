@@ -1,4 +1,4 @@
-# Johnny5-Kalshi-Auto v5.2.0
+# Johnny5-Kalshi-Auto v5.3.0
 
 > Production quant bot for Kalshi 15-minute BTC up/down prediction markets.
 > Near-money order book pressure + BTC momentum confirmation + fractional Kelly sizing.
@@ -8,7 +8,9 @@
 ## Strategy
 
 ### Signal 1 — Near-Money OB Pressure (primary edge)
-Measures dollar depth within ±10 cents of the current mid-price on the YES/NO order book. If ≥62% of near-money depth sits on one side, smart money is positioned there. Requires ≥$5 total depth to prevent single resting orders from manufacturing false signals.
+Measures dollar depth within ±10 cents of the current mid-price on the YES/NO order book. If sufficient imbalance exists on one side, smart money is positioned there. Requires ≥$5 total depth to prevent single resting orders from manufacturing false signals.
+
+**v5.3.0: Adaptive threshold** — thin books ($5-15 depth) require 70%+ imbalance, thick books ($50+ depth) allow 58%+, medium books use profile default (62%).
 
 ### Signal 2 — BTC Momentum Confirmation
 Fetches live BTC/USD price from Kraken (Coinbase fallback). If BTC moved ≥0.20% in the same direction as the OB signal in the last 2 minutes → AGREE (boosts win probability). If BTC moved against the OB signal → CONFLICT (trade skipped). Flat market → NEUTRAL (no adjustment).
@@ -19,12 +21,20 @@ Only enters contracts priced ≤67 cents. At 68.5% historical win rate, the math
 ### Signal 4 — Bias Filter
 Skips contracts priced <35 cents or >65 cents. Academic research (Bürgi et al. 2025) confirms Kalshi contracts below ~20 cents lose ~60% of capital on average.
 
+### v5.3.0: OB Trend Detection
+Compares the current order book snapshot to the previous one for each ticker. Trades only fire when pressure is building or stable — if the imbalance is fading (dropped >5%) or the direction flipped, the trade is skipped. Prevents entering on stale or collapsing signals.
+
+### v5.3.0: Multi-Market Scanner
+Scans ALL open BTC markets across KXBTC15M/KXBTCD/KXBTC series and evaluates each for signals. The bot tries every valid market per cycle instead of just picking the one closest to 50c. Position guard and cooldown prevent over-trading.
+
 ### Sizing — Fractional Kelly
 `f* = (b×p - q) / b` where b = net odds, p = OB win probability, q = 1-p.
 Kelly fraction: 35% (grid-search optimal). Capped at TRADE_SIZE_DOLLARS and 20% of balance.
 
 ### Execution — Maker Limit Orders
 Posts limit orders one cent inside the best bid/ask. Kalshi makers pay zero fee. Takers pay ~1% of winnings. Fee drag on taker orders: ~$5+/day at scale.
+
+**v5.3.0: Stale order cancellation** — unfilled maker orders are automatically canceled after 5 minutes (configurable) to free capital for better opportunities.
 
 ---
 
@@ -39,6 +49,34 @@ Posts limit orders one cent inside the best bid/ask. Kalshi makers pay zero fee.
 | Expiry guard | Skips contracts priced >85c or <15c (near-certain outcome, zero EV) |
 | Spread guard | Skips zero/crossed spreads (broken book) |
 | Streak filter | After 3 consecutive losses, skips one window then resets counter |
+| **Liquidity filter** *(v5.3.0)* | Skips low-liquidity UTC hours (default 4-8 UTC / midnight-4am ET) |
+| **Concurrent limit** *(v5.3.0)* | Max simultaneous open positions (default 2) |
+| **Stale cancel** *(v5.3.0)* | Auto-cancels unfilled orders after timeout (default 300s) |
+
+---
+
+## v5.3.0 — Win Rate Confidence Tracking
+
+The bot now computes Wilson score confidence intervals on accumulated win/loss data. This tells you whether your edge is statistically real or just luck:
+
+- **Heartbeat** (every 15 min): includes WR% with 95% CI when ≥5 trades resolved
+- **Daily summary**: includes confidence interval
+- **Logs**: portfolio status includes CI bounds
+
+Example: `WR: 72.0% [58-83%]` means your true win rate is somewhere between 58% and 83% with 95% confidence. As you accumulate more trades, the interval narrows.
+
+---
+
+## v5.3.0 — Smarter Paper Mode
+
+Paper mode no longer uses a random 68.5% coin flip to determine outcomes. Instead:
+- Each paper order records the BTC price at entry
+- At resolution (15 min later), the bot checks current BTC price
+- If you bought YES and BTC went up → WIN. If BTC went down → LOSS.
+- If you bought NO and BTC went down → WIN. If BTC went up → LOSS.
+- Falls back to RNG only if BTC price feed is unavailable.
+
+This gives paper mode results that correlate with actual market outcomes.
 
 ---
 
@@ -48,8 +86,20 @@ Posts limit orders one cent inside the best bid/ask. Kalshi makers pay zero fee.
 |---|---|
 | `bot.py` | Main trading bot — runs on Railway |
 | `telegram_utils.py` | Telegram notification module |
+| `test_bot.py` | Pytest test suite — risk controls + signal math |
 | `requirements.txt` | Python dependencies |
 | `railway.toml` | Railway deployment config |
+
+---
+
+## Testing
+
+```bash
+pip install -r requirements.txt
+pytest test_bot.py -v
+```
+
+Tests cover all risk controls (P0), signal math (P1), and v5.3.0 features (P2). 60+ test cases including edge boundaries, adaptive threshold scaling, OB trend detection, stale order cancellation, and Wilson confidence intervals.
 
 ---
 
@@ -61,7 +111,7 @@ Posts limit orders one cent inside the best bid/ask. Kalshi makers pay zero fee.
 3. The PEM looks like: `-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----`
 
 ### Step 2 — GitHub Repo
-Upload all four files to a new GitHub repo. Commit to `main`.
+Upload all files to a new GitHub repo. Commit to `main`.
 
 ### Step 3 — Railway
 1. New Project → Deploy from GitHub Repo → select your repo
@@ -92,6 +142,10 @@ Upload all four files to a new GitHub repo. Commit to `main`.
 | `POLL_INTERVAL_SECS` | `30` | Market scan frequency |
 | `TELEGRAM_BOT_TOKEN` | optional | From @BotFather |
 | `TELEGRAM_CHAT_ID` | optional | Your Telegram chat ID |
+| `STALE_ORDER_TIMEOUT` | `300` | *(v5.3.0)* Seconds before canceling unfilled orders |
+| `MAX_CONCURRENT_POS` | `2` | *(v5.3.0)* Max simultaneous open positions |
+| `LOW_LIQ_START_UTC` | `4` | *(v5.3.0)* Low-liquidity skip window start (UTC hour) |
+| `LOW_LIQ_END_UTC` | `8` | *(v5.3.0)* Low-liquidity skip window end (UTC hour) |
 
 ---
 
@@ -99,13 +153,13 @@ Upload all four files to a new GitHub repo. Commit to `main`.
 
 | Event | Fires |
 |---|---|
-| Boot | Always (includes balance, caps, version) |
-| Heartbeat | Every 15 minutes (balance, P&L, open orders, last signal) |
+| Boot | Always (includes balance, caps, version, new v5.3.0 params) |
+| Heartbeat | Every 15 minutes (balance, P&L, open orders, WR + confidence interval) |
 | Trade entered | Every live order placed (OB%, edge%, cost) |
 | WIN | Every settled winning trade |
 | LOSS | Every settled losing trade (live mode only) |
 | HALT | Session stop, daily loss cap, balance floor |
-| Daily summary | Midnight UTC (~8pm ET) |
+| Daily summary | Midnight UTC (~8pm ET) with confidence intervals |
 | Shutdown | On manual stop |
 
 ---
@@ -114,11 +168,13 @@ Upload all four files to a new GitHub repo. Commit to `main`.
 
 | Version | Key Changes |
 |---|---|
-| v5.2.0 | BOT_VERSION tag; no Kalshi mid proxy in BTC feed; OB depth floor $5; streak filter deadlock fix; paper_daily_pnl loss tracking; running_pnl for accurate session P&L; WIN alerts in paper mode |
-| v5.1.x | Telegram heartbeat + entry/loss alerts; positions endpoint for resolution; stale order cleanup; global consecutive_losses fix |
-| v5.0 | Session stop (50% halt); BTC momentum 0.20% threshold; spread guard fixed (1c markets allowed); Kelly 35%; balance floor $5 |
-| v4.0 | win_prob = OB imbalance only (not rolling win rate); balance floor; paper mode fully simulated |
-| v3.0 | RSA-PSS auth; near-money OB filter ±10c; maker limit orders; favourite-longshot bias filter |
+| **v5.3.0** | **Multi-market scanner; stale order cancellation (5 min); adaptive OB threshold (thin/thick books); time-of-day liquidity filter; OB trend detection (building/fading); smarter paper mode (BTC movement, not RNG); Wilson confidence intervals; concurrent position limit; 60+ pytest tests** |
+| v5.2.1 | BOT_VERSION tag; BTC feed timed backoff; global consecutive_losses fix; WIN notification branch fix |
+| v5.2.0 | No Kalshi mid proxy in BTC feed; OB depth floor $5; streak filter deadlock fix; running_pnl |
+| v5.1.x | Telegram heartbeat + entry/loss alerts; positions endpoint for resolution; stale order cleanup |
+| v5.0 | Session stop (50% halt); BTC momentum 0.20% threshold; spread guard fixed; Kelly 35% |
+| v4.0 | win_prob = OB imbalance only; balance floor; paper mode fully simulated |
+| v3.0 | RSA-PSS auth; near-money OB filter ±10c; maker limit orders; bias filter |
 
 ---
 
@@ -129,3 +185,4 @@ Upload all four files to a new GitHub repo. Commit to `main`.
 - Past win rates do not guarantee future performance.
 - Start with DEMO_MODE=true and verify behavior before trading real money.
 - Set MAX_DAILY_LOSS_DOLLARS conservatively relative to your account size.
+- The Wilson confidence intervals help you evaluate whether your edge is real, but statistical significance does not guarantee future performance.
