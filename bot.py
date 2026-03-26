@@ -45,11 +45,12 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "5.2.2"  # bump with every deploy
+BOT_VERSION = "5.3.0"  # bump with every deploy
 
 import base64
 import logging
 import os
+import signal
 import time
 import uuid
 from collections import deque
@@ -62,6 +63,12 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 import telegram_utils as tg   # notification module
+
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP SESSION — reuses TCP connections, avoids TLS handshake per call
+# ─────────────────────────────────────────────────────────────────────────────
+_http = requests.Session()
+_http.headers.update({"Content-Type": "application/json"})
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -166,7 +173,6 @@ _RAW_PEM             = _require("KALSHI_PRIVATE_KEY_PEM")
 DEMO_MODE            = os.environ.get("DEMO_MODE", "true").lower() == "true"
 TRADE_SIZE_DOLLARS   = float(os.environ.get("TRADE_SIZE_DOLLARS", "5"))
 MAX_DAILY_LOSS       = float(os.environ.get("MAX_DAILY_LOSS_DOLLARS", "20"))
-VOL_HIGH_THRESH      = float(os.environ.get("VOL_HIGH_THRESH", "0.008"))
 POLL_INTERVAL        = int(os.environ.get("POLL_INTERVAL_SECS", "30"))
 MIN_BALANCE_FLOOR    = float(os.environ.get("MIN_BALANCE_FLOOR", "5.00"))  # raised: no micro-bets below $5
 YES_BREAKEVEN_PRICE  = int(os.environ.get("YES_BREAKEVEN_PRICE", "67"))  # raised from 65 to capture near-edge entries
@@ -235,14 +241,14 @@ def _auth_headers(method: str, path: str) -> dict:
 
 
 def _get(path: str, params: Optional[dict] = None) -> dict:
-    r = requests.get(BASE_URL + path, params=params,
+    r = _http.get(BASE_URL + path, params=params,
                      headers=_auth_headers("GET", path), timeout=12)
     r.raise_for_status()
     return r.json()
 
 
 def _post(path: str, body: dict) -> dict:
-    r = requests.post(BASE_URL + path, json=body,
+    r = _http.post(BASE_URL + path, json=body,
                       headers=_auth_headers("POST", path), timeout=12)
     r.raise_for_status()
     return r.json()
@@ -252,7 +258,7 @@ def init_base_url() -> None:
     global BASE_URL
     for host in ["https://api.elections.kalshi.com", "https://trading-api.kalshi.com"]:
         try:
-            r = requests.get(host + "/trade-api/v2/exchange/status", timeout=6)
+            r = _http.get(host + "/trade-api/v2/exchange/status", timeout=6)
             if r.status_code == 200:
                 BASE_URL = host + "/trade-api/v2"
                 log.info("✅ API host confirmed: %s", host)
@@ -284,6 +290,28 @@ last_signal_desc:      str   = "none yet"  # for heartbeat
 running_pnl:           float = 0.0         # cumulative session P&L (resets at boot)
 last_heartbeat_ts:     float = 0.0         # timestamp of last heartbeat
 
+# FIX v5.3.0: graceful shutdown on SIGTERM (Railway deploys)
+_shutdown_requested: bool = False
+
+def _sigterm_handler(signum, frame):
+    global _shutdown_requested
+    log.info("SIGTERM received — requesting graceful shutdown")
+    _shutdown_requested = True
+
+signal.signal(signal.SIGTERM, _sigterm_handler)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UTILITIES
+# ─────────────────────────────────────────────────────────────────────────────
+
+def to_cents(val) -> int:
+    """Convert a dollar string (e.g. '0.50') to integer cents. Returns 0 on bad input."""
+    try:
+        return int(round(float(val) * 100))
+    except (TypeError, ValueError):
+        return 0
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TELEGRAM — all event types
@@ -300,12 +328,6 @@ def telegram_boot(balance: float) -> None:
         f"Balance: ${balance:.2f} | Max bet: ${TRADE_SIZE_DOLLARS:.2f}\n"
         f"Daily loss cap: ${MAX_DAILY_LOSS:.2f} | Floor: ${MIN_BALANCE_FLOOR:.2f}"
     )
-
-
-# telegram_win replaced by tg.send_win_notification
-
-
-# telegram_loss replaced by tg.send_loss_notification
 
 
 def telegram_halt(reason: str, balance: float) -> None:
@@ -345,7 +367,7 @@ def fetch_btc_price() -> Optional[float]:
     if time.time() < _btc_feed_backoff_until:
         return None
     try:
-        r = requests.get(
+        r = _http.get(
             "https://api.kraken.com/0/public/Ticker?pair=XBTUSD",
             timeout=5,
         )
@@ -360,7 +382,7 @@ def fetch_btc_price() -> Optional[float]:
         pass
     # Fallback: try Coinbase
     try:
-        r = requests.get(
+        r = _http.get(
             "https://api.coinbase.com/v2/prices/BTC-USD/spot",
             timeout=5,
         )
@@ -431,13 +453,30 @@ def update_btc_price(market: dict) -> None:
 # PORTFOLIO
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_live_balance() -> float:
+_cached_balance: float = 0.0
+_cached_balance_ts: float = 0.0
+_BALANCE_CACHE_TTL: float = 15.0  # seconds — one fetch per loop max
+
+
+def get_live_balance(force: bool = False) -> float:
+    """Fetch balance from Kalshi. Returns cached value on transient failure.
+
+    FIX v5.3.0: old code returned 0.0 on timeout, which tripped balance_floor_check
+    and halted the session permanently on a single API blip.
+    """
+    global _cached_balance, _cached_balance_ts
+    now = time.time()
+    if not force and (now - _cached_balance_ts) < _BALANCE_CACHE_TTL and _cached_balance > 0:
+        return _cached_balance
     try:
         data = _get("/portfolio/balance")
-        return (data.get("balance", 0) or 0) / 100.0
+        bal = (data.get("balance", 0) or 0) / 100.0
+        _cached_balance = bal
+        _cached_balance_ts = now
+        return bal
     except Exception as e:
-        log.warning("Balance fetch failed: %s", e)
-        return 0.0
+        log.warning("Balance fetch failed: %s — using cached $%.2f", e, _cached_balance)
+        return _cached_balance
 
 
 def resolve_open_orders() -> None:
@@ -458,9 +497,12 @@ def resolve_open_orders() -> None:
                 won   = random.random() < 0.685  # observed signal accuracy
                 count = trade.get("count", 0)
                 cost  = trade.get("cost", 0.0)
-                pnl        = round(count - cost, 2) if won else 0.0
-                trade_pnl  = pnl if won else -cost  # net result
-                paper_balance   += pnl          # win: add payout; loss: 0 (cost already deducted)
+                # FIX v5.3.0: On win, payout = count contracts × $1.00 each.
+                # Cost was already deducted at entry, so add full payout back.
+                # Old code added (count - cost) which double-deducted cost.
+                payout     = float(count) if won else 0.0  # $1 per contract on win
+                trade_pnl  = round(payout - cost, 2)       # net P&L for this trade
+                paper_balance   += payout       # win: restore full payout; loss: 0 (cost already gone)
                 paper_daily_pnl += trade_pnl    # track actual P&L including losses
                 result = "win" if won else "loss"
                 for t in trade_history:
@@ -468,13 +510,13 @@ def resolve_open_orders() -> None:
                         t["result"] = result
                         t["pnl"]    = round(trade_pnl, 4)
                         break
-                outcome_str = f"+${pnl:.2f}" if won else f"-${cost:.2f}"
+                outcome_str = f"+${payout - cost:.2f}" if won else f"-${cost:.2f}"
                 running_pnl += trade_pnl
                 if won:
                     consecutive_losses = 0
-                    # FIX v5.2.1: WIN notification was in the else (loss) branch — swapped
+                    # FIX v5.3.0: removed daily_pnl kwarg — not in function signature
                     tg.send_win_notification(
-                        profit=pnl,
+                        profit=round(payout - cost, 2),
                         balance=paper_balance,
                         running_pnl=running_pnl,
                         ticker=ticker,
@@ -536,6 +578,7 @@ def resolve_open_orders() -> None:
                 running_pnl += pnl
                 if won:
                     consecutive_losses = 0
+                    # FIX v5.3.0: removed daily_pnl kwarg — not in function signature
                     tg.send_win_notification(
                         profit=pnl,
                         balance=balance,
@@ -601,9 +644,7 @@ def get_active_btc_market() -> Optional[dict]:
                     m.get("yes_ask_dollars","?"),
                     (m.get("close_time") or "?")[:16],
                 )
-            def to_cents(val):
-                try:    return int(round(float(val) * 100))
-                except: return 0
+            # to_cents() is defined at module scope (v5.3.0)
             valid = [m for m in markets
                      if to_cents(m.get("yes_bid_dollars")) > 0
                      and to_cents(m.get("yes_ask_dollars")) > 0
@@ -1018,7 +1059,7 @@ def main() -> None:
     log.info("━" * 70)
     log.info("  BOT_VERSION: %s", BOT_VERSION)
     tg.validate_telegram_connection()   # validate once at boot
-    log.info("  JOHNNY5 %s │ %s │ Archetype: %s", BOT_VERSION,
+    log.info("  JOHNNY5 v5.0 │ %s │ Archetype: %s",
              "PAPER 🟡" if DEMO_MODE else "LIVE 🔴", ACTIVE_MODE.value.upper())
     log.info("  %s", PROFILE["description"])
     log.info("  Max trade: $%.2f │ Kelly: %.0f%% │ Min edge: %.1f%% │ Daily cap: $%.2f",
@@ -1049,7 +1090,7 @@ def main() -> None:
 
     resolve_cycle = 0
 
-    while True:
+    while not _shutdown_requested:
         try:
             log.debug("Loop cycle %d — scanning markets", resolve_cycle + 1)
 
@@ -1138,13 +1179,15 @@ def main() -> None:
             time.sleep(POLL_INTERVAL)
 
         except KeyboardInterrupt:
-            final = paper_balance if DEMO_MODE else get_live_balance()
-            log.info("Shutting down. Final balance: $%.2f", final)
-            tg.send_telegram_message(f"🛑 Johnny5 stopped. Final balance: ${final:.2f}")
             break
         except Exception as e:
             log.error("Unexpected error: %s", e, exc_info=True)
             time.sleep(POLL_INTERVAL)
+
+    # ── Graceful shutdown (handles both SIGTERM and KeyboardInterrupt) ─────
+    final = paper_balance if DEMO_MODE else get_live_balance()
+    log.info("Shutting down. Final balance: $%.2f", final)
+    tg.send_telegram_message(f"🛑 Johnny5 stopped. Final balance: ${final:.2f}")
 
 
 if __name__ == "__main__":
