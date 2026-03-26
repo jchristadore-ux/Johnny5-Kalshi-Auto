@@ -45,7 +45,7 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "5.2.1"  # bump with every deploy
+BOT_VERSION = "5.2.2"  # bump with every deploy
 
 import base64
 import logging
@@ -476,7 +476,6 @@ def resolve_open_orders() -> None:
                     tg.send_win_notification(
                         profit=pnl,
                         balance=paper_balance,
-                        daily_pnl=paper_daily_pnl,
                         running_pnl=running_pnl,
                         ticker=ticker,
                         direction=trade.get("side", "?"),
@@ -540,7 +539,6 @@ def resolve_open_orders() -> None:
                     tg.send_win_notification(
                         profit=pnl,
                         balance=balance,
-                        daily_pnl=balance - session_start_balance,
                         running_pnl=running_pnl,
                         ticker=ticker,
                         direction=trade.get("side", "?"),
@@ -1020,7 +1018,7 @@ def main() -> None:
     log.info("━" * 70)
     log.info("  BOT_VERSION: %s", BOT_VERSION)
     tg.validate_telegram_connection()   # validate once at boot
-    log.info("  JOHNNY5 v5.0 │ %s │ Archetype: %s",
+    log.info("  JOHNNY5 %s │ %s │ Archetype: %s", BOT_VERSION,
              "PAPER 🟡" if DEMO_MODE else "LIVE 🔴", ACTIVE_MODE.value.upper())
     log.info("  %s", PROFILE["description"])
     log.info("  Max trade: $%.2f │ Kelly: %.0f%% │ Min edge: %.1f%% │ Daily cap: $%.2f",
