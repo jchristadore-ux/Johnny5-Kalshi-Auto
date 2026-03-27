@@ -64,19 +64,23 @@ def send_telegram_message(text: str) -> bool:
     return _send_raw(text)
 
 
-def send_heartbeat(daily_pnl: float, overall_pnl: float) -> None:
+def send_heartbeat(balance: float, session_pnl: float, open_count: int,
+                   trades_today: int, last_signal: str) -> None:
     """
-    15-minute heartbeat. Reports daily and overall (session) PnL.
+    15-minute heartbeat. Confirms bot is alive and scanning.
     Sent regardless of whether trades are firing.
     """
     if not _telegram_enabled:
         return
-    daily_sign   = "+" if daily_pnl   >= 0 else ""
-    overall_sign = "+" if overall_pnl >= 0 else ""
+    now = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    pnl_sign = "+" if session_pnl >= 0 else ""
     msg = (
-        f"💓 Heartbeat\n"
-        f"📅 Daily PnL:   {daily_sign}${daily_pnl:.2f}\n"
-        f"📈 Overall PnL: {overall_sign}${overall_pnl:.2f}"
+        f"💓 Heartbeat — {now}\n"
+        f"💵 Balance:     ${balance:,.2f}\n"
+        f"📊 Session PnL: {pnl_sign}${session_pnl:.2f}\n"
+        f"📂 Open orders: {open_count}\n"
+        f"🔁 Trades today:{trades_today}\n"
+        f"🔍 Last signal: {last_signal}"
     )
     send_telegram_message(msg)
 
@@ -85,30 +89,58 @@ def send_trade_entry_notification(ticker: str, direction: str, cost: float,
                                    price_cents: int, balance: float,
                                    ob_pct: float = 0.0, edge_pct: float = 0.0,
                                    timestamp: Optional[datetime] = None) -> None:
-    """Trade entry notifications are suppressed — only wins are surfaced."""
-    return
+    """Send a trade entry alert. Fires on every order placed."""
+    if not _telegram_enabled:
+        return
+    ts  = (timestamp or datetime.now(timezone.utc)).strftime("%H:%M UTC")
+    pos = "🟢 YES" if direction.upper() == "YES" else "🔴 NO"
+    msg = (
+        f"📈 TRADE ENTERED — {ts}\n"
+        f"📍 {pos}  │  {ticker[-15:]}\n"
+        f"💵 Cost: ${cost:.2f}  │  Price: {price_cents}¢\n"
+        f"🎯 OB: {ob_pct:.0f}%  │  Edge: {edge_pct:.1f}%\n"
+        f"🏦 Balance: ${balance:,.2f}"
+    )
+    send_telegram_message(msg)
 
 
-def send_win_notification(profit: float, overall_pnl: float) -> None:
-    """Send a WIN alert. Suppressed if profit <= 0."""
+def send_win_notification(profit: float, balance: float, daily_pnl: float,
+                           ticker: str, direction: str,
+                           timestamp: Optional[datetime] = None) -> None:
+    """Send a WIN alert on every settled winning trade."""
     if not _telegram_enabled:
         return
     if profit <= 0:
         log.debug("send_win_notification called with profit=%.4f — suppressed.", profit)
         return
-    overall_sign = "+" if overall_pnl >= 0 else ""
+    ts       = (timestamp or datetime.now(timezone.utc)).strftime("%H:%M UTC")
+    pos      = "YES" if direction.upper() == "YES" else "NO"
+    pnl_sign = "+" if daily_pnl >= 0 else ""
     msg = (
-        f"✅ Winning Trade Closed\n"
-        f"💰 PnL: +${profit:.2f}\n"
-        f"📈 Overall PnL: {overall_sign}${overall_pnl:.2f}"
+        f"✅ WIN — {ts}\n"
+        f"💰 +${profit:.2f}  │  {pos}  │  {ticker[-15:]}\n"
+        f"📅 Daily PnL: {pnl_sign}${daily_pnl:.2f}\n"
+        f"🏦 Balance: ${balance:,.2f}"
     )
     send_telegram_message(msg)
 
 
-def send_loss_notification(loss: float, balance: float, running_pnl: float,
+def send_loss_notification(loss: float, balance: float, daily_pnl: float,
                             ticker: str, direction: str, streak: int) -> None:
-    """Loss notifications are suppressed — only wins are surfaced."""
-    return
+    """Send a LOSS alert on every settled losing trade."""
+    if not _telegram_enabled:
+        return
+    ts         = datetime.now(timezone.utc).strftime("%H:%M UTC")
+    pos        = "YES" if direction.upper() == "YES" else "NO"
+    pnl_sign   = "+" if daily_pnl >= 0 else ""
+    streak_str = f"  │  Streak: {streak}" if streak > 1 else ""
+    msg = (
+        f"❌ LOSS — {ts}\n"
+        f"💸 -${loss:.2f}  │  {pos}  │  {ticker[-15:]}{streak_str}\n"
+        f"📅 Daily PnL: {pnl_sign}${daily_pnl:.2f}\n"
+        f"🏦 Balance: ${balance:,.2f}"
+    )
+    send_telegram_message(msg)
 
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
