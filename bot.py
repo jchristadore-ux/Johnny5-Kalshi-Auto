@@ -472,17 +472,19 @@ def resolve_open_orders() -> None:
                 running_pnl += trade_pnl
                 if won:
                     consecutive_losses = 0
-                    # FIX v5.2.1: WIN notification was in the else (loss) branch — swapped
                     tg.send_win_notification(
                         profit=pnl,
-                        overall_pnl=running_pnl,
+                        balance=paper_balance,
+                        daily_pnl=paper_daily_pnl,
+                        ticker=ticker,
+                        direction=trade.get("side", "?"),
                     )
                 else:
                     consecutive_losses += 1
                     tg.send_loss_notification(
                         loss=abs(trade_pnl),
                         balance=paper_balance,
-                        running_pnl=running_pnl,
+                        daily_pnl=paper_daily_pnl,
                         ticker=ticker,
                         direction=trade.get("side", "?"),
                         streak=consecutive_losses,
@@ -531,11 +533,15 @@ def resolve_open_orders() -> None:
                     ticker[-15:], result.upper(), pnl)
                 balance = get_live_balance()
                 running_pnl += pnl
+                live_daily_pnl = balance - session_start_balance
                 if won:
                     consecutive_losses = 0
                     tg.send_win_notification(
                         profit=pnl,
-                        overall_pnl=running_pnl,
+                        balance=balance,
+                        daily_pnl=live_daily_pnl,
+                        ticker=ticker,
+                        direction=trade.get("side", "?"),
                     )
                 else:
                     consecutive_losses += 1
@@ -543,7 +549,7 @@ def resolve_open_orders() -> None:
                     tg.send_loss_notification(
                         loss=abs(pnl),
                         balance=balance,
-                        running_pnl=running_pnl,
+                        daily_pnl=live_daily_pnl,
                         ticker=ticker,
                         direction=trade.get("side", "?"),
                         streak=consecutive_losses,
@@ -812,6 +818,15 @@ def place_limit_order(ticker: str, direction: str, size_dollars: float,
         log.info("🟡 PAPER │ %s %s │ %d contracts @ %dc │ cost=$%.2f │ bal=$%.2f │ [%s]",
             direction, ticker[-15:], count, limit_price_cents,
             cost, paper_balance, ACTIVE_MODE.value.upper())
+        tg.send_trade_entry_notification(
+            ticker=ticker,
+            direction=direction,
+            cost=cost,
+            price_cents=limit_price_cents,
+            balance=paper_balance,
+            ob_pct=ob_pct,
+            edge_pct=edge_pct,
+        )
         return client_id
 
     # Live order — maker limit only
@@ -847,6 +862,16 @@ def place_limit_order(ticker: str, direction: str, size_dollars: float,
         log.info("✅ ORDER │ %s %s │ %d contracts @ %dc │ $%.2f │ ID:%s │ [%s]",
             direction, ticker[-15:], count, limit_price_cents,
             size_dollars, order_id[:12], ACTIVE_MODE.value.upper())
+        live_bal = get_live_balance()
+        tg.send_trade_entry_notification(
+            ticker=ticker,
+            direction=direction,
+            cost=cost,
+            price_cents=limit_price_cents,
+            balance=live_bal,
+            ob_pct=ob_pct,
+            edge_pct=edge_pct,
+        )
         return order_id
     except requests.HTTPError as e:
         log.error("Order failed │ HTTP %s │ %s", e.response.status_code, e.response.text[:200])
@@ -1040,11 +1065,16 @@ def main() -> None:
             # ── 15-minute heartbeat ────────────────────────────────────────
             if time.time() - last_heartbeat_ts >= 900:  # 15 min
                 last_heartbeat_ts = time.time()
-                hb_bal = paper_balance if DEMO_MODE else get_live_balance()
-                hb_pnl = paper_daily_pnl if DEMO_MODE else (hb_bal - session_start_balance)
+                hb_bal    = paper_balance if DEMO_MODE else get_live_balance()
+                hb_pnl    = paper_daily_pnl if DEMO_MODE else (hb_bal - session_start_balance)
+                hb_open   = len(open_orders)
+                hb_trades = len([t for t in trade_history if t.get("result") in ("win", "loss", "pending")])
                 tg.send_heartbeat(
-                    daily_pnl=hb_pnl,
-                    overall_pnl=running_pnl,
+                    balance=hb_bal,
+                    session_pnl=hb_pnl,
+                    open_count=hb_open,
+                    trades_today=hb_trades,
+                    last_signal=last_signal_desc,
                 )
 
             market = get_active_btc_market()
