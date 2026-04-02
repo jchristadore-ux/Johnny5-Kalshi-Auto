@@ -1416,7 +1416,7 @@ def run_decision(market: dict, current_balance: float) -> None:
     # In RANGING or UNKNOWN regimes, OB imbalance has no directional edge.
     # In HIGH_VOL, unpredictable swings invalidate all short-term signals.
     regime, r_squared = compute_btc_regime()
-    if regime != "TRENDING":
+    if regime in ("HIGH_VOL", "UNKNOWN"):
         log.info(
             "Regime filter │ %s (R²=%.2f) — only TRENDING allowed. Skipping.",
             regime, r_squared,
