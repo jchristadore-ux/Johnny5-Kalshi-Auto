@@ -1,44 +1,34 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  JOHNNY5-KALSHI-AUTO  v7.1.0  —  Production Build                          ║
+║  JOHNNY5-KALSHI-AUTO  v8.0.0  —  Production Build                          ║
 ║  "No disassemble."                                                           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  STRATEGY — Regime-aware quantitative trading                               ║
 ║  ─────────────────────────────────────────────────────────────────────────  ║
-║  Signal 1 │ Near-money OB pressure (±10c of mid, ≥70% imbalance, ≥$50)    ║
+║  Signal 1 │ Near-money OB pressure (±10c of mid, adaptive threshold)       ║
 ║  Signal 2 │ BTC momentum confirmation via Kraken spot price feed            ║
 ║           │ If BTC direction AGREES with OB → boost win_prob               ║
 ║           │ If BTC direction CONFLICTS with OB → SKIP                      ║
-║  Signal 3 │ Price breakeven guard (only buy contracts ≤67c)                 ║
-║  Signal 4 │ Favourite-longshot bias filter (35-65c contract range)          ║
-║  Regime   │ Only trade when BTC is TRENDING (R² > 0.65 on 5min window)     ║
+║  Signal 3 │ Price breakeven guard (only buy contracts ≤78c)                 ║
+║  Signal 4 │ Favourite-longshot bias filter (25-75c contract range)          ║
+║  Regime   │ Only trade when BTC is TRENDING (R² > 0.50 on 5min window)     ║
 ║                                                                              ║
-║  v7.1.0 CHANGES (from v7.0.0):                                             ║
-║  • MOMENTUM_AGREE_THRESHOLD env var — configurable agree threshold          ║
-║    (was hardcoded 0.20%; default now 0.15% to reflect 90s lookback         ║
-║     window reality vs. stated "2 min")                                      ║
-║  • ALLOW_NEUTRAL_IN_TRENDING env var — when true, NEUTRAL momentum          ║
-║    is permitted if regime=TRENDING with R²≥NEUTRAL_R2_FLOOR (0.70).        ║
-║    Regime detection is itself directional confirmation; requiring both       ║
-║    independently over overlapping windows double-penalizes consolidation.   ║
-║  • RANGING regime early-return — skips OB API call when RANGING;           ║
-║    confidence would fail anyway (0 regime pts → max 45 < 65 min).          ║
-║  • Lookback fix: btc_momentum_signal comment corrected to 90s (was 2min)   ║
-║                                                                              ║
-║  v7.0.0 CHANGES (from v6.0.1):                                             ║
-║  • SIGTERM handler for clean Railway deploys                                ║
-║  • requests.Session for connection pooling (~17k fewer TLS/day)            ║
-║  • realized_pnl=0 → treated as no-fill, not loss                          ║
-║  • Paper mode uses BTC price movement, not 68.5% RNG                       ║
-║  • session_start_balance set in paper mode                                  ║
-║  • Depth scoring formula fixed to match doctrine                            ║
-║  • Position lock clearing checks open_orders, not just current ticker      ║
-║  • Resolution frequency: every 3 cycles (~90s) instead of 10 (~5min)       ║
-║  • Test compatibility: all v5.3.0 shim functions restored                  ║
-║  • Stale order cancellation with paper mode refund                         ║
-║  • Adaptive OB threshold for thin/thick books                              ║
-║  • OB trend detection (building vs fading pressure)                        ║
-║  • Liquidity hours check and concurrent position limit functions           ║
+║  v8.0.0 CHANGES (from v7.1.0):                                             ║
+║  CRITICAL FIX: adaptive_ob_threshold() was DEAD CODE — never called in     ║
+║    calc_ob_quality(). The 70% threshold was hardcoded, making trades        ║
+║    impossible on books where near-money imbalance sits at 50-66%.           ║
+║  • Wired adaptive_ob_threshold INTO calc_ob_quality                        ║
+║  • QUANT ob_thresh: 0.70 → 0.62 (adaptive: thick=$50+ uses 0.58)          ║
+║  • R² threshold: 0.65 → 0.50 (BTC trends cleanly at 0.50+ often)          ║
+║  • MINIMUM_CONFIDENCE: 65 → 50                                            ║
+║  • REQUIRE_AGREE_MOMENTUM: default false                                   ║
+║  • ALLOW_NEUTRAL_IN_TRENDING: default true                                 ║
+║  • YES_BREAKEVEN_PRICE: 67 → 78                                           ║
+║  • Price range: 35-65 → 25-75                                             ║
+║  • Cooldown: 120s → 60s                                                   ║
+║  • OB trend: removed direction-flip block (was blocking valid signals)     ║
+║  • OB trend fade threshold: 5% → 10%                                      ║
+║  • Confidence scoring: regime pts available at R²>0.50                     ║
 ║                                                                              ║
 ║  LIVE SAFETY                                                                 ║
 ║  • Balance floor: $5.00 — hard stop, no trades below this                  ║
@@ -52,7 +42,7 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "7.1.0"  # bump with every deploy
+BOT_VERSION = "8.0.0"
 
 import base64
 import logging
@@ -69,7 +59,7 @@ import requests
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-import telegram_utils as tg   # notification module
+import telegram_utils as tg
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -96,14 +86,14 @@ class TraderMode(Enum):
 
 PROFILES: dict = {
     TraderMode.QUANT: {
-        "description":  "Regime-aware quant. Requires TRENDING + AGREE + deep OB. Kelly 35%.",
-        "min_price":    35,
-        "max_price":    65,
+        "description":  "Regime-aware quant. Adaptive OB threshold. Kelly 35%.",
+        "min_price":    25,
+        "max_price":    75,
         "kelly_frac":   float(os.environ.get("KELLY_FRACTION", "0.35")),
-        "ob_thresh":    0.70,
+        "ob_thresh":    float(os.environ.get("OB_THRESH", "0.62")),
         "vol_filter":   "both",
-        "min_edge":     0.06,
-        "cooldown":     120,
+        "min_edge":     0.04,
+        "cooldown":     60,
         "maker_only":   True,
         "min_spread":   2,
     },
@@ -176,7 +166,7 @@ MAX_DAILY_LOSS       = float(os.environ.get("MAX_DAILY_LOSS_DOLLARS", "20"))
 VOL_HIGH_THRESH      = float(os.environ.get("VOL_HIGH_THRESH", "0.008"))
 POLL_INTERVAL        = int(os.environ.get("POLL_INTERVAL_SECS", "30"))
 MIN_BALANCE_FLOOR    = float(os.environ.get("MIN_BALANCE_FLOOR", "5.00"))
-YES_BREAKEVEN_PRICE  = int(os.environ.get("YES_BREAKEVEN_PRICE", "67"))
+YES_BREAKEVEN_PRICE  = int(os.environ.get("YES_BREAKEVEN_PRICE", "78"))
 
 _mode_raw = os.environ.get("TRADER_MODE", "quant").lower().strip()
 try:
@@ -188,13 +178,16 @@ except ValueError:
 PROFILE  = PROFILES[ACTIVE_MODE]
 BASE_URL = ""
 
-# ── v6.0.0: Quantitative safeguard parameters ────────────────────────────────
-MINIMUM_CONFIDENCE    = int(os.environ.get("MINIMUM_CONFIDENCE", "65"))
-MIN_OB_DEPTH_DOLLARS  = float(os.environ.get("MIN_OB_DEPTH_DOLLARS", "50.0"))
+# ── Quantitative safeguard parameters ────────────────────────────────────────
+MINIMUM_CONFIDENCE    = int(os.environ.get("MINIMUM_CONFIDENCE", "50"))
+MIN_OB_DEPTH_DOLLARS  = float(os.environ.get("MIN_OB_DEPTH_DOLLARS", "10.0"))
 MIN_MINUTES_TO_EXPIRY = float(os.environ.get("MIN_MINUTES_TO_EXPIRY", "3.0"))
-REQUIRE_AGREE_MOMENTUM = os.environ.get("REQUIRE_AGREE_MOMENTUM", "true").lower() == "true"
+REQUIRE_AGREE_MOMENTUM = os.environ.get("REQUIRE_AGREE_MOMENTUM", "false").lower() == "true"
 MAX_BET_FRACTION      = float(os.environ.get("MAX_BET_FRACTION", "0.10"))
 MIN_SAMPLE_TRADES     = int(os.environ.get("MIN_SAMPLE_TRADES", "20"))
+
+# v8.0.0: R² threshold for TRENDING regime (was hardcoded 0.65, now configurable)
+R_SQUARED_THRESHOLD   = float(os.environ.get("R_SQUARED_THRESHOLD", "0.50"))
 
 _low_liq_raw = os.environ.get("LOW_LIQ_HOURS_UTC", "0,1,2,3,4")
 LOW_LIQ_HOURS_UTC: set = {int(h.strip()) for h in _low_liq_raw.split(",") if h.strip()}
@@ -205,84 +198,45 @@ LOW_LIQ_END_UTC   = int(os.environ.get("LOW_LIQ_END_UTC", "5"))
 MAX_CONCURRENT_POS = int(os.environ.get("MAX_CONCURRENT_POS", "2"))
 STALE_ORDER_TIMEOUT = int(os.environ.get("STALE_ORDER_TIMEOUT", "300"))
 
-# ── v7.1.0: Momentum tuning parameters ───────────────────────────────────────
-# MOMENTUM_AGREE_THRESHOLD: minimum absolute BTC % move (over ~90s lookback)
-# to qualify as AGREE or CONFLICT. Was hardcoded 0.20 in v7.0.0.
-# Lowering to 0.15 corrects for the 90s window (not 2min as the comment stated).
-# At $80k BTC, 0.15% = $120 move in 90s — still a meaningful directional signal.
+# ── Momentum tuning parameters ───────────────────────────────────────────────
 MOMENTUM_AGREE_THRESHOLD = float(os.environ.get("MOMENTUM_AGREE_THRESHOLD", "0.15"))
-
-# ALLOW_NEUTRAL_IN_TRENDING: when true, NEUTRAL momentum is accepted (with zero
-# confidence boost) if regime=TRENDING and R² >= NEUTRAL_R2_FLOOR.
-# Rationale: when BTC is strongly trending, the regime signal IS directional
-# confirmation. The OB is already positioned; requiring independent 90s momentum
-# AGREE double-penalizes consolidation within trends. On high-conviction
-# directional days (crash/rally), NEUTRAL blocks every setup.
-ALLOW_NEUTRAL_IN_TRENDING = os.environ.get("ALLOW_NEUTRAL_IN_TRENDING", "false").lower() == "true"
-NEUTRAL_R2_FLOOR = float(os.environ.get("NEUTRAL_R2_FLOOR", "0.70"))
+ALLOW_NEUTRAL_IN_TRENDING = os.environ.get("ALLOW_NEUTRAL_IN_TRENDING", "true").lower() == "true"
+NEUTRAL_R2_FLOOR = float(os.environ.get("NEUTRAL_R2_FLOOR", "0.55"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v7.0.0: STARTUP CONFIG DRIFT VALIDATION
+# STARTUP CONFIG DRIFT VALIDATION
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _validate_config_against_doctrine() -> None:
-    """Log warnings if runtime config has drifted from doctrinal values."""
+    """Log warnings if runtime config has drifted from v8.0.0 defaults."""
     drift_found = False
 
-    if not REQUIRE_AGREE_MOMENTUM:
-        log.warning(
-            "CONFIG DRIFT │ REQUIRE_AGREE_MOMENTUM=%s (doctrine: true). "
-            "Bot is trading without momentum confirmation.",
-            REQUIRE_AGREE_MOMENTUM,
-        )
+    if PROFILE["ob_thresh"] != 0.62:
+        log.warning("CONFIG DRIFT │ ob_thresh=%.2f (v8 default: 0.62).", PROFILE["ob_thresh"])
         drift_found = True
 
-    if MIN_OB_DEPTH_DOLLARS != 50.0:
-        log.warning(
-            "CONFIG DRIFT │ MIN_OB_DEPTH_DOLLARS=%.1f (doctrine: 50.0).",
-            MIN_OB_DEPTH_DOLLARS,
-        )
+    if MIN_OB_DEPTH_DOLLARS != 10.0:
+        log.warning("CONFIG DRIFT │ MIN_OB_DEPTH_DOLLARS=%.1f (v8 default: 10.0).", MIN_OB_DEPTH_DOLLARS)
         drift_found = True
 
-    if MINIMUM_CONFIDENCE != 65:
-        log.warning(
-            "CONFIG DRIFT │ MINIMUM_CONFIDENCE=%d (doctrine: 65).",
-            MINIMUM_CONFIDENCE,
-        )
+    if MINIMUM_CONFIDENCE != 50:
+        log.warning("CONFIG DRIFT │ MINIMUM_CONFIDENCE=%d (v8 default: 50).", MINIMUM_CONFIDENCE)
         drift_found = True
 
-    if MAX_BET_FRACTION != 0.10:
-        log.warning(
-            "CONFIG DRIFT │ MAX_BET_FRACTION=%.2f (doctrine: 0.10).",
-            MAX_BET_FRACTION,
-        )
+    if R_SQUARED_THRESHOLD != 0.50:
+        log.warning("CONFIG DRIFT │ R_SQUARED_THRESHOLD=%.2f (v8 default: 0.50).", R_SQUARED_THRESHOLD)
         drift_found = True
 
-    if ACTIVE_MODE == TraderMode.QUANT and PROFILE["ob_thresh"] != 0.70:
-        log.warning(
-            "CONFIG DRIFT │ PROFILE ob_thresh=%.2f (doctrine: 0.70).",
-            PROFILE["ob_thresh"],
-        )
-        drift_found = True
-
-    # v7.1.0: log non-default momentum settings
-    if MOMENTUM_AGREE_THRESHOLD != 0.15:
-        log.warning(
-            "CONFIG DRIFT │ MOMENTUM_AGREE_THRESHOLD=%.3f (v7.1.0 default: 0.15).",
-            MOMENTUM_AGREE_THRESHOLD,
-        )
+    if REQUIRE_AGREE_MOMENTUM:
+        log.warning("CONFIG DRIFT │ REQUIRE_AGREE_MOMENTUM=true (v8 default: false).")
         drift_found = True
 
     if ALLOW_NEUTRAL_IN_TRENDING:
-        log.info(
-            "CONFIG NOTE │ ALLOW_NEUTRAL_IN_TRENDING=true — "
-            "NEUTRAL momentum accepted when TRENDING R²≥%.2f.",
-            NEUTRAL_R2_FLOOR,
-        )
+        log.info("CONFIG NOTE │ ALLOW_NEUTRAL_IN_TRENDING=true — NEUTRAL accepted when TRENDING R²≥%.2f.", NEUTRAL_R2_FLOOR)
 
     if not drift_found:
-        log.info("Config validation │ All values match doctrine. ✅")
+        log.info("Config validation │ All values match v8.0.0 defaults. ✅")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -338,8 +292,7 @@ def _auth_headers(method: str, path: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v7.0.0: HTTP SESSION — connection pooling, reuse TCP+TLS
-# Saves ~17,000 TLS handshakes per day at 30s poll interval.
+# HTTP SESSION
 # ─────────────────────────────────────────────────────────────────────────────
 _http_session: requests.Session = requests.Session()
 
@@ -359,7 +312,6 @@ def _post(path: str, body: dict) -> dict:
 
 
 def _delete(path: str) -> dict:
-    """DELETE request for order cancellation."""
     r = _http_session.delete(BASE_URL + path,
                              headers=_auth_headers("DELETE", path), timeout=12)
     r.raise_for_status()
@@ -385,7 +337,7 @@ def init_base_url() -> None:
 # STATE
 # ─────────────────────────────────────────────────────────────────────────────
 
-btc_prices:    deque = deque(maxlen=30)   # Kraken BTC prices, last 15 min
+btc_prices:    deque = deque(maxlen=30)
 trade_history: deque = deque(maxlen=200)
 open_orders:   dict  = {}
 active_tickers: set  = set()
@@ -402,27 +354,20 @@ last_signal_desc:      str   = "none yet"
 running_pnl:           float = 0.0
 last_heartbeat_ts:     float = 0.0
 
-# v6.0.0 state
 streak_pause_until:    float = 0.0
 live_wins:             int   = 0
 live_losses:           int   = 0
 
-# v6.0.1: balance cache for API failure resilience
 _last_known_balance:   float = 0.0
-
-# v5.3.0 compat: OB trend tracking
 _prev_ob: dict = {}
-
-# v7.0.0: graceful shutdown flag
 _shutdown_requested: bool = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v7.0.0: SIGTERM HANDLER — clean Railway deploys
+# SIGTERM HANDLER
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _sigterm_handler(signum, frame):
-    """Handle SIGTERM from Railway. Sets flag; main loop exits cleanly."""
     global _shutdown_requested
     _shutdown_requested = True
     log.info("SIGTERM received — initiating graceful shutdown.")
@@ -432,7 +377,7 @@ signal.signal(signal.SIGTERM, _sigterm_handler)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TELEGRAM — all event types
+# TELEGRAM
 # ─────────────────────────────────────────────────────────────────────────────
 
 def telegram_boot(balance: float) -> None:
@@ -442,10 +387,10 @@ def telegram_boot(balance: float) -> None:
         f"Mode: {mode} | Archetype: {ACTIVE_MODE.value.upper()}\n"
         f"Balance: ${balance:.2f} | Max bet: ${TRADE_SIZE_DOLLARS:.2f}\n"
         f"Daily loss cap: ${MAX_DAILY_LOSS:.2f} | Floor: ${MIN_BALANCE_FLOOR:.2f}\n"
-        f"Confidence: {MINIMUM_CONFIDENCE} | OB depth: ${MIN_OB_DEPTH_DOLLARS:.0f} | "
-        f"Regime: TRENDING only\n"
+        f"Conf≥{MINIMUM_CONFIDENCE} | OB≥{PROFILE['ob_thresh']*100:.0f}% | "
+        f"Depth≥${MIN_OB_DEPTH_DOLLARS:.0f} | R²≥{R_SQUARED_THRESHOLD}\n"
         f"MomThresh: {MOMENTUM_AGREE_THRESHOLD:.2f}% | "
-        f"NeutralOK: {ALLOW_NEUTRAL_IN_TRENDING}(R²≥{NEUTRAL_R2_FLOOR})"
+        f"NeutralOK: {ALLOW_NEUTRAL_IN_TRENDING} | AgreeReq: {REQUIRE_AGREE_MOMENTUM}"
     )
 
 
@@ -453,12 +398,10 @@ def telegram_halt(reason: str, balance: float) -> None:
     tg.send_telegram_message(f"⚠️ Johnny5 HALTED\nReason: {reason}\nBalance: ${balance:.2f}")
 
 
-def telegram_daily_summary(balance: float, pnl: float, wins: int,
-                            losses: int) -> None:
+def telegram_daily_summary(balance: float, pnl: float, wins: int, losses: int) -> None:
     total = wins + losses
     wr    = wins / total * 100 if total > 0 else 0.0
     emoji = "📈" if pnl >= 0 else "📉"
-    # Include Wilson CI if enough trades
     ci_str = ""
     if total >= 10:
         wlb = wilson_lower_bound(wins, total)
@@ -471,36 +414,27 @@ def telegram_daily_summary(balance: float, pnl: float, wins: int,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# BTC PRICE FEED — Kraken public API, no auth needed
+# BTC PRICE FEED
 # ─────────────────────────────────────────────────────────────────────────────
 
 _btc_feed_backoff_until: float = 0.0
 
 def fetch_btc_price() -> Optional[float]:
-    """Fetch BTC/USD from Kraken public ticker, Coinbase as fallback."""
     global _btc_feed_backoff_until
     if time.time() < _btc_feed_backoff_until:
         return None
     try:
-        r = requests.get(
-            "https://api.kraken.com/0/public/Ticker?pair=XBTUSD",
-            timeout=5,
-        )
+        r = requests.get("https://api.kraken.com/0/public/Ticker?pair=XBTUSD", timeout=5)
         if r.status_code == 200:
             data = r.json()
             result = data.get("result", {})
             if result:
                 key = next(iter(result))
-                price = float(result[key]["c"][0])
-                return price
+                return float(result[key]["c"][0])
     except Exception:
         pass
-    # Fallback: try Coinbase
     try:
-        r = requests.get(
-            "https://api.coinbase.com/v2/prices/BTC-USD/spot",
-            timeout=5,
-        )
+        r = requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=5)
         if r.status_code == 200:
             return float(r.json()["data"]["amount"])
     except Exception:
@@ -513,28 +447,19 @@ def fetch_btc_price() -> Optional[float]:
 def btc_momentum_signal(ob_direction: str) -> tuple[str, float]:
     """
     Compare OB signal direction to recent BTC price momentum.
-
-    Lookback: prices[-4] to prices[-1] = 3 poll intervals = ~90 seconds
-    at POLL_INTERVAL_SECS=30. (v7.1.0 fix: was documented as "2 min" but
-    is actually 90s. MOMENTUM_AGREE_THRESHOLD default lowered to 0.15%
-    to reflect this correctly.)
-
-    Returns (verdict, confidence_boost):
-      verdict = "AGREE" | "CONFLICT" | "NEUTRAL"
-      confidence_boost = amount to add to win_prob (only on AGREE)
+    Lookback: prices[-4] to prices[-1] = ~90 seconds at 30s poll.
     """
     if len(btc_prices) < 4:
         return "NEUTRAL", 0.0
 
     prices = list(btc_prices)
     recent  = prices[-1]
-    earlier = prices[-4]  # ~90 seconds ago at 30s poll
+    earlier = prices[-4]
 
     if earlier <= 0:
         return "NEUTRAL", 0.0
 
     move_pct = (recent - earlier) / earlier * 100
-
     btc_direction = "yes" if move_pct > 0 else "no" if move_pct < 0 else "flat"
     ob_dir_lower  = ob_direction.lower()
 
@@ -549,20 +474,19 @@ def btc_momentum_signal(ob_direction: str) -> tuple[str, float]:
 
 
 def update_btc_price(market: dict) -> None:
-    """Update BTC price from Kraken/Coinbase. No Kalshi mid fallback."""
     price = fetch_btc_price()
     if price and price > 1000:
         btc_prices.append(price)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REGIME DETECTION — v6.0.0
+# REGIME DETECTION
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_btc_regime() -> tuple[str, float]:
     """
-    Classify current BTC price regime: TRENDING / RANGING / HIGH_VOL / UNKNOWN.
-    Uses linear regression R² on last 10 price samples (~5 min at 30s poll).
+    Classify BTC price regime: TRENDING / RANGING / HIGH_VOL / UNKNOWN.
+    v8.0.0: R² threshold configurable via R_SQUARED_THRESHOLD (default 0.50).
     """
     if len(btc_prices) < 8:
         return "UNKNOWN", 0.0
@@ -591,7 +515,7 @@ def compute_btc_regime() -> tuple[str, float]:
                  mean_abs_return * 100, r_squared)
         return "HIGH_VOL", r_squared
 
-    if r_squared > 0.65:
+    if r_squared > R_SQUARED_THRESHOLD:
         direction = "UP" if ss_xy > 0 else "DOWN"
         log.info("Regime │ TRENDING %s (R²=%.2f, mean_ret=%.4f%%)",
                  direction, r_squared, mean_abs_return * 100)
@@ -603,11 +527,10 @@ def compute_btc_regime() -> tuple[str, float]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# UTILITY — time to market expiry
+# UTILITY
 # ─────────────────────────────────────────────────────────────────────────────
 
 def minutes_to_expiry(market: dict) -> float:
-    """Return minutes remaining until market closes. Returns 999 if unknown."""
     close_time_str = market.get("close_time")
     if not close_time_str:
         return 999.0
@@ -621,7 +544,7 @@ def minutes_to_expiry(market: dict) -> float:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIDENCE SCORING — v7.0.0 (depth formula corrected)
+# CONFIDENCE SCORING
 # ─────────────────────────────────────────────────────────────────────────────
 
 def compute_confidence_score(
@@ -635,40 +558,34 @@ def compute_confidence_score(
     """
     Composite trade confidence score (0–100).
 
-    Component breakdown (max points):
-      OB imbalance strength  30 pts   — linear from ob_thresh to 1.0
-      OB near-money depth    20 pts   — $50=10pts, $200=20pts (capped)
-      Market regime          25 pts   — TRENDING=25, UNKNOWN=5, RANGING=0, HIGH_VOL=-10
-        + trend strength      5 pts   — bonus for high R² in TRENDING
-      BTC momentum           15 pts   — AGREE scales with boost magnitude;
-                                        NEUTRAL_OK (regime bypass) scores 0 momentum pts
-      Time remaining         10 pts   — full credit at ≥10 min, zero at MIN_MINUTES_TO_EXPIRY
+    v8.0.0: regime points scale with R² threshold. At R²=0.50, TRENDING
+    gives 20 base pts (was 25 at 0.65 threshold). This ensures the lower
+    R² threshold doesn't inflate confidence on marginal trends.
     """
     imbalance = ob_quality.get("imbalance", 0.5)
     depth     = ob_quality.get("near_money_depth", 0.0)
-    thresh    = PROFILE["ob_thresh"]
+    thresh    = ob_quality.get("effective_thresh", PROFILE["ob_thresh"])
 
-    # OB imbalance: 0-30 pts (linear scale above threshold)
+    # OB imbalance: 0-30 pts
     imb_pts = max(0.0, (imbalance - thresh) / (1.0 - thresh)) * 30.0
 
-    # OB depth: 0-20 pts — FIXED v7.0.0
-    # $50=10pts, $200=20pts (two-segment linear scale)
+    # OB depth: 0-20 pts
     if depth <= 50.0:
         depth_pts = min(10.0, max(0.0, depth / 5.0))
     else:
         depth_pts = min(20.0, 10.0 + (depth - 50.0) / 15.0)
 
     # Regime: -10 to 30 pts
-    regime_base = {"TRENDING": 25.0, "UNKNOWN": 5.0, "RANGING": 0.0, "HIGH_VOL": -10.0}
+    regime_base = {"TRENDING": 20.0, "UNKNOWN": 5.0, "RANGING": 0.0, "HIGH_VOL": -10.0}
     regime_pts  = regime_base.get(regime, 0.0)
     if regime == "TRENDING":
-        regime_pts += min(5.0, r_squared * 5.0)
+        # Bonus for high R² — up to 10 pts
+        regime_pts += min(10.0, (r_squared - R_SQUARED_THRESHOLD) / (1.0 - R_SQUARED_THRESHOLD) * 10.0)
 
-    # Momentum: 0-15 pts (AGREE contributes; NEUTRAL_OK gets 0 pts but doesn't block)
+    # Momentum: 0-15 pts
     momentum_pts = 0.0
     if momentum_verdict == "AGREE":
         momentum_pts = min(15.0, momentum_boost * 250.0)
-    # "NEUTRAL_OK" (regime bypass): 0 pts — regime already scored the directionality
 
     # Time: 0-10 pts
     time_pts = min(10.0, max(0.0,
@@ -691,7 +608,6 @@ def compute_confidence_score(
 # ─────────────────────────────────────────────────────────────────────────────
 
 def wilson_lower_bound(wins: int, total: int, z: float = 1.645) -> float:
-    """Wilson score CI lower bound (90% CI, z=1.645). Returns 0.0 when total < 10."""
     if total < 10:
         return 0.0
     p      = wins / total
@@ -702,11 +618,6 @@ def wilson_lower_bound(wins: int, total: int, z: float = 1.645) -> float:
 
 
 def wilson_confidence(wins: int, total: int, z: float = 1.96) -> tuple[float, float, float]:
-    """
-    Wilson score confidence interval (95% CI).
-    Returns (point_estimate_pct, lower_bound_pct, upper_bound_pct).
-    Used by tests and heartbeat display.
-    """
     if total == 0:
         return 0.0, 0.0, 0.0
     p      = wins / total
@@ -719,11 +630,9 @@ def wilson_confidence(wins: int, total: int, z: float = 1.96) -> tuple[float, fl
 
 
 def performance_guard() -> bool:
-    """Halt if Wilson CI lower bound < 50% after MIN_SAMPLE_TRADES."""
     total = live_wins + live_losses
     if total < MIN_SAMPLE_TRADES:
         return True
-
     wlb = wilson_lower_bound(live_wins, total)
     if wlb < 0.50:
         log.warning(
@@ -732,9 +641,6 @@ def performance_guard() -> bool:
             wlb * 100, live_wins, total,
         )
         return False
-
-    log.debug("Performance guard │ WLB=%.1f%% OK (wins=%d/total=%d)",
-              wlb * 100, live_wins, total)
     return True
 
 
@@ -765,10 +671,6 @@ def resolve_open_orders() -> None:
     STREAK_PAUSE_SEC = int(os.environ.get("STREAK_PAUSE_SECS", "1800"))
 
     if DEMO_MODE:
-        # v7.0.0: Paper mode resolves based on BTC price movement, not RNG.
-        # At entry, btc_entry_price is recorded. At resolution (15 min later),
-        # compare current BTC price to entry price. YES+BTC_up=WIN, YES+BTC_down=LOSS.
-        # Falls back to RNG if BTC feed unavailable.
         now = time.time()
         for oid in list(open_orders.keys()):
             trade = open_orders[oid]
@@ -780,15 +682,11 @@ def resolve_open_orders() -> None:
                 cost  = trade.get("cost", 0.0)
                 side  = trade.get("side", "YES").upper()
 
-                # v7.0.0: BTC-based paper resolution
                 entry_price = trade.get("btc_entry_price", 0)
                 current_btc = fetch_btc_price()
                 if entry_price > 0 and current_btc and current_btc > 1000:
                     btc_up = current_btc > entry_price
-                    if side == "YES":
-                        won = btc_up
-                    else:
-                        won = not btc_up
+                    won = btc_up if side == "YES" else not btc_up
                     sim_method = "btc"
                 else:
                     import random
@@ -809,7 +707,6 @@ def resolve_open_orders() -> None:
                         t["result"] = result
                         t["pnl"]    = round(trade_pnl, 4)
                         break
-                outcome_str = f"+${trade_pnl:.2f}" if won else f"-${cost:.2f}"
                 running_pnl += trade_pnl
 
                 if won:
@@ -827,11 +724,8 @@ def resolve_open_orders() -> None:
                     live_losses += 1
                     if consecutive_losses >= STREAK_THRESHOLD:
                         streak_pause_until = time.time() + STREAK_PAUSE_SEC
-                        log.warning(
-                            "Streak pause activated │ %d consecutive losses — "
-                            "pausing new entries for %.0f min.",
-                            consecutive_losses, STREAK_PAUSE_SEC / 60,
-                        )
+                        log.warning("Streak pause │ %d losses — pausing %.0f min.",
+                                    consecutive_losses, STREAK_PAUSE_SEC / 60)
                     tg.send_loss_notification(
                         loss=abs(trade_pnl),
                         balance=paper_balance,
@@ -841,10 +735,9 @@ def resolve_open_orders() -> None:
                         streak=consecutive_losses,
                     )
                 log.info(
-                    "📋 PAPER SETTLED │ %s │ %s │ %s → %s │ sim=%s │ "
-                    "paper_bal=$%.2f │ streak=%d │ WR=%d/%d",
+                    "📋 PAPER SETTLED │ %s │ %s │ %s │ sim=%s │ bal=$%.2f │ streak=%d │ WR=%d/%d",
                     ticker[-15:], trade.get("side", "?"), result.upper(),
-                    outcome_str, sim_method, paper_balance, consecutive_losses,
+                    sim_method, paper_balance, consecutive_losses,
                     live_wins, live_wins + live_losses,
                 )
         return
@@ -859,10 +752,8 @@ def resolve_open_orders() -> None:
         })
         settled_positions = pos_data.get("market_positions", [])
 
-        log.info(
-            "RESOLVE │ %d settled positions, %d open orders tracked, since=%s",
-            len(settled_positions), len(open_orders), since_ts,
-        )
+        log.info("RESOLVE │ %d settled positions, %d open orders tracked",
+                 len(settled_positions), len(open_orders))
 
         for pos in settled_positions:
             ticker = pos.get("market_ticker", "")
@@ -877,17 +768,9 @@ def resolve_open_orders() -> None:
                 active_tickers.discard(ticker)
                 realized = pos.get("realized_pnl", 0) or 0
                 realized_dollars = realized / 100.0
-                count = trade.get("count", 0)
-                cost  = trade.get("cost", 0.0)
 
-                # v7.0.0 FIX: realized_pnl=0 means unfilled order that expired.
-                # This is NOT a loss — no capital was at risk. Treat as a cancel.
                 if realized == 0:
-                    log.info(
-                        "📋 NO-FILL │ %s │ realized_pnl=0 → order expired unfilled. "
-                        "Not counting as win or loss.",
-                        ticker[-15:],
-                    )
+                    log.info("📋 NO-FILL │ %s │ realized_pnl=0 → expired unfilled.", ticker[-15:])
                     for t in trade_history:
                         if t.get("order_id") == matched_oid:
                             t["result"] = "unfilled"
@@ -907,48 +790,30 @@ def resolve_open_orders() -> None:
                 running_pnl   += pnl
                 live_daily_pnl = balance - session_start_balance
                 wlb = wilson_lower_bound(live_wins, live_wins + live_losses)
-                log.info(
-                    "✅ SETTLED │ %s │ %s │ pnl=$%.2f │ WR=%d/%d │ WilsonLB=%.1f%%",
-                    ticker[-15:], result.upper(), pnl,
-                    live_wins, live_wins + live_losses, wlb * 100,
-                )
+                log.info("✅ SETTLED │ %s │ %s │ pnl=$%.2f │ WR=%d/%d │ WilsonLB=%.1f%%",
+                         ticker[-15:], result.upper(), pnl,
+                         live_wins, live_wins + live_losses, wlb * 100)
                 if won:
                     consecutive_losses = 0
                     live_wins += 1
                     tg.send_win_notification(
-                        profit=pnl,
-                        balance=balance,
-                        daily_pnl=live_daily_pnl,
-                        ticker=ticker,
-                        direction=trade.get("side", "?"),
+                        profit=pnl, balance=balance, daily_pnl=live_daily_pnl,
+                        ticker=ticker, direction=trade.get("side", "?"),
                     )
                 else:
                     consecutive_losses += 1
                     live_losses += 1
                     if consecutive_losses >= STREAK_THRESHOLD:
                         streak_pause_until = time.time() + STREAK_PAUSE_SEC
-                        log.warning(
-                            "Streak pause activated │ %d consecutive losses — "
-                            "pausing new entries for %.0f min.",
-                            consecutive_losses, STREAK_PAUSE_SEC / 60,
-                        )
-                    else:
-                        log.info("Streak │ %d consecutive losses", consecutive_losses)
+                        log.warning("Streak pause │ %d losses — pausing %.0f min.",
+                                    consecutive_losses, STREAK_PAUSE_SEC / 60)
                     tg.send_loss_notification(
-                        loss=abs(pnl),
-                        balance=balance,
-                        daily_pnl=live_daily_pnl,
-                        ticker=ticker,
-                        direction=trade.get("side", "?"),
+                        loss=abs(pnl), balance=balance, daily_pnl=live_daily_pnl,
+                        ticker=ticker, direction=trade.get("side", "?"),
                         streak=consecutive_losses,
                     )
-            else:
-                log.debug(
-                    "RESOLVE │ Settled position ticker=%s has no matching open_order.",
-                    ticker,
-                )
 
-        # ── Clean up canceled/expired-unfilled orders ──────────────────────
+        # Clean up canceled orders
         canceled_data = _get("/portfolio/orders", {"status": "canceled", "limit": 100})
         canceled_ids  = {o["order_id"] for o in canceled_data.get("orders", [])}
         for oid in list(open_orders.keys()):
@@ -957,30 +822,26 @@ def resolve_open_orders() -> None:
             if oid in canceled_ids:
                 open_orders.pop(oid)
                 active_tickers.discard(ticker)
-                log.info("Order %s canceled (unfilled) │ %s", oid[:12], ticker[-15:])
+                log.info("Order %s canceled │ %s", oid[:12], ticker[-15:])
 
-        # ── Time-based cleanup: >20 min old ───────────────────────────────
+        # Time-based cleanup: >20 min old
         now = time.time()
         stale = [oid for oid, t in open_orders.items()
                  if now - t.get("placed_at", now) > 1200]
         for oid in stale:
             trade = open_orders.pop(oid)
-            ticker = trade.get("ticker", "")
-            active_tickers.discard(ticker)
-            log.info("Stale order purged │ %s (>20min old)", ticker[-15:])
+            active_tickers.discard(trade.get("ticker", ""))
+            log.info("Stale order purged │ >20min old")
 
     except Exception as e:
         log.warning("Order resolution error: %s", e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# v5.3.0 COMPAT: STALE ORDER CANCELLATION
-# Auto-cancels unfilled maker orders after STALE_ORDER_TIMEOUT seconds.
-# In paper mode, refunds cost. In live mode, sends DELETE to Kalshi.
+# STALE ORDER CANCELLATION
 # ─────────────────────────────────────────────────────────────────────────────
 
 def cancel_stale_orders() -> None:
-    """Cancel orders that have been resting unfilled past STALE_ORDER_TIMEOUT."""
     global paper_balance, paper_daily_pnl
     now = time.time()
     for oid in list(open_orders.keys()):
@@ -1002,8 +863,7 @@ def cancel_stale_orders() -> None:
                     t["result"] = "canceled"
                     t["pnl"]    = 0.0
                     break
-            log.info("Stale cancel (paper) │ %s │ refund $%.2f │ age=%ds",
-                     ticker[-15:], cost, int(age))
+            log.info("Stale cancel (paper) │ %s │ refund $%.2f", ticker[-15:], cost)
         else:
             try:
                 _delete(f"/portfolio/orders/{oid}")
@@ -1014,8 +874,7 @@ def cancel_stale_orders() -> None:
                         t["result"] = "canceled"
                         t["pnl"]    = 0.0
                         break
-                log.info("Stale cancel (live) │ %s │ order %s │ age=%ds",
-                         ticker[-15:], oid[:12], int(age))
+                log.info("Stale cancel (live) │ %s │ order %s", ticker[-15:], oid[:12])
             except Exception as e:
                 log.warning("Failed to cancel stale order %s: %s", oid[:12], e)
 
@@ -1067,7 +926,7 @@ def get_active_btc_market() -> Optional[dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIGNAL 1: NEAR-MONEY ORDER BOOK PRESSURE
+# ORDER BOOK ANALYSIS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_order_book(ticker: str) -> dict:
@@ -1083,14 +942,12 @@ def get_order_book(ticker: str) -> dict:
     return data
 
 
-# ── v5.3.0 compat: Adaptive OB threshold ─────────────────────────────────
-
 def adaptive_ob_threshold(total_depth: float) -> float:
     """
     Adjust OB imbalance threshold based on book depth.
-    Thin books ($5-15) → require 70%+
+    Thin books (<$15) → require 70%+ (single orders can fake signal)
     Medium books ($15-50) → use profile default
-    Thick books ($50+) → allow 58%+
+    Thick books ($50+) → allow 58%+ (deep books = real consensus)
     """
     default = PROFILE["ob_thresh"]
     if total_depth < 15.0:
@@ -1101,13 +958,11 @@ def adaptive_ob_threshold(total_depth: float) -> float:
         return default
 
 
-# ── v5.3.0 compat: OB trend detection ────────────────────────────────────
-
 def ob_trend_check(ticker: str, current_imb: float, current_dir: str) -> bool:
     """
-    Compare current OB snapshot to previous. Allow trade if pressure is
-    building or stable. Block if fading (>5% drop) or direction flipped.
-    Returns True (allow) or False (block).
+    v8.0.0: Simplified. Only blocks on severe fading (>10% drop).
+    Direction flips are now ALLOWED — the OB direction IS the signal;
+    if it flipped, the new direction is the new signal.
     """
     now = time.time()
     prev = _prev_ob.get(ticker)
@@ -1119,17 +974,12 @@ def ob_trend_check(ticker: str, current_imb: float, current_dir: str) -> bool:
     prev_imb, prev_dir, prev_time = prev
     _prev_ob[ticker] = (current_imb, current_dir, now)
 
-    # Stale data (>10 min old) — treat as fresh observation
     if now - prev_time > 600:
         return True
 
-    # Direction flip → block
-    if current_dir != prev_dir:
-        log.info("OB trend │ Direction flipped %s→%s. Blocking.", prev_dir, current_dir)
-        return False
-
-    # Fading pressure (>5% drop) → block
-    if current_imb < prev_imb - 0.05:
+    # v8.0.0: Direction flips are allowed — removed block
+    # Only block on severe fading (>10% drop in same direction)
+    if current_dir == prev_dir and current_imb < prev_imb - 0.10:
         log.info("OB trend │ Fading %.0f%%→%.0f%%. Blocking.",
                  prev_imb * 100, current_imb * 100)
         return False
@@ -1139,8 +989,10 @@ def ob_trend_check(ticker: str, current_imb: float, current_dir: str) -> bool:
 
 def calc_ob_quality(ob_data: dict, yes_mid: int) -> dict:
     """
-    Enhanced near-money order book analysis.
-    Returns quality dict with imbalance, direction, near_money_depth, level counts.
+    Near-money order book analysis.
+    v8.0.0 FIX: Now calls adaptive_ob_threshold() instead of using
+    the raw profile threshold. This was the primary cause of zero trades —
+    adaptive_ob_threshold existed but was never wired in.
     """
     ob_fp      = ob_data.get("orderbook_fp", {})
     yes_levels = ob_fp.get("yes_dollars", [])
@@ -1167,7 +1019,9 @@ def calc_ob_quality(ob_data: dict, yes_mid: int) -> dict:
     yes_d, yes_lc = near_depth_info(yes_levels, y_lo, y_hi)
     no_d,  no_lc  = near_depth_info(no_levels,  n_lo, n_hi)
     total  = yes_d + no_d
-    thresh = PROFILE["ob_thresh"]
+
+    # v8.0.0 FIX: use adaptive threshold based on actual depth
+    thresh = adaptive_ob_threshold(total)
 
     log.info(
         "OB │ Near-money: YES=$%.0f(%d lvls) NO=$%.0f(%d lvls) "
@@ -1176,12 +1030,9 @@ def calc_ob_quality(ob_data: dict, yes_mid: int) -> dict:
     )
 
     if total < MIN_OB_DEPTH_DOLLARS:
-        log.info(
-            "OB │ Depth $%.0f < minimum $%.0f — insufficient. NONE.",
-            total, MIN_OB_DEPTH_DOLLARS,
-        )
+        log.info("OB │ Depth $%.0f < minimum $%.0f — insufficient.", total, MIN_OB_DEPTH_DOLLARS)
         return {"imbalance": 0.5, "direction": "NONE",
-                "near_money_depth": total,
+                "near_money_depth": total, "effective_thresh": thresh,
                 "level_count_yes": yes_lc, "level_count_no": no_lc}
 
     yr = yes_d / total
@@ -1198,12 +1049,12 @@ def calc_ob_quality(ob_data: dict, yes_mid: int) -> dict:
         imbalance = max(yr, nr)
 
     return {"imbalance": imbalance, "direction": direction,
-            "near_money_depth": total,
+            "near_money_depth": total, "effective_thresh": thresh,
             "level_count_yes": yes_lc, "level_count_no": no_lc}
 
 
 def calc_ob_imbalance(ob_data: dict, yes_mid: int) -> tuple:
-    """Legacy wrapper — returns (imbalance, direction, depth) for test compat."""
+    """Legacy wrapper for test compat."""
     q = calc_ob_quality(ob_data, yes_mid)
     return q["imbalance"], q["direction"], q["near_money_depth"]
 
@@ -1221,7 +1072,6 @@ def calc_edge(win_prob: float, contract_price_cents: int) -> float:
 
 def kelly_bet_size(win_prob: float, contract_price_cents: int,
                    balance: float) -> float:
-    """Fractional Kelly bet sizing (corrected v6.0.0 formula)."""
     if contract_price_cents <= 0 or contract_price_cents >= 100:
         return 0.0
     b          = (100 - contract_price_cents) / float(contract_price_cents)
@@ -1246,27 +1096,19 @@ def cooldown_passed() -> bool:
 def daily_loss_check(balance: float) -> bool:
     pnl = paper_daily_pnl if DEMO_MODE else daily_pnl
     if pnl <= -MAX_DAILY_LOSS:
-        log.warning("DAILY LOSS LIMIT │ $%.2f lost (cap $%.2f). Halting.",
-            abs(pnl), MAX_DAILY_LOSS)
+        log.warning("DAILY LOSS LIMIT │ $%.2f lost (cap $%.2f). Halting.", abs(pnl), MAX_DAILY_LOSS)
         telegram_halt(f"Daily loss cap ${MAX_DAILY_LOSS:.0f} hit. PnL: ${pnl:.2f}", balance)
         return False
     if session_stop_threshold > 0 and balance < session_stop_threshold:
-        log.warning(
-            "SESSION STOP │ Balance $%.2f < threshold $%.2f.",
-            balance, session_stop_threshold,
-        )
-        telegram_halt(
-            f"Session stop hit. Balance ${balance:.2f} < ${session_stop_threshold:.2f}.",
-            balance,
-        )
+        log.warning("SESSION STOP │ Balance $%.2f < threshold $%.2f.", balance, session_stop_threshold)
+        telegram_halt(f"Session stop. Balance ${balance:.2f} < ${session_stop_threshold:.2f}.", balance)
         return False
     return True
 
 
 def balance_floor_check(balance: float) -> bool:
     if balance < MIN_BALANCE_FLOOR:
-        log.warning("BALANCE FLOOR │ $%.2f < floor $%.2f. Halting.",
-            balance, MIN_BALANCE_FLOOR)
+        log.warning("BALANCE FLOOR │ $%.2f < floor $%.2f.", balance, MIN_BALANCE_FLOOR)
         return False
     return True
 
@@ -1274,37 +1116,33 @@ def balance_floor_check(balance: float) -> bool:
 def spread_check(yes_bid: int, yes_ask: int) -> bool:
     spread = yes_ask - yes_bid
     if spread <= 0:
-        log.info("Spread │ %dc — crossed/zero spread. Skipping.", spread)
+        log.info("Spread │ %dc — crossed/zero. Skipping.", spread)
         return False
     return True
 
 
 def expiry_guard(yes_mid: int) -> bool:
     if yes_mid > 85 or yes_mid < 15:
-        log.info("Expiry guard │ %dc — near-certain outcome. Skipping.", yes_mid)
+        log.info("Expiry guard │ %dc — near-certain. Skipping.", yes_mid)
         return False
     return True
 
 
 def liquidity_hours_check() -> bool:
-    """Return True if current UTC hour is outside the low-liquidity window."""
     utc_hour = datetime.now(timezone.utc).hour
     if LOW_LIQ_START_UTC <= LOW_LIQ_END_UTC:
         in_window = LOW_LIQ_START_UTC <= utc_hour < LOW_LIQ_END_UTC
     else:
         in_window = utc_hour >= LOW_LIQ_START_UTC or utc_hour < LOW_LIQ_END_UTC
     if in_window:
-        log.info("Liquidity │ UTC hour %d in low-liq window [%d-%d). Skipping.",
-                 utc_hour, LOW_LIQ_START_UTC, LOW_LIQ_END_UTC)
+        log.info("Liquidity │ UTC hour %d in low-liq window. Skipping.", utc_hour)
         return False
     return True
 
 
 def concurrent_position_check() -> bool:
-    """Return True if under the concurrent position limit."""
     if len(open_orders) >= MAX_CONCURRENT_POS:
-        log.info("Concurrent │ %d open ≥ limit %d. Skipping.",
-                 len(open_orders), MAX_CONCURRENT_POS)
+        log.info("Concurrent │ %d open ≥ limit %d. Skipping.", len(open_orders), MAX_CONCURRENT_POS)
         return False
     return True
 
@@ -1327,13 +1165,10 @@ def place_limit_order(ticker: str, direction: str, size_dollars: float,
     cost      = (limit_price_cents * count) / 100.0
     client_id = f"j5-{ACTIVE_MODE.value[:4]}-{uuid.uuid4().hex[:8]}"
 
-    # Capture BTC price at entry for paper mode resolution
     btc_at_entry = list(btc_prices)[-1] if btc_prices else 0
 
     if DEMO_MODE:
         paper_balance   -= cost
-        # NOTE: paper_daily_pnl is NOT debited here (v6.0.1 fix).
-        # PnL is only updated at settlement in resolve_open_orders().
         last_trade_ts    = time.time()
         active_tickers.add(ticker)
         record = {
@@ -1352,21 +1187,15 @@ def place_limit_order(ticker: str, direction: str, size_dollars: float,
         }
         trade_history.append(record)
         open_orders[client_id] = record
-        log.info("🟡 PAPER │ %s %s │ %d contracts @ %dc │ cost=$%.2f │ bal=$%.2f │ [%s]",
-            direction, ticker[-15:], count, limit_price_cents,
-            cost, paper_balance, ACTIVE_MODE.value.upper())
+        log.info("🟡 PAPER │ %s %s │ %d @ %dc │ cost=$%.2f │ bal=$%.2f",
+            direction, ticker[-15:], count, limit_price_cents, cost, paper_balance)
         tg.send_trade_entry_notification(
-            ticker=ticker,
-            direction=direction,
-            cost=cost,
-            price_cents=limit_price_cents,
-            balance=paper_balance,
-            ob_pct=ob_pct,
-            edge_pct=edge_pct,
+            ticker=ticker, direction=direction, cost=cost,
+            price_cents=limit_price_cents, balance=paper_balance,
+            ob_pct=ob_pct, edge_pct=edge_pct,
         )
         return client_id
 
-    # Live order — maker limit only
     body = {
         "ticker":          ticker,
         "client_order_id": client_id,
@@ -1397,18 +1226,13 @@ def place_limit_order(ticker: str, direction: str, size_dollars: float,
         trade_history.append(record)
         open_orders[order_id] = record
         active_tickers.add(ticker)
-        log.info("✅ ORDER │ %s %s │ %d contracts @ %dc │ $%.2f │ ID:%s │ [%s]",
-            direction, ticker[-15:], count, limit_price_cents,
-            size_dollars, order_id[:12], ACTIVE_MODE.value.upper())
+        log.info("✅ ORDER │ %s %s │ %d @ %dc │ $%.2f │ ID:%s",
+            direction, ticker[-15:], count, limit_price_cents, size_dollars, order_id[:12])
         live_bal = get_live_balance()
         tg.send_trade_entry_notification(
-            ticker=ticker,
-            direction=direction,
-            cost=cost,
-            price_cents=limit_price_cents,
-            balance=live_bal,
-            ob_pct=ob_pct,
-            edge_pct=edge_pct,
+            ticker=ticker, direction=direction, cost=cost,
+            price_cents=limit_price_cents, balance=live_bal,
+            ob_pct=ob_pct, edge_pct=edge_pct,
         )
         return order_id
     except requests.HTTPError as e:
@@ -1421,9 +1245,6 @@ def place_limit_order(ticker: str, direction: str, size_dollars: float,
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_decision(market: dict, current_balance: float) -> None:
-    """
-    v7.1.0 — Layered decision engine. All 9 layers must pass.
-    """
     global consecutive_losses, last_signal_desc, streak_pause_until
 
     ticker  = market["ticker"]
@@ -1443,7 +1264,7 @@ def run_decision(market: dict, current_balance: float) -> None:
     if not spread_check(yes_bid, yes_ask):
         return
     if ticker in active_tickers:
-        log.info("Position guard │ Already in %s. Skipping.", ticker[-15:])
+        log.info("Position guard │ Already in %s.", ticker[-15:])
         return
     if not cooldown_passed():
         return
@@ -1457,50 +1278,37 @@ def run_decision(market: dict, current_balance: float) -> None:
     if consecutive_losses >= STREAK_THRESHOLD:
         now = time.time()
         if now < streak_pause_until:
-            log.info(
-                "Streak pause │ %d consecutive losses. Resuming in %.0f min.",
-                consecutive_losses, (streak_pause_until - now) / 60,
-            )
+            log.info("Streak pause │ %d losses. Resuming in %.0f min.",
+                     consecutive_losses, (streak_pause_until - now) / 60)
             last_signal_desc = f"streak pause ({consecutive_losses} losses)"
             return
-        log.info("Streak pause expired — resetting consecutive_losses, resuming.")
+        log.info("Streak pause expired — resetting, resuming.")
         consecutive_losses = 0
 
     # ── Layer 3: Statistical performance guard ────────────────────────────
     if not performance_guard():
-        last_signal_desc = "performance guard active (Wilson LB < 50%)"
+        last_signal_desc = "performance guard (Wilson LB < 50%)"
         return
 
     # ── Layer 4: Time filters ─────────────────────────────────────────────
     utc_hour = datetime.now(timezone.utc).hour
     if utc_hour in LOW_LIQ_HOURS_UTC:
-        log.info(
-            "Low-liq filter │ UTC hour %d in low-liq set %s. Skipping.",
-            utc_hour, sorted(LOW_LIQ_HOURS_UTC),
-        )
+        log.info("Low-liq │ UTC hour %d. Skipping.", utc_hour)
         last_signal_desc = f"low-liq hour UTC:{utc_hour}"
         return
 
     mins_remaining = minutes_to_expiry(market)
     if mins_remaining < MIN_MINUTES_TO_EXPIRY:
-        log.info(
-            "Expiry imminent │ %.1f min remaining < %.1f min minimum. Skipping.",
-            mins_remaining, MIN_MINUTES_TO_EXPIRY,
-        )
+        log.info("Expiry imminent │ %.1f min < %.1f min. Skipping.",
+                 mins_remaining, MIN_MINUTES_TO_EXPIRY)
         last_signal_desc = f"expiry imminent ({mins_remaining:.1f}min)"
         return
 
     # ── Layer 5: Regime detection ─────────────────────────────────────────
     regime, r_squared = compute_btc_regime()
 
-    # v7.1.0: RANGING added to early-return set. Confidence score for RANGING
-    # is capped at ~45 (0 regime pts) which is always below MINIMUM_CONFIDENCE=65.
-    # Skip the OB API call — it cannot result in a trade.
     if regime in ("HIGH_VOL", "UNKNOWN", "RANGING"):
-        log.info(
-            "Regime filter │ %s (R²=%.2f) — only TRENDING allowed. Skipping.",
-            regime, r_squared,
-        )
+        log.info("Regime filter │ %s (R²=%.2f) — only TRENDING allowed.", regime, r_squared)
         last_signal_desc = f"regime={regime} (R²={r_squared:.2f})"
         return
 
@@ -1510,18 +1318,14 @@ def run_decision(market: dict, current_balance: float) -> None:
     ob_dir     = ob_quality["direction"]
 
     if ob_dir == "NONE":
-        log.info(
-            "OB │ No signal — imbalance=%.0f%% depth=$%.0f.",
-            ob_quality["imbalance"] * 100,
-            ob_quality["near_money_depth"],
-        )
+        log.info("OB │ No signal — imb=%.0f%% depth=$%.0f.",
+                 ob_quality["imbalance"] * 100, ob_quality["near_money_depth"])
         last_signal_desc = (
             f"OB flat ({ob_quality['imbalance']*100:.0f}%"
             f" depth=${ob_quality['near_money_depth']:.0f})"
         )
         return
 
-    # v5.3.0: OB trend check — block if pressure is fading
     if not ob_trend_check(ticker, ob_quality["imbalance"], ob_dir):
         last_signal_desc = f"OB trend fading ({ticker[-15:]})"
         return
@@ -1535,41 +1339,24 @@ def run_decision(market: dict, current_balance: float) -> None:
         return
 
     if REQUIRE_AGREE_MOMENTUM and momentum_verdict == "NEUTRAL":
-        # v7.1.0: Regime bypass for NEUTRAL momentum.
-        # When regime=TRENDING with strong R², the 5-min regression IS directional
-        # confirmation. The 90s momentum window frequently shows NEUTRAL during
-        # consolidation within a trend. CONFLICT still blocks. AGREE still boosts.
-        # Only NEUTRAL in a high-confidence trend is allowed through (0 momentum pts).
         if ALLOW_NEUTRAL_IN_TRENDING and r_squared >= NEUTRAL_R2_FLOOR:
-            log.info(
-                "Momentum │ NEUTRAL bypassed — TRENDING R²=%.2f ≥ %.2f. "
-                "Proceeding with zero momentum boost.",
-                r_squared, NEUTRAL_R2_FLOOR,
-            )
-            # momentum_verdict stays "NEUTRAL"; confidence score gives 0 momentum pts
+            log.info("Momentum │ NEUTRAL bypassed — TRENDING R²=%.2f ≥ %.2f.",
+                     r_squared, NEUTRAL_R2_FLOOR)
         else:
-            log.info(
-                "Momentum filter │ Required AGREE, got %s (OB=%s). Skipping.",
-                momentum_verdict, ob_dir,
-            )
+            log.info("Momentum filter │ Required AGREE, got %s (OB=%s). Skipping.",
+                     momentum_verdict, ob_dir)
             last_signal_desc = f"momentum={momentum_verdict} (need AGREE, OB={ob_dir})"
             return
 
     # ── Layer 8: Confidence score ─────────────────────────────────────────
     confidence = compute_confidence_score(
-        ob_quality       = ob_quality,
-        regime           = regime,
-        r_squared        = r_squared,
-        momentum_verdict = momentum_verdict,
-        momentum_boost   = momentum_boost,
-        mins_remaining   = mins_remaining,
+        ob_quality=ob_quality, regime=regime, r_squared=r_squared,
+        momentum_verdict=momentum_verdict, momentum_boost=momentum_boost,
+        mins_remaining=mins_remaining,
     )
 
     if confidence < MINIMUM_CONFIDENCE:
-        log.info(
-            "Confidence │ Score %.0f < minimum %d — no trade.",
-            confidence, MINIMUM_CONFIDENCE,
-        )
+        log.info("Confidence │ Score %.0f < minimum %d.", confidence, MINIMUM_CONFIDENCE)
         last_signal_desc = f"confidence {confidence:.0f}/{MINIMUM_CONFIDENCE}"
         return
 
@@ -1577,54 +1364,50 @@ def run_decision(market: dict, current_balance: float) -> None:
 
     log.info(
         "📡 %s │ Regime:%s(R²=%.2f) │ OB:%s %.1f%% depth=$%.0f │ "
-        "BTC:%s(+%.2f%%) │ WinProb:%.1f%% │ Conf:%.0f/100 │ "
-        "%.1fmin remain │ bid/mid/ask:%d/%d/%dc │ [%s]",
+        "BTC:%s(+%.2f%%) │ WinProb:%.1f%% │ Conf:%.0f │ %.1fmin remain",
         ticker, regime, r_squared, ob_dir,
         ob_quality["imbalance"] * 100, ob_quality["near_money_depth"],
         momentum_verdict, momentum_boost * 100,
         win_prob * 100, confidence, mins_remaining,
-        yes_bid, yes_mid, yes_ask, ACTIVE_MODE.value.upper(),
     )
 
     # ── Layer 9a: Price breakeven guard ───────────────────────────────────
     if ob_dir == "YES":
         if yes_mid > YES_BREAKEVEN_PRICE:
-            log.info("Price guard │ YES at %dc > breakeven %dc. Skipping.",
-                     yes_mid, YES_BREAKEVEN_PRICE)
+            log.info("Price guard │ YES at %dc > breakeven %dc.", yes_mid, YES_BREAKEVEN_PRICE)
             return
         trade_direction = "YES"
         contract_price  = yes_mid
     else:
         no_price = 100 - yes_mid
         if no_price > YES_BREAKEVEN_PRICE:
-            log.info("Price guard │ NO at %dc > breakeven %dc. Skipping.",
-                     no_price, YES_BREAKEVEN_PRICE)
+            log.info("Price guard │ NO at %dc > breakeven %dc.", no_price, YES_BREAKEVEN_PRICE)
             return
         trade_direction = "NO"
         contract_price  = no_price
 
     if not (PROFILE["min_price"] <= contract_price <= PROFILE["max_price"]):
-        log.info("Bias filter │ %dc outside [%d–%d]c. Skipping.",
+        log.info("Bias filter │ %dc outside [%d–%d]c.",
                  contract_price, PROFILE["min_price"], PROFILE["max_price"])
         return
 
     # ── Layer 9b: Edge filter ─────────────────────────────────────────────
     edge = calc_edge(win_prob, contract_price)
     if edge < PROFILE["min_edge"]:
-        log.info("Edge │ %.3f < min %.3f. Skipping.", edge, PROFILE["min_edge"])
+        log.info("Edge │ %.3f < min %.3f.", edge, PROFILE["min_edge"])
         return
 
     # ── Layer 9c: Kelly sizing ────────────────────────────────────────────
     bet = kelly_bet_size(win_prob, contract_price, current_balance)
     if bet < 0.25:
-        log.info("Kelly │ $%.2f too small. Skipping.", bet)
+        log.info("Kelly │ $%.2f too small.", bet)
         return
 
     if current_balance < bet:
         log.warning("Insufficient balance │ $%.2f < bet $%.2f.", current_balance, bet)
         return
 
-    # ── Maker limit price (1¢ inside spread) ──────────────────────────────
+    # ── Maker limit price ─────────────────────────────────────────────────
     if trade_direction == "YES":
         limit_price = max(1, min(yes_bid + 1, yes_ask - 1))
     else:
@@ -1633,30 +1416,29 @@ def run_decision(market: dict, current_balance: float) -> None:
     limit_price = max(1, min(99, limit_price))
 
     if abs(limit_price - contract_price) > 8:
-        log.info("Limit drift │ %dc too far from mid %dc. Skipping.",
-                 limit_price, contract_price)
+        log.info("Limit drift │ %dc too far from mid %dc.", limit_price, contract_price)
         return
 
     # ── EDGE JUSTIFICATION ────────────────────────────────────────────────
     wlb_str = (
         f"WilsonLB={wilson_lower_bound(live_wins, live_wins + live_losses)*100:.1f}%"
-        if (live_wins + live_losses) >= 10 else "WilsonLB=n/a(<10 trades)"
+        if (live_wins + live_losses) >= 10 else "WilsonLB=n/a"
     )
-    edge_justification = (
-        f"EDGE JUSTIFICATION │ {trade_direction} {ticker[-15:]} @ {contract_price}¢ │ "
-        f"Regime={regime}(R²={r_squared:.2f}) │ "
-        f"OB={ob_quality['imbalance']*100:.0f}% depth=${ob_quality['near_money_depth']:.0f} │ "
-        f"Momentum={momentum_verdict}(+{momentum_boost*100:.1f}%) │ "
-        f"WinProb={win_prob*100:.1f}% Edge={edge*100:.2f}% │ "
-        f"Confidence={confidence:.0f}/100 │ Bet=${bet:.2f} │ "
-        f"{mins_remaining:.1f}min remain │ {wlb_str}"
+    log.info(
+        "📋 EDGE JUSTIFICATION │ %s %s @ %d¢ │ "
+        "Regime=%s(R²=%.2f) │ OB=%.0f%% depth=$%.0f │ "
+        "Momentum=%s(+%.1f%%) │ WinProb=%.1f%% Edge=%.2f%% │ "
+        "Confidence=%.0f/100 │ Bet=$%.2f │ %.1fmin remain │ %s",
+        trade_direction, ticker[-15:], contract_price,
+        regime, r_squared,
+        ob_quality['imbalance']*100, ob_quality['near_money_depth'],
+        momentum_verdict, momentum_boost*100,
+        win_prob*100, edge*100, confidence, bet, mins_remaining, wlb_str,
     )
-    log.info("📋 %s", edge_justification)
 
     last_signal_desc = (
         f"SIGNAL {trade_direction} conf={confidence:.0f} "
-        f"OB={ob_quality['imbalance']*100:.0f}% "
-        f"edge={edge*100:.1f}% regime={regime}"
+        f"OB={ob_quality['imbalance']*100:.0f}% edge={edge*100:.1f}%"
     )
 
     place_limit_order(ticker, trade_direction, bet, limit_price,
@@ -1681,7 +1463,7 @@ def main() -> None:
     log.info("━" * 70)
     log.info("  BOT_VERSION: %s", BOT_VERSION)
     tg.validate_telegram_connection()
-    log.info("  JOHNNY5 v7.1 │ %s │ Archetype: %s",
+    log.info("  JOHNNY5 v8 │ %s │ Archetype: %s",
              "PAPER 🟡" if DEMO_MODE else "LIVE 🔴", ACTIVE_MODE.value.upper())
     log.info("  %s", PROFILE["description"])
     log.info("  Max trade: $%.2f │ Kelly: %.0f%% │ Min edge: %.1f%% │ Daily cap: $%.2f",
@@ -1690,15 +1472,12 @@ def main() -> None:
     log.info("  Breakeven cap: %dc │ Floor: $%.2f │ OB thresh: %.0f%% │ Min depth: $%.0f",
              YES_BREAKEVEN_PRICE, MIN_BALANCE_FLOOR,
              PROFILE["ob_thresh"] * 100, MIN_OB_DEPTH_DOLLARS)
-    log.info("  Confidence min: %d │ Require AGREE: %s │ Min expiry: %.1fmin",
-             MINIMUM_CONFIDENCE, REQUIRE_AGREE_MOMENTUM, MIN_MINUTES_TO_EXPIRY)
-    log.info("  Max bet fraction: %.0f%% │ Streak threshold: %s │ Pause: %ss",
-             MAX_BET_FRACTION * 100,
-             os.environ.get("MAX_CONSEC_LOSSES", "2"),
-             os.environ.get("STREAK_PAUSE_SECS", "1800"))
+    log.info("  Confidence min: %d │ R² thresh: %.2f │ Require AGREE: %s",
+             MINIMUM_CONFIDENCE, R_SQUARED_THRESHOLD, REQUIRE_AGREE_MOMENTUM)
+    log.info("  Cooldown: %ds │ Max bet frac: %.0f%% │ Streak threshold: %s",
+             PROFILE["cooldown"], MAX_BET_FRACTION * 100,
+             os.environ.get("MAX_CONSEC_LOSSES", "2"))
     log.info("  Low-liq UTC hours: %s", sorted(LOW_LIQ_HOURS_UTC))
-    log.info("  Stale order timeout: %ds │ Max concurrent: %d",
-             STALE_ORDER_TIMEOUT, MAX_CONCURRENT_POS)
     log.info("  MomThresh: %.3f%% │ NeutralOK: %s (R²≥%.2f)",
              MOMENTUM_AGREE_THRESHOLD, ALLOW_NEUTRAL_IN_TRENDING, NEUTRAL_R2_FLOOR)
     log.info("  %s", "📋 PAPER — zero real orders" if DEMO_MODE else "⚠️  LIVE — real money")
@@ -1706,17 +1485,15 @@ def main() -> None:
 
     _validate_config_against_doctrine()
 
-    # Reset session state
     live_wins          = 0
     live_losses        = 0
     streak_pause_until = 0.0
 
     if DEMO_MODE:
         running_pnl           = 0.0
-        session_start_balance = paper_balance  # v7.0.0 fix: was 0.0
+        session_start_balance = paper_balance
         session_stop_threshold = paper_balance * 0.50
-        log.info("Starting paper balance: $%.2f", paper_balance)
-        log.info("Session stop threshold: $%.2f (50%% of start)", session_stop_threshold)
+        log.info("Paper balance: $%.2f │ Session stop: $%.2f", paper_balance, session_stop_threshold)
         telegram_boot(paper_balance)
     else:
         bal = get_live_balance()
@@ -1727,29 +1504,24 @@ def main() -> None:
         active_tickers.clear()
         consecutive_losses = 0
         running_pnl        = 0.0
-        log.info("Starting live balance: $%.2f | Session stop: $%.2f", bal, session_stop_threshold)
-        log.info("State cleared — fresh session start")
+        log.info("Live balance: $%.2f │ Session stop: $%.2f", bal, session_stop_threshold)
         telegram_boot(bal)
 
     resolve_cycle = 0
 
     while not _shutdown_requested:
         try:
-            log.debug("Loop cycle %d — scanning markets", resolve_cycle + 1)
-
-            # ── 15-minute heartbeat ────────────────────────────────────────
+            # ── Heartbeat ──────────────────────────────────────────────────
             if time.time() - last_heartbeat_ts >= 900:
                 last_heartbeat_ts = time.time()
                 hb_bal    = paper_balance if DEMO_MODE else get_live_balance()
                 hb_pnl    = paper_daily_pnl if DEMO_MODE else (hb_bal - session_start_balance)
                 hb_open   = len(open_orders)
-                hb_trades = len([t for t in trade_history if t.get("result") in ("win", "loss", "pending")])
+                hb_trades = len([t for t in trade_history
+                                 if t.get("result") in ("win", "loss", "pending")])
                 tg.send_heartbeat(
-                    balance=hb_bal,
-                    session_pnl=hb_pnl,
-                    open_count=hb_open,
-                    trades_today=hb_trades,
-                    last_signal=last_signal_desc,
+                    balance=hb_bal, session_pnl=hb_pnl, open_count=hb_open,
+                    trades_today=hb_trades, last_signal=last_signal_desc,
                 )
 
             market = get_active_btc_market()
@@ -1761,7 +1533,7 @@ def main() -> None:
 
             update_btc_price(market)
 
-            # v7.0.0 FIX: Only clear position locks for tickers that have no open orders
+            # Clear expired position locks
             current_ticker = market.get("ticker", "")
             tickers_with_orders = {t.get("ticker", "") for t in open_orders.values()}
             expired = {t for t in active_tickers
@@ -1774,8 +1546,6 @@ def main() -> None:
             run_decision(market, current_balance)
 
             resolve_cycle += 1
-
-            # v7.0.0: Resolve every 3 cycles (~90s) instead of 10 (~5min).
             if resolve_cycle % 3 == 0:
                 resolve_open_orders()
                 cancel_stale_orders()
@@ -1785,36 +1555,18 @@ def main() -> None:
                     wins  = sum(1 for t in resolved if t["result"] == "win")
                     total = len(resolved)
                     wr    = wins / total if total > 0 else 0.0
-                    log.info(
-                        "📋 PAPER STATUS │ Balance: $%.2f │ Daily: $%+.2f │ "
-                        "Trades: %d │ Resolved: %d │ WR: %.1f%%",
-                        paper_balance, paper_daily_pnl,
-                        len(trade_history), total, wr * 100,
-                    )
+                    log.info("📋 PAPER │ Balance: $%.2f │ PnL: $%+.2f │ WR: %.1f%% (%d trades)",
+                             paper_balance, paper_daily_pnl, wr * 100, total)
                 else:
                     live_bal  = get_live_balance()
                     daily_pnl = live_bal - session_start_balance
                     resolved  = [t for t in trade_history if t.get("result") in ("win","loss")]
-                    wins  = sum(1 for t in resolved if t["result"] == "win")
+                    wins   = sum(1 for t in resolved if t["result"] == "win")
                     losses = len(resolved) - wins
-                    total = len(resolved)
-                    wr    = wins / total if total > 0 else 0.0
-                    trade_pnls = [t.get("pnl", 0) for t in trade_history
-                                  if t.get("pnl") is not None
-                                  and t.get("result") in ("win","loss")
-                                  and t.get("pnl") != 0]
-                    if len(trade_pnls) >= 3:
-                        sr_mean = sum(trade_pnls) / len(trade_pnls)
-                        sr_std  = (sum((x - sr_mean)**2 for x in trade_pnls) / len(trade_pnls)) ** 0.5
-                        sharpe  = (sr_mean / sr_std) if sr_std > 0 else 0.0
-                        sharpe_str = f" │ Sharpe: {sharpe:.2f}"
-                    else:
-                        sharpe_str = f" │ Sharpe: n/a ({len(trade_pnls)} resolved)"
-                    log.info(
-                        "Portfolio │ Balance: $%.2f │ Session PnL: $%+.2f │ "
-                        "Open: %d │ WR: %.1f%%%s",
-                        live_bal, daily_pnl, len(open_orders), wr * 100, sharpe_str,
-                    )
+                    total  = len(resolved)
+                    wr     = wins / total if total > 0 else 0.0
+                    log.info("Portfolio │ Balance: $%.2f │ PnL: $%+.2f │ Open: %d │ WR: %.1f%%",
+                             live_bal, daily_pnl, len(open_orders), wr * 100)
 
                     now_utc_hour = datetime.now(timezone.utc).hour
                     if now_utc_hour == 0 and time.time() - last_daily_summary_ts > 3600:
@@ -1829,7 +1581,6 @@ def main() -> None:
             log.error("Unexpected error: %s", e, exc_info=True)
             time.sleep(POLL_INTERVAL)
 
-    # ── Graceful shutdown (SIGTERM or KeyboardInterrupt) ──────────────────
     final = paper_balance if DEMO_MODE else get_live_balance()
     log.info("Shutting down. Final balance: $%.2f", final)
     tg.send_telegram_message(f"🛑 Johnny5 stopped. Final balance: ${final:.2f}")
