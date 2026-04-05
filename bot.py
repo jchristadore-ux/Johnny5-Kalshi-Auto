@@ -1,6 +1,6 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  JOHNNY5-KALSHI-AUTO  v7.0.0  —  Production Build                          ║
+║  JOHNNY5-KALSHI-AUTO  v7.1.0  —  Production Build                          ║
 ║  "No disassemble."                                                           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  STRATEGY — Regime-aware quantitative trading                               ║
@@ -12,6 +12,18 @@
 ║  Signal 3 │ Price breakeven guard (only buy contracts ≤67c)                 ║
 ║  Signal 4 │ Favourite-longshot bias filter (35-65c contract range)          ║
 ║  Regime   │ Only trade when BTC is TRENDING (R² > 0.65 on 5min window)     ║
+║                                                                              ║
+║  v7.1.0 CHANGES (from v7.0.0):                                             ║
+║  • MOMENTUM_AGREE_THRESHOLD env var — configurable agree threshold          ║
+║    (was hardcoded 0.20%; default now 0.15% to reflect 90s lookback         ║
+║     window reality vs. stated "2 min")                                      ║
+║  • ALLOW_NEUTRAL_IN_TRENDING env var — when true, NEUTRAL momentum          ║
+║    is permitted if regime=TRENDING with R²≥NEUTRAL_R2_FLOOR (0.70).        ║
+║    Regime detection is itself directional confirmation; requiring both       ║
+║    independently over overlapping windows double-penalizes consolidation.   ║
+║  • RANGING regime early-return — skips OB API call when RANGING;           ║
+║    confidence would fail anyway (0 regime pts → max 45 < 65 min).          ║
+║  • Lookback fix: btc_momentum_signal comment corrected to 90s (was 2min)   ║
 ║                                                                              ║
 ║  v7.0.0 CHANGES (from v6.0.1):                                             ║
 ║  • SIGTERM handler for clean Railway deploys                                ║
@@ -40,7 +52,7 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "7.0.0"  # bump with every deploy
+BOT_VERSION = "7.1.0"  # bump with every deploy
 
 import base64
 import logging
@@ -193,6 +205,22 @@ LOW_LIQ_END_UTC   = int(os.environ.get("LOW_LIQ_END_UTC", "5"))
 MAX_CONCURRENT_POS = int(os.environ.get("MAX_CONCURRENT_POS", "2"))
 STALE_ORDER_TIMEOUT = int(os.environ.get("STALE_ORDER_TIMEOUT", "300"))
 
+# ── v7.1.0: Momentum tuning parameters ───────────────────────────────────────
+# MOMENTUM_AGREE_THRESHOLD: minimum absolute BTC % move (over ~90s lookback)
+# to qualify as AGREE or CONFLICT. Was hardcoded 0.20 in v7.0.0.
+# Lowering to 0.15 corrects for the 90s window (not 2min as the comment stated).
+# At $80k BTC, 0.15% = $120 move in 90s — still a meaningful directional signal.
+MOMENTUM_AGREE_THRESHOLD = float(os.environ.get("MOMENTUM_AGREE_THRESHOLD", "0.15"))
+
+# ALLOW_NEUTRAL_IN_TRENDING: when true, NEUTRAL momentum is accepted (with zero
+# confidence boost) if regime=TRENDING and R² >= NEUTRAL_R2_FLOOR.
+# Rationale: when BTC is strongly trending, the regime signal IS directional
+# confirmation. The OB is already positioned; requiring independent 90s momentum
+# AGREE double-penalizes consolidation within trends. On high-conviction
+# directional days (crash/rally), NEUTRAL blocks every setup.
+ALLOW_NEUTRAL_IN_TRENDING = os.environ.get("ALLOW_NEUTRAL_IN_TRENDING", "false").lower() == "true"
+NEUTRAL_R2_FLOOR = float(os.environ.get("NEUTRAL_R2_FLOOR", "0.70"))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # v7.0.0: STARTUP CONFIG DRIFT VALIDATION
@@ -237,6 +265,21 @@ def _validate_config_against_doctrine() -> None:
             PROFILE["ob_thresh"],
         )
         drift_found = True
+
+    # v7.1.0: log non-default momentum settings
+    if MOMENTUM_AGREE_THRESHOLD != 0.15:
+        log.warning(
+            "CONFIG DRIFT │ MOMENTUM_AGREE_THRESHOLD=%.3f (v7.1.0 default: 0.15).",
+            MOMENTUM_AGREE_THRESHOLD,
+        )
+        drift_found = True
+
+    if ALLOW_NEUTRAL_IN_TRENDING:
+        log.info(
+            "CONFIG NOTE │ ALLOW_NEUTRAL_IN_TRENDING=true — "
+            "NEUTRAL momentum accepted when TRENDING R²≥%.2f.",
+            NEUTRAL_R2_FLOOR,
+        )
 
     if not drift_found:
         log.info("Config validation │ All values match doctrine. ✅")
@@ -400,7 +443,9 @@ def telegram_boot(balance: float) -> None:
         f"Balance: ${balance:.2f} | Max bet: ${TRADE_SIZE_DOLLARS:.2f}\n"
         f"Daily loss cap: ${MAX_DAILY_LOSS:.2f} | Floor: ${MIN_BALANCE_FLOOR:.2f}\n"
         f"Confidence: {MINIMUM_CONFIDENCE} | OB depth: ${MIN_OB_DEPTH_DOLLARS:.0f} | "
-        f"Regime: TRENDING only"
+        f"Regime: TRENDING only\n"
+        f"MomThresh: {MOMENTUM_AGREE_THRESHOLD:.2f}% | "
+        f"NeutralOK: {ALLOW_NEUTRAL_IN_TRENDING}(R²≥{NEUTRAL_R2_FLOOR})"
     )
 
 
@@ -469,16 +514,21 @@ def btc_momentum_signal(ob_direction: str) -> tuple[str, float]:
     """
     Compare OB signal direction to recent BTC price momentum.
 
+    Lookback: prices[-4] to prices[-1] = 3 poll intervals = ~90 seconds
+    at POLL_INTERVAL_SECS=30. (v7.1.0 fix: was documented as "2 min" but
+    is actually 90s. MOMENTUM_AGREE_THRESHOLD default lowered to 0.15%
+    to reflect this correctly.)
+
     Returns (verdict, confidence_boost):
       verdict = "AGREE" | "CONFLICT" | "NEUTRAL"
-      confidence_boost = amount to add/subtract from win_prob
+      confidence_boost = amount to add to win_prob (only on AGREE)
     """
     if len(btc_prices) < 4:
         return "NEUTRAL", 0.0
 
     prices = list(btc_prices)
-    recent = prices[-1]
-    earlier = prices[-4]  # ~2 minutes ago at 30s poll
+    recent  = prices[-1]
+    earlier = prices[-4]  # ~90 seconds ago at 30s poll
 
     if earlier <= 0:
         return "NEUTRAL", 0.0
@@ -488,7 +538,7 @@ def btc_momentum_signal(ob_direction: str) -> tuple[str, float]:
     btc_direction = "yes" if move_pct > 0 else "no" if move_pct < 0 else "flat"
     ob_dir_lower  = ob_direction.lower()
 
-    if abs(move_pct) < 0.20:
+    if abs(move_pct) < MOMENTUM_AGREE_THRESHOLD:
         return "NEUTRAL", 0.0
 
     if btc_direction == ob_dir_lower:
@@ -590,7 +640,8 @@ def compute_confidence_score(
       OB near-money depth    20 pts   — $50=10pts, $200=20pts (capped)
       Market regime          25 pts   — TRENDING=25, UNKNOWN=5, RANGING=0, HIGH_VOL=-10
         + trend strength      5 pts   — bonus for high R² in TRENDING
-      BTC momentum           15 pts   — only counts if AGREE; scales with boost magnitude
+      BTC momentum           15 pts   — AGREE scales with boost magnitude;
+                                        NEUTRAL_OK (regime bypass) scores 0 momentum pts
       Time remaining         10 pts   — full credit at ≥10 min, zero at MIN_MINUTES_TO_EXPIRY
     """
     imbalance = ob_quality.get("imbalance", 0.5)
@@ -613,10 +664,11 @@ def compute_confidence_score(
     if regime == "TRENDING":
         regime_pts += min(5.0, r_squared * 5.0)
 
-    # Momentum: 0-15 pts (only AGREE contributes)
+    # Momentum: 0-15 pts (AGREE contributes; NEUTRAL_OK gets 0 pts but doesn't block)
     momentum_pts = 0.0
     if momentum_verdict == "AGREE":
         momentum_pts = min(15.0, momentum_boost * 250.0)
+    # "NEUTRAL_OK" (regime bypass): 0 pts — regime already scored the directionality
 
     # Time: 0-10 pts
     time_pts = min(10.0, max(0.0,
@@ -1370,7 +1422,7 @@ def place_limit_order(ticker: str, direction: str, size_dollars: float,
 
 def run_decision(market: dict, current_balance: float) -> None:
     """
-    v7.0.0 — Layered decision engine. All 9 layers must pass.
+    v7.1.0 — Layered decision engine. All 9 layers must pass.
     """
     global consecutive_losses, last_signal_desc, streak_pause_until
 
@@ -1440,7 +1492,11 @@ def run_decision(market: dict, current_balance: float) -> None:
 
     # ── Layer 5: Regime detection ─────────────────────────────────────────
     regime, r_squared = compute_btc_regime()
-    if regime in ("HIGH_VOL", "UNKNOWN"):
+
+    # v7.1.0: RANGING added to early-return set. Confidence score for RANGING
+    # is capped at ~45 (0 regime pts) which is always below MINIMUM_CONFIDENCE=65.
+    # Skip the OB API call — it cannot result in a trade.
+    if regime in ("HIGH_VOL", "UNKNOWN", "RANGING"):
         log.info(
             "Regime filter │ %s (R²=%.2f) — only TRENDING allowed. Skipping.",
             regime, r_squared,
@@ -1470,21 +1526,34 @@ def run_decision(market: dict, current_balance: float) -> None:
         last_signal_desc = f"OB trend fading ({ticker[-15:]})"
         return
 
-    # ── Layer 7: BTC momentum — AGREE required ────────────────────────────
+    # ── Layer 7: BTC momentum ─────────────────────────────────────────────
     momentum_verdict, momentum_boost = btc_momentum_signal(ob_dir)
-
-    if REQUIRE_AGREE_MOMENTUM and momentum_verdict != "AGREE":
-        log.info(
-            "Momentum filter │ Required AGREE, got %s (OB=%s). Skipping.",
-            momentum_verdict, ob_dir,
-        )
-        last_signal_desc = f"momentum={momentum_verdict} (need AGREE, OB={ob_dir})"
-        return
 
     if momentum_verdict == "CONFLICT":
         log.info("Momentum CONFLICT │ OB=%s vs BTC. Skipping.", ob_dir)
         last_signal_desc = f"CONFLICT: OB={ob_dir} vs BTC"
         return
+
+    if REQUIRE_AGREE_MOMENTUM and momentum_verdict == "NEUTRAL":
+        # v7.1.0: Regime bypass for NEUTRAL momentum.
+        # When regime=TRENDING with strong R², the 5-min regression IS directional
+        # confirmation. The 90s momentum window frequently shows NEUTRAL during
+        # consolidation within a trend. CONFLICT still blocks. AGREE still boosts.
+        # Only NEUTRAL in a high-confidence trend is allowed through (0 momentum pts).
+        if ALLOW_NEUTRAL_IN_TRENDING and r_squared >= NEUTRAL_R2_FLOOR:
+            log.info(
+                "Momentum │ NEUTRAL bypassed — TRENDING R²=%.2f ≥ %.2f. "
+                "Proceeding with zero momentum boost.",
+                r_squared, NEUTRAL_R2_FLOOR,
+            )
+            # momentum_verdict stays "NEUTRAL"; confidence score gives 0 momentum pts
+        else:
+            log.info(
+                "Momentum filter │ Required AGREE, got %s (OB=%s). Skipping.",
+                momentum_verdict, ob_dir,
+            )
+            last_signal_desc = f"momentum={momentum_verdict} (need AGREE, OB={ob_dir})"
+            return
 
     # ── Layer 8: Confidence score ─────────────────────────────────────────
     confidence = compute_confidence_score(
@@ -1612,7 +1681,7 @@ def main() -> None:
     log.info("━" * 70)
     log.info("  BOT_VERSION: %s", BOT_VERSION)
     tg.validate_telegram_connection()
-    log.info("  JOHNNY5 v7.0 │ %s │ Archetype: %s",
+    log.info("  JOHNNY5 v7.1 │ %s │ Archetype: %s",
              "PAPER 🟡" if DEMO_MODE else "LIVE 🔴", ACTIVE_MODE.value.upper())
     log.info("  %s", PROFILE["description"])
     log.info("  Max trade: $%.2f │ Kelly: %.0f%% │ Min edge: %.1f%% │ Daily cap: $%.2f",
@@ -1630,6 +1699,8 @@ def main() -> None:
     log.info("  Low-liq UTC hours: %s", sorted(LOW_LIQ_HOURS_UTC))
     log.info("  Stale order timeout: %ds │ Max concurrent: %d",
              STALE_ORDER_TIMEOUT, MAX_CONCURRENT_POS)
+    log.info("  MomThresh: %.3f%% │ NeutralOK: %s (R²≥%.2f)",
+             MOMENTUM_AGREE_THRESHOLD, ALLOW_NEUTRAL_IN_TRENDING, NEUTRAL_R2_FLOOR)
     log.info("  %s", "📋 PAPER — zero real orders" if DEMO_MODE else "⚠️  LIVE — real money")
     log.info("━" * 70)
 
@@ -1705,7 +1776,6 @@ def main() -> None:
             resolve_cycle += 1
 
             # v7.0.0: Resolve every 3 cycles (~90s) instead of 10 (~5min).
-            # Markets settle every 15 min; faster resolution catches results sooner.
             if resolve_cycle % 3 == 0:
                 resolve_open_orders()
                 cancel_stale_orders()
