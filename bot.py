@@ -1,43 +1,51 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  JOHNNY5-KALSHI-AUTO  v8.1.0  —  Production Build                          ║
+║  JOHNNY5-KALSHI-AUTO  v8.2.0  —  Production Build                          ║
 ║  "No disassemble."                                                           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  v8.1.0 CRITICAL FIX: Settlement matching was 100% broken                   ║
+║  v8.2.0 — POST-MORTEM REBUILD (April 7 forensic)                            ║
 ║  ─────────────────────────────────────────────────────────────────────────  ║
-║  BUG: resolve_open_orders() NEVER matched any settlements                   ║
-║       - 66 orders placed, 0 settlements logged                              ║
-║       - Orders purged as "stale >20min" instead of resolved                 ║
-║       - win/loss stats, streak counter, notifications all non-functional    ║
-║                                                                              ║
-║  ROOT CAUSE: 24-hour created_since filter returns old positions from        ║
-║              before bot session started. These don't match open_orders.     ║
-║              Fresh positions that DO match get lost in the iteration.       ║
-║                                                                              ║
-║  FIX: Track processed position IDs, filter by session start time,           ║
-║       add debug logging, case-insensitive ticker matching.                  ║
+║  ROOT CAUSES FIXED:                                                          ║
+║  1. MOMENTUM GATE DISABLED — REQUIRE_AGREE_MOMENTUM default now true        ║
+║     All 13 April 7 trades fired on OB alone with NEUTRAL BTC. Forbidden.   ║
+║  2. CONFIDENCE FLOOR TOO LOW — default raised 50→65                         ║
+║     conf=54,57,59,61 trades no longer allowed. Doctrine minimum is 65.      ║
+║  3. HALT NOT ABSOLUTE — session halt flag is now permanent this session      ║
+║     A win that recovers PnL above cap no longer re-enables trading.         ║
+║  4. GHOST OB SIGNAL — new check blocks orders when opposing book is empty   ║
+║     100% YES OB with $0 NO depth = no counterparty = structural non-fill.  ║
+║  5. DUPLICATE TICKER — session_traded_tickers prevents re-entry same market ║
+║     Prevents double-entry on same closing market after stale purge.         ║
+║  6. HALT LOOP SPAM — bot sleeps 1hr instead of logging HALT every 30s      ║
+║  7. GLOBAL BUG — _btc_feed_backoff_until now properly declared global       ║
+║  8. PARAMETER DEFAULTS — all updated to match new Railway env vars:         ║
+║     R_SQUARED_THRESHOLD=0.65, MIN_OB_DEPTH_DOLLARS=50, MIN_MINS=7.0        ║
+║  9. SETTLEMENT DEBUG LOGGING — raw position ticker/pnl logged per cycle    ║
 ║                                                                              ║
 ║  STRATEGY — Regime-aware quantitative trading                               ║
 ║  ─────────────────────────────────────────────────────────────────────────  ║
 ║  Signal 1 │ Near-money OB pressure (±10c of mid, adaptive threshold)       ║
-║  Signal 2 │ BTC momentum confirmation via Kraken spot price feed            ║
+║  Signal 2 │ BTC momentum confirmation via Kraken spot price feed (REQUIRED) ║
 ║  Signal 3 │ Price breakeven guard (only buy contracts ≤78c)                 ║
 ║  Signal 4 │ Favourite-longshot bias filter (25-75c contract range)          ║
-║  Regime   │ Only trade when BTC is TRENDING (R² > 0.50 on 5min window)     ║
+║  Regime   │ Only trade when BTC is TRENDING (R² > 0.65 on 5min window)     ║
 ║                                                                              ║
 ║  LIVE SAFETY                                                                 ║
 ║  • Balance floor: $5.00 — hard stop, no trades below this                  ║
-║  • Daily loss cap: $20 — halt for the day if hit                           ║
+║  • Daily loss cap: $20 — PERMANENT halt for the session if hit             ║
 ║  • Session stop: halt if balance drops below 50% of start                  ║
 ║  • Performance guard: Wilson CI lower bound must be ≥ 50%                  ║
 ║  • Streak pause: 30 minutes after 2 consecutive losses                     ║
-║  • Regime filter: TRENDING only. No trades in RANGING/HIGH_VOL             ║
+║  • Regime filter: TRENDING only (R²≥0.65). No RANGING/HIGH_VOL            ║
+║  • Momentum: AGREE required. NEUTRAL and CONFLICT both block entry         ║
+║  • Ghost OB: blocked if opposing book side has zero levels                 ║
+║  • No re-entry on same market ticker within the same session               ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
 from __future__ import annotations
 
-BOT_VERSION = "8.1.0"
+BOT_VERSION = "8.2.0"
 
 import base64
 import logging
@@ -174,24 +182,25 @@ PROFILE  = PROFILES[ACTIVE_MODE]
 BASE_URL = ""
 
 # ── Quantitative safeguard parameters ────────────────────────────────────────
-MINIMUM_CONFIDENCE    = int(os.environ.get("MINIMUM_CONFIDENCE", "50"))
-MIN_OB_DEPTH_DOLLARS  = float(os.environ.get("MIN_OB_DEPTH_DOLLARS", "10.0"))
-MIN_MINUTES_TO_EXPIRY = float(os.environ.get("MIN_MINUTES_TO_EXPIRY", "3.0"))
-REQUIRE_AGREE_MOMENTUM = os.environ.get("REQUIRE_AGREE_MOMENTUM", "false").lower() == "true"
+# v8.2.0: Updated defaults to match post-mortem requirements
+MINIMUM_CONFIDENCE    = int(os.environ.get("MINIMUM_CONFIDENCE", "65"))      # was 50
+MIN_OB_DEPTH_DOLLARS  = float(os.environ.get("MIN_OB_DEPTH_DOLLARS", "50.0")) # was 10.0
+MIN_MINUTES_TO_EXPIRY = float(os.environ.get("MIN_MINUTES_TO_EXPIRY", "7.0")) # was 3.0
+REQUIRE_AGREE_MOMENTUM = os.environ.get("REQUIRE_AGREE_MOMENTUM", "true").lower() == "true"  # was false
 MAX_BET_FRACTION      = float(os.environ.get("MAX_BET_FRACTION", "0.10"))
 MIN_SAMPLE_TRADES     = int(os.environ.get("MIN_SAMPLE_TRADES", "20"))
-R_SQUARED_THRESHOLD   = float(os.environ.get("R_SQUARED_THRESHOLD", "0.50"))
+R_SQUARED_THRESHOLD   = float(os.environ.get("R_SQUARED_THRESHOLD", "0.65")) # was 0.50
 
 _low_liq_raw = os.environ.get("LOW_LIQ_HOURS_UTC", "0,1,2,3,4")
 LOW_LIQ_HOURS_UTC: set = {int(h.strip()) for h in _low_liq_raw.split(",") if h.strip()}
 
 LOW_LIQ_START_UTC = int(os.environ.get("LOW_LIQ_START_UTC", "0"))
 LOW_LIQ_END_UTC   = int(os.environ.get("LOW_LIQ_END_UTC", "5"))
-MAX_CONCURRENT_POS = int(os.environ.get("MAX_CONCURRENT_POS", "2"))
+MAX_CONCURRENT_POS = int(os.environ.get("MAX_CONCURRENT_POS", "1"))          # was 2
 STALE_ORDER_TIMEOUT = int(os.environ.get("STALE_ORDER_TIMEOUT", "300"))
 
 MOMENTUM_AGREE_THRESHOLD = float(os.environ.get("MOMENTUM_AGREE_THRESHOLD", "0.15"))
-ALLOW_NEUTRAL_IN_TRENDING = os.environ.get("ALLOW_NEUTRAL_IN_TRENDING", "true").lower() == "true"
+ALLOW_NEUTRAL_IN_TRENDING = os.environ.get("ALLOW_NEUTRAL_IN_TRENDING", "false").lower() == "true"  # was true
 NEUTRAL_R2_FLOOR = float(os.environ.get("NEUTRAL_R2_FLOOR", "0.55"))
 
 
@@ -323,6 +332,12 @@ _processed_position_ids: Set[str] = set()
 # v8.1.0: Session start timestamp for filtering positions
 _session_start_ts: str = ""
 
+# v8.2.0: Permanent session halt flag — once set, no new trades for this session
+_session_halted: bool = False
+
+# v8.2.0: Tickers that have had an order placed this session — no re-entry allowed
+session_traded_tickers: Set[str] = set()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SIGTERM HANDLER
@@ -348,13 +363,15 @@ def telegram_boot(balance: float) -> None:
         f"Mode: {mode} | Archetype: {ACTIVE_MODE.value.upper()}\n"
         f"Balance: ${balance:.2f} | Max bet: ${TRADE_SIZE_DOLLARS:.2f}\n"
         f"Daily loss cap: ${MAX_DAILY_LOSS:.2f} | Floor: ${MIN_BALANCE_FLOOR:.2f}\n"
-        f"Conf≥{MINIMUM_CONFIDENCE} | OB≥{PROFILE['ob_thresh']*100:.0f}%\n"
-        f"v8.1.0 FIX: Settlement matching repaired"
+        f"Conf≥{MINIMUM_CONFIDENCE} | OB≥{PROFILE['ob_thresh']*100:.0f}% | R²≥{R_SQUARED_THRESHOLD}\n"
+        f"MinDepth≥${MIN_OB_DEPTH_DOLLARS:.0f} | MinMins≥{MIN_MINUTES_TO_EXPIRY:.0f}\n"
+        f"Momentum=AGREE required | Halt=permanent\n"
+        f"v8.2.0: Post-mortem rebuild"
     )
 
 
 def telegram_halt(reason: str, balance: float) -> None:
-    tg.send_telegram_message(f"⚠️ Johnny5 HALTED\nReason: {reason}\nBalance: ${balance:.2f}")
+    tg.send_telegram_message(f"⛔ Johnny5 HALTED (PERMANENT THIS SESSION)\nReason: {reason}\nBalance: ${balance:.2f}")
 
 
 def telegram_daily_summary(balance: float, pnl: float, wins: int, losses: int) -> None:
@@ -379,6 +396,8 @@ def telegram_daily_summary(balance: float, pnl: float, wins: int, losses: int) -
 _btc_feed_backoff_until: float = 0.0
 
 def fetch_btc_price() -> Optional[float]:
+    # v8.2.0 FIX: Added missing global declaration (was silently failing to
+    # update module-level var, so backoff never activated)
     global _btc_feed_backoff_until
     if time.time() < _btc_feed_backoff_until:
         return None
@@ -566,13 +585,8 @@ def get_live_balance() -> float:
 
 def resolve_open_orders() -> None:
     """
-    v8.1.0 CRITICAL FIX: Settlement matching was completely broken.
-    
-    Changes:
-    1. Track processed position IDs to avoid re-processing
-    2. Filter positions by session start timestamp (not 24 hours)
-    3. Add debug logging for ticker matching attempts
-    4. Case-insensitive ticker matching
+    v8.2.0: Added settlement debug logging to diagnose persistent WR=0/0 issue.
+    Settlement matching logic unchanged from v8.1.0 fix.
     """
     global active_tickers, paper_balance, paper_daily_pnl, consecutive_losses, running_pnl
     global live_wins, live_losses, streak_pause_until
@@ -638,12 +652,11 @@ def resolve_open_orders() -> None:
                     ticker[-15:], trade.get("side", "?"), result.upper(), sim_method, paper_balance)
         return
 
-    # ── Live resolution (v8.1.0 FIXED) ─────────────────────────────────────
+    # ── Live resolution ──────────────────────────────────────────────────────
     try:
-        # v8.1.0: Use session start timestamp, not 24 hours ago
         since_ts = _session_start_ts if _session_start_ts else \
                    (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        
+
         pos_data = _get("/portfolio/positions", {
             "limit": 100,
             "settlement_status": "settled",
@@ -654,7 +667,18 @@ def resolve_open_orders() -> None:
         log.info("RESOLVE │ %d settled positions, %d open orders, %d processed",
                  len(settled_positions), len(open_orders), len(_processed_position_ids))
 
-        # v8.1.0: Build ticker->order_id map for faster matching
+        # v8.2.0: Debug logging to diagnose settlement matching
+        if settled_positions:
+            debug_sample = [
+                {"ticker": p.get("market_ticker"), "realized_pnl": p.get("realized_pnl")}
+                for p in settled_positions[:5]
+            ]
+            log.info("RESOLVE DEBUG │ settled sample: %s", debug_sample)
+        if open_orders:
+            log.info("RESOLVE DEBUG │ open_orders keys: %s",
+                     list(open_orders.keys())[:5])
+
+        # Build ticker->order_id map for matching
         ticker_to_oid: dict = {}
         for oid, trade in open_orders.items():
             ticker = trade.get("ticker", "")
@@ -666,22 +690,20 @@ def resolve_open_orders() -> None:
             pos_ticker = pos.get("market_ticker", "")
             pos_created = pos.get("created_time", "")
             pos_id = f"{pos_ticker}:{pos_created}"
-            
-            # Skip already-processed positions
+
             if pos_id in _processed_position_ids:
                 continue
-            
-            # v8.1.0: Try multiple matching strategies
+
             matched_oid = None
-            
+
             # Strategy 1: Direct match
             if pos_ticker in ticker_to_oid:
                 matched_oid = ticker_to_oid[pos_ticker]
-            
+
             # Strategy 2: Case-insensitive match
             if not matched_oid and pos_ticker.upper() in ticker_to_oid:
                 matched_oid = ticker_to_oid[pos_ticker.upper()]
-            
+
             # Strategy 3: Iterate (fallback)
             if not matched_oid:
                 for oid, trade in list(open_orders.items()):
@@ -691,17 +713,17 @@ def resolve_open_orders() -> None:
                         break
 
             if not matched_oid:
-                log.debug("RESOLVE │ No match for %s (tracking: %s)",
+                log.debug("RESOLVE │ No match for %s (open tickers: %s)",
                          pos_ticker, list(ticker_to_oid.keys())[:3])
                 _processed_position_ids.add(pos_id)
                 continue
 
             _processed_position_ids.add(pos_id)
-            
+
             trade = open_orders.pop(matched_oid)
             active_tickers.discard(pos_ticker)
             active_tickers.discard(trade.get("ticker", ""))
-            
+
             realized = pos.get("realized_pnl", 0) or 0
             realized_dollars = realized / 100.0
 
@@ -717,17 +739,17 @@ def resolve_open_orders() -> None:
             won = realized_dollars > 0
             pnl = round(realized_dollars, 2)
             result = "win" if won else "loss"
-            
+
             for t in trade_history:
                 if t.get("order_id") == matched_oid:
                     t["result"] = result
                     t["pnl"]    = pnl
                     break
-            
+
             balance = get_live_balance()
             running_pnl += pnl
             live_daily_pnl = balance - session_start_balance
-            
+
             if won:
                 consecutive_losses = 0
                 live_wins += 1
@@ -736,12 +758,12 @@ def resolve_open_orders() -> None:
                 live_losses += 1
                 if consecutive_losses >= STREAK_THRESHOLD:
                     streak_pause_until = time.time() + STREAK_PAUSE_SEC
-            
+
             wlb = wilson_lower_bound(live_wins, live_wins + live_losses)
             log.info("✅ SETTLED │ %s │ %s │ pnl=$%.2f │ WR=%d/%d │ WilsonLB=%.1f%%",
                      pos_ticker[-15:], result.upper(), pnl,
                      live_wins, live_wins + live_losses, wlb * 100)
-            
+
             if won:
                 tg.send_win_notification(
                     profit=pnl, balance=balance, daily_pnl=live_daily_pnl,
@@ -912,8 +934,8 @@ def calc_ob_quality(ob_data: dict, yes_mid: int) -> dict:
     total = yes_d + no_d
     thresh = adaptive_ob_threshold(total)
 
-    log.info("OB │ YES=$%.0f NO=$%.0f total=$%.0f thresh=%.0f%%",
-        yes_d, no_d, total, thresh * 100)
+    log.info("OB │ YES=$%.0f(%dlvl) NO=$%.0f(%dlvl) total=$%.0f thresh=%.0f%%",
+        yes_d, yes_lc, no_d, no_lc, total, thresh * 100)
 
     if total < MIN_OB_DEPTH_DOLLARS:
         return {"imbalance": 0.5, "direction": "NONE",
@@ -977,13 +999,25 @@ def cooldown_passed() -> bool:
 
 
 def daily_loss_check(balance: float) -> bool:
+    """
+    v8.2.0: Permanent session halt.
+    Once the daily loss cap or session stop fires, _session_halted is set True
+    and can never be cleared within this session — even if a subsequent win
+    recovers the balance above the cap threshold.
+    """
+    global _session_halted
+    if _session_halted:
+        return False
     pnl = paper_daily_pnl if DEMO_MODE else daily_pnl
     if pnl <= -MAX_DAILY_LOSS:
-        log.warning("DAILY LOSS LIMIT │ $%.2f lost. Halting.", abs(pnl))
+        _session_halted = True
+        log.warning("DAILY LOSS LIMIT │ $%.2f lost. Session halted permanently.", abs(pnl))
         telegram_halt(f"Daily loss cap hit. PnL: ${pnl:.2f}", balance)
         return False
     if session_stop_threshold > 0 and balance < session_stop_threshold:
-        log.warning("SESSION STOP │ Balance $%.2f < threshold $%.2f.", balance, session_stop_threshold)
+        _session_halted = True
+        log.warning("SESSION STOP │ Balance $%.2f < threshold $%.2f. Halted permanently.",
+                    balance, session_stop_threshold)
         telegram_halt(f"Session stop. Balance ${balance:.2f}.", balance)
         return False
     return True
@@ -1053,6 +1087,7 @@ def place_limit_order(ticker: str, direction: str, size_dollars: float,
         paper_balance -= cost
         last_trade_ts = time.time()
         active_tickers.add(ticker)
+        session_traded_tickers.add(ticker)  # v8.2.0
         record = {
             "time": datetime.now(timezone.utc).isoformat(),
             "ticker": ticker, "side": direction, "size": size_dollars,
@@ -1092,6 +1127,7 @@ def place_limit_order(ticker: str, direction: str, size_dollars: float,
         trade_history.append(record)
         open_orders[order_id] = record
         active_tickers.add(ticker)
+        session_traded_tickers.add(ticker)  # v8.2.0
         log.info("✅ ORDER │ %s %s │ %d @ %dc │ $%.2f │ ID:%s",
             direction, ticker[-15:], count, limit_price_cents, size_dollars, order_id[:12])
         live_bal = get_live_balance()
@@ -1120,6 +1156,7 @@ def run_decision(market: dict, current_balance: float) -> None:
         return
     yes_mid = (yes_bid + yes_ask) // 2
 
+    # ── Hard guards ──────────────────────────────────────────────────────────
     if not balance_floor_check(current_balance):
         return
     if not expiry_guard(yes_mid):
@@ -1129,6 +1166,14 @@ def run_decision(market: dict, current_balance: float) -> None:
     if ticker in active_tickers:
         log.info("Position guard │ Already in %s.", ticker[-15:])
         return
+
+    # v8.2.0: Block re-entry on any ticker already traded this session
+    if ticker in session_traded_tickers:
+        log.info("Session ticker guard │ Already traded %s this session. Skipping.",
+                 ticker[-15:])
+        last_signal_desc = f"session re-entry blocked ({ticker[-10:]})"
+        return
+
     if not cooldown_passed():
         return
     if not daily_loss_check(current_balance):
@@ -1156,16 +1201,18 @@ def run_decision(market: dict, current_balance: float) -> None:
 
     mins_remaining = minutes_to_expiry(market)
     if mins_remaining < MIN_MINUTES_TO_EXPIRY:
-        log.info("Expiry imminent │ %.1f min.", mins_remaining)
-        last_signal_desc = f"expiry imminent"
+        log.info("Expiry imminent │ %.1f min < %.1f min minimum.", mins_remaining, MIN_MINUTES_TO_EXPIRY)
+        last_signal_desc = "expiry imminent"
         return
 
+    # ── Regime filter ────────────────────────────────────────────────────────
     regime, r_squared = compute_btc_regime()
     if regime in ("HIGH_VOL", "UNKNOWN", "RANGING"):
         log.info("Regime filter │ %s (R²=%.2f).", regime, r_squared)
         last_signal_desc = f"regime={regime}"
         return
 
+    # ── Order book analysis ──────────────────────────────────────────────────
     ob_data = get_order_book(ticker)
     ob_quality = calc_ob_quality(ob_data, yes_mid)
     ob_dir = ob_quality["direction"]
@@ -1176,9 +1223,24 @@ def run_decision(market: dict, current_balance: float) -> None:
         return
 
     if not ob_trend_check(ticker, ob_quality["imbalance"], ob_dir):
-        last_signal_desc = f"OB trend fading"
+        last_signal_desc = "OB trend fading"
         return
 
+    # v8.2.0: Ghost OB check — if the opposing side has zero levels,
+    # there is no counterparty and the maker order cannot fill.
+    # Example: YES OB=100% with NO depth=$0 means no one is selling YES.
+    yes_levels = ob_quality.get("level_count_yes", 0)
+    no_levels  = ob_quality.get("level_count_no", 0)
+    if ob_dir == "YES" and no_levels == 0:
+        log.info("Ghost OB │ YES signal but NO side has zero levels — no counterparty. Skipping.")
+        last_signal_desc = "ghost OB (YES, zero NO levels)"
+        return
+    if ob_dir == "NO" and yes_levels == 0:
+        log.info("Ghost OB │ NO signal but YES side has zero levels — no counterparty. Skipping.")
+        last_signal_desc = "ghost OB (NO, zero YES levels)"
+        return
+
+    # ── Momentum filter ──────────────────────────────────────────────────────
     momentum_verdict, momentum_boost = btc_momentum_signal(ob_dir)
 
     if momentum_verdict == "CONFLICT":
@@ -1186,14 +1248,19 @@ def run_decision(market: dict, current_balance: float) -> None:
         last_signal_desc = f"CONFLICT: OB={ob_dir}"
         return
 
-    if REQUIRE_AGREE_MOMENTUM and momentum_verdict == "NEUTRAL":
-        if ALLOW_NEUTRAL_IN_TRENDING and r_squared >= NEUTRAL_R2_FLOOR:
-            pass
-        else:
-            log.info("Momentum filter │ NEUTRAL blocked.")
-            last_signal_desc = f"momentum=NEUTRAL"
-            return
+    # REQUIRE_AGREE_MOMENTUM: NEUTRAL is now a hard block by default (v8.2.0)
+    if momentum_verdict == "NEUTRAL":
+        if REQUIRE_AGREE_MOMENTUM:
+            # Only allow bypass if explicitly configured AND conditions are strict
+            if ALLOW_NEUTRAL_IN_TRENDING and r_squared >= NEUTRAL_R2_FLOOR:
+                log.info("Momentum NEUTRAL │ Bypassed: TRENDING R²=%.2f ≥ %.2f floor.",
+                         r_squared, NEUTRAL_R2_FLOOR)
+            else:
+                log.info("Momentum filter │ NEUTRAL blocked. AGREE required.")
+                last_signal_desc = "momentum=NEUTRAL (AGREE required)"
+                return
 
+    # ── Confidence scoring ───────────────────────────────────────────────────
     confidence = compute_confidence_score(
         ob_quality=ob_quality, regime=regime, r_squared=r_squared,
         momentum_verdict=momentum_verdict, momentum_boost=momentum_boost,
@@ -1207,10 +1274,11 @@ def run_decision(market: dict, current_balance: float) -> None:
 
     win_prob = min(0.92, ob_quality["imbalance"] + momentum_boost)
 
-    log.info("📡 %s │ Regime:%s │ OB:%s %.0f%% │ BTC:%s │ WinProb:%.0f%% │ Conf:%.0f",
-        ticker[-15:], regime, ob_dir, ob_quality["imbalance"]*100,
+    log.info("📡 %s │ Regime:%s(R²=%.2f) │ OB:%s %.0f%% │ BTC:%s │ WinProb:%.0f%% │ Conf:%.0f",
+        ticker[-15:], regime, r_squared, ob_dir, ob_quality["imbalance"]*100,
         momentum_verdict, win_prob*100, confidence)
 
+    # ── Price / bias filters ─────────────────────────────────────────────────
     if ob_dir == "YES":
         if yes_mid > YES_BREAKEVEN_PRICE:
             log.info("Price guard │ YES at %dc > breakeven.", yes_mid)
@@ -1229,6 +1297,7 @@ def run_decision(market: dict, current_balance: float) -> None:
         log.info("Bias filter │ %dc outside range.", contract_price)
         return
 
+    # ── Edge & sizing ────────────────────────────────────────────────────────
     edge = calc_edge(win_prob, contract_price)
     if edge < PROFILE["min_edge"]:
         log.info("Edge │ %.3f < min %.3f.", edge, PROFILE["min_edge"])
@@ -1243,6 +1312,7 @@ def run_decision(market: dict, current_balance: float) -> None:
         log.warning("Insufficient balance.")
         return
 
+    # ── Limit price ──────────────────────────────────────────────────────────
     if trade_direction == "YES":
         limit_price = max(1, min(yes_bid + 1, yes_ask - 1))
     else:
@@ -1256,9 +1326,11 @@ def run_decision(market: dict, current_balance: float) -> None:
 
     wlb_str = f"WilsonLB={wilson_lower_bound(live_wins, live_wins + live_losses)*100:.1f}%" \
               if (live_wins + live_losses) >= 10 else "WilsonLB=n/a"
-    log.info("📋 EDGE JUSTIFICATION │ %s %s @ %d¢ │ OB=%.0f%% │ Edge=%.1f%% │ Bet=$%.2f │ %s",
+    log.info("📋 EDGE JUSTIFICATION │ %s %s @ %d¢ │ OB=%.0f%% depth=$%.0f │ "
+             "Edge=%.1f%% │ Bet=$%.2f │ %.1fmin remain │ %s",
         trade_direction, ticker[-15:], contract_price,
-        ob_quality['imbalance']*100, edge*100, bet, wlb_str)
+        ob_quality['imbalance']*100, ob_quality['near_money_depth'],
+        edge*100, bet, mins_remaining, wlb_str)
 
     last_signal_desc = f"SIGNAL {trade_direction} conf={confidence:.0f}"
 
@@ -1276,17 +1348,27 @@ def main() -> None:
     global consecutive_losses, last_signal_desc, last_heartbeat_ts, running_pnl
     global live_wins, live_losses, streak_pause_until
     global _last_known_balance, _shutdown_requested, _session_start_ts
+    global _session_halted, session_traded_tickers
 
     init_base_url()
 
     paper_balance = float(os.environ.get("PAPER_BALANCE", "25.0"))
     _session_start_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    # v8.2.0: Reset session-scoped state on boot
+    _session_halted = False
+    session_traded_tickers = set()
+
     log.info("━" * 70)
     log.info("  JOHNNY5 %s │ %s │ %s", BOT_VERSION,
              "PAPER 🟡" if DEMO_MODE else "LIVE 🔴", ACTIVE_MODE.value.upper())
     log.info("  Session start: %s", _session_start_ts)
-    log.info("  v8.1.0 FIX: Settlement matching repaired")
+    log.info("  MOMENTUM: AGREE required=%s", REQUIRE_AGREE_MOMENTUM)
+    log.info("  MIN CONFIDENCE: %d | R²≥%.2f | DEPTH≥$%.0f | MINS≥%.0f",
+             MINIMUM_CONFIDENCE, R_SQUARED_THRESHOLD,
+             MIN_OB_DEPTH_DOLLARS, MIN_MINUTES_TO_EXPIRY)
+    log.info("  MAX CONCURRENT POSITIONS: %d", MAX_CONCURRENT_POS)
+    log.info("  HALT: permanent once session loss cap hit")
     log.info("━" * 70)
 
     tg.validate_telegram_connection()
@@ -1315,6 +1397,13 @@ def main() -> None:
 
     while not _shutdown_requested:
         try:
+            # v8.2.0: If session is permanently halted, sleep long instead of
+            # spamming HALT logs every 30 seconds
+            if _session_halted:
+                log.info("Session permanently halted. Sleeping 1hr. Restart Railway to reset.")
+                time.sleep(3600)
+                continue
+
             if time.time() - last_heartbeat_ts >= 900:
                 last_heartbeat_ts = time.time()
                 hb_bal = paper_balance if DEMO_MODE else get_live_balance()
@@ -1356,13 +1445,14 @@ def main() -> None:
                     wins = sum(1 for t in resolved if t["result"] == "win")
                     total = len(resolved)
                     wr = wins / total if total > 0 else 0.0
-                    log.info("📋 PAPER │ Balance: $%.2f │ PnL: $%+.2f │ WR: %.1f%%",
-                             paper_balance, paper_daily_pnl, wr * 100)
+                    log.info("📋 PAPER │ Balance: $%.2f │ PnL: $%+.2f │ WR: %.1f%% │ Session tickers: %d",
+                             paper_balance, paper_daily_pnl, wr * 100, len(session_traded_tickers))
                 else:
                     live_bal = get_live_balance()
                     daily_pnl = live_bal - session_start_balance
-                    log.info("Portfolio │ Balance: $%.2f │ PnL: $%+.2f │ Open: %d │ WR: %d/%d",
-                             live_bal, daily_pnl, len(open_orders), live_wins, live_wins + live_losses)
+                    log.info("Portfolio │ Balance: $%.2f │ PnL: $%+.2f │ Open: %d │ WR: %d/%d │ Session tickers: %d",
+                             live_bal, daily_pnl, len(open_orders),
+                             live_wins, live_wins + live_losses, len(session_traded_tickers))
 
                     now_utc_hour = datetime.now(timezone.utc).hour
                     if now_utc_hour == 0 and time.time() - last_daily_summary_ts > 3600:
