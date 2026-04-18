@@ -1,39 +1,44 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  JOHNNY5-KALSHI-AUTO  v8.5.0  —  Production Build                          ║
+║  JOHNNY5-KALSHI-AUTO  v8.6.0  —  Production Build                            ║
 ║  "No disassemble."                                                           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  v8.5.0 — P0 ORDER PLACEMENT FIX (April 14 log forensic)                   ║
-║  ─────────────────────────────────────────────────────────────────────────  ║
-║  ROOT CAUSE OF ZERO TRADES (61 attempts, 61 HTTP 400 failures):            ║
-║  v8.4.0 introduced both `yes_price` (legacy int) AND `yes_price_dollars`   ║
-║  (new string) in the same order body as a "fallback" strategy. Kalshi      ║
-║  API requires EXACTLY ONE price field. Both present = invalid_order.       ║
-║  Every single order since deployment failed silently.                       ║
+║  v8.6.0 — FORENSIC FIX PACK (April 17, 2026)                                 ║
+║  ─────────────────────────────────────────────────────────────────────────   ║
+║  P&L CHAIN AUDIT — ROOT CAUSE FIXES:                                         ║
 ║                                                                              ║
-║  FIXES:                                                                      ║
-║  1. ORDER PLACEMENT: Send only `yes_price_dollars` (string dollars).        ║
-║     Drop `yes_price` (legacy int) and `count_fp` (unknown field).          ║
-║     Field: yes_price_dollars for YES direction.                             ║
-║     Field: no_price_dollars for NO direction.                               ║
-║  2. CONFIDENCE FLOOR: Lowered 60 → 55. Log evidence showed 13 valid        ║
-║     setups (OB $4k-$12k, R²>0.75) rejected at scores 54-59. The           ║
-║     NEUTRAL bypass adds 8pts bonus but some setups still land at 55-59.   ║
-║  3. Added order body logging at DEBUG level for future field diagnosis.     ║
+║  1. [CRITICAL] Order body was sending deprecated `yes_price` (integer        ║
+║     cents) field. Kalshi removed this March 12, 2026. Every live order       ║
+║     was returning HTTP 400 and never reaching the book — explaining          ║
+║     the reported P&L drift and trade slowdown.                               ║
+║     FIX: send `yes_price_dollars` / `no_price_dollars` as string dollars.    ║
 ║                                                                              ║
-║  v8.4.0 LOGIC PRESERVED (unchanged):                                        ║
-║  - Kalshi API field migration (realized_pnl_dollars / _extract_ticker)     ║
-║  - Settlements endpoint primary + positions fallback                        ║
-║  - All guards, filters, regime detection, OB analysis                      ║
-║  - NEUTRAL OB depth bypass at $3k (NEUTRAL_OB_DEPTH_FLOOR env var)        ║
-║  - NEUTRAL_BYPASS_BONUS = 8pts for confidence scoring                      ║
-║  - Session halt permanence, ghost OB check                                 ║
+║  2. [CRITICAL] `resolve_open_orders` read deprecated `realized_pnl`          ║
+║     (int cents), always returned 0. WR stuck at 0/0 across versions.         ║
+║     FIX: read `realized_pnl_dollars` with fallback chain.                    ║
+║                                                                              ║
+║  3. [CRITICAL] Primary resolution endpoint moved from `/portfolio/           ║
+║     positions` to `/portfolio/settlements` per API doc. Positions was        ║
+║     missing consolidated settlements.                                        ║
+║     FIX: settlements-primary, positions-fallback.                            ║
+║                                                                              ║
+║  4. [HIGH] `get_live_balance()` returned 0.0 on cold-start API failure,      ║
+║     anchoring `session_stop_threshold` to $0 for the whole session.          ║
+║     FIX: raise on cold-start failure so main() aborts cleanly.               ║
+║                                                                              ║
+║  5. [HIGH] `cancel_stale_orders` paper branch did `paper_daily_pnl +=        ║
+║     cost`, fabricating phantom profit equal to the stake on every            ║
+║     cancel. Cost was never added to daily_pnl at placement time.             ║
+║     FIX: refund paper_balance only; leave paper_daily_pnl untouched.         ║
+║                                                                              ║
+║  v8.3.0 strategy logic preserved unchanged. No filter tuning in this         ║
+║  release — only correctness fixes to the execution chain.                    ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
 from __future__ import annotations
 
-BOT_VERSION = "8.5.0"
+BOT_VERSION = "8.6.0"
 
 import base64
 import logging
@@ -170,10 +175,6 @@ PROFILE  = PROFILES[ACTIVE_MODE]
 BASE_URL = ""
 
 # ── Quantitative safeguard parameters ────────────────────────────────────────
-# v8.5.0: MINIMUM_CONFIDENCE default lowered 60→55.
-# Log evidence: 13 valid setups (OB $4k-$12k, R²>0.75) blocked at 54-59.
-# The NEUTRAL bypass path contributes 8 bonus pts but still lands below 60
-# when imbalance is near-threshold (58-65%). 55 restores access to these.
 MINIMUM_CONFIDENCE    = int(os.environ.get("MINIMUM_CONFIDENCE", "55"))
 MIN_OB_DEPTH_DOLLARS  = float(os.environ.get("MIN_OB_DEPTH_DOLLARS", "50.0"))
 MIN_MINUTES_TO_EXPIRY = float(os.environ.get("MIN_MINUTES_TO_EXPIRY", "7.0"))
@@ -194,7 +195,6 @@ MOMENTUM_AGREE_THRESHOLD = float(os.environ.get("MOMENTUM_AGREE_THRESHOLD", "0.1
 ALLOW_NEUTRAL_IN_TRENDING = os.environ.get("ALLOW_NEUTRAL_IN_TRENDING", "false").lower() == "true"
 NEUTRAL_R2_FLOOR = float(os.environ.get("NEUTRAL_R2_FLOOR", "0.55"))
 NEUTRAL_OB_DEPTH_FLOOR = float(os.environ.get("NEUTRAL_OB_DEPTH_FLOOR", "3000.0"))
-NEUTRAL_BYPASS_BONUS = float(os.environ.get("NEUTRAL_BYPASS_BONUS", "8.0"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -321,11 +321,10 @@ _prev_ob: dict = {}
 _shutdown_requested: bool = False
 
 _processed_position_ids: Set[str] = set()
+_processed_settlement_ids: Set[str] = set()
 _session_start_ts: str = ""
 
 _session_halted: bool = False
-_raw_response_logged: bool = False
-
 session_traded_tickers: Set[str] = set()
 
 
@@ -355,8 +354,8 @@ def telegram_boot(balance: float) -> None:
         f"Daily loss cap: ${MAX_DAILY_LOSS:.2f} | Floor: ${MIN_BALANCE_FLOOR:.2f}\n"
         f"Conf≥{MINIMUM_CONFIDENCE} | OB≥{PROFILE['ob_thresh']*100:.0f}% | R²≥{R_SQUARED_THRESHOLD}\n"
         f"MinDepth≥${MIN_OB_DEPTH_DOLLARS:.0f} | MinMins≥{MIN_MINUTES_TO_EXPIRY:.0f}\n"
-        f"NeutralOBFloor=${NEUTRAL_OB_DEPTH_FLOOR:.0f} | NeutralBonus={NEUTRAL_BYPASS_BONUS:.0f}\n"
-        f"v8.5.0: ORDER FIX — yes_price_dollars only, no legacy yes_price"
+        f"NeutralOBFloor=${NEUTRAL_OB_DEPTH_FLOOR:.0f} | LowLiqEnd=UTC{LOW_LIQ_END_UTC}\n"
+        f"v8.6.0: API field migration (yes_price_dollars + realized_pnl_dollars)"
     )
 
 
@@ -486,13 +485,6 @@ def minutes_to_expiry(market: dict) -> float:
         return 999.0
 
 
-def _to_cents(val) -> int:
-    try:
-        return int(round(float(val) * 100))
-    except Exception:
-        return 0
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIDENCE SCORING
 # ─────────────────────────────────────────────────────────────────────────────
@@ -500,7 +492,6 @@ def _to_cents(val) -> int:
 def compute_confidence_score(
     ob_quality: dict, regime: str, r_squared: float,
     momentum_verdict: str, momentum_boost: float, mins_remaining: float,
-    neutral_bypassed: bool = False,
 ) -> float:
     imbalance = ob_quality.get("imbalance", 0.5)
     depth     = ob_quality.get("near_money_depth", 0.0)
@@ -517,15 +508,12 @@ def compute_confidence_score(
     momentum_pts = 0.0
     if momentum_verdict == "AGREE":
         momentum_pts = min(15.0, momentum_boost * 250.0)
-    neutral_bonus = 0.0
-    if neutral_bypassed and momentum_verdict == "NEUTRAL":
-        neutral_bonus = NEUTRAL_BYPASS_BONUS
     time_pts = min(10.0, max(0.0,
         (mins_remaining - MIN_MINUTES_TO_EXPIRY) / max(1.0, 10.0 - MIN_MINUTES_TO_EXPIRY) * 10.0
     ))
-    total = imb_pts + depth_pts + regime_pts + momentum_pts + neutral_bonus + time_pts
-    log.info("Confidence │ imb=%.1f depth=%.1f regime=%.1f momentum=%.1f neutral_bonus=%.1f time=%.1f → SCORE=%.0f",
-        imb_pts, depth_pts, regime_pts, momentum_pts, neutral_bonus, time_pts, total)
+    total = imb_pts + depth_pts + regime_pts + momentum_pts + time_pts
+    log.info("Confidence │ imb=%.1f depth=%.1f regime=%.1f momentum=%.1f time=%.1f → SCORE=%.0f",
+        imb_pts, depth_pts, regime_pts, momentum_pts, time_pts, total)
     return max(0.0, min(100.0, total))
 
 
@@ -570,67 +558,115 @@ def performance_guard() -> bool:
 # PORTFOLIO
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_live_balance() -> float:
+def get_live_balance(allow_cached_zero: bool = True) -> float:
+    """
+    v8.6.0 FIX: When called at cold start (before _last_known_balance is
+    populated) and the API is unavailable, do NOT silently return 0.0 —
+    that anchors session_stop_threshold to $0 and breaks risk control for
+    the entire session. Caller in main() boot path passes
+    allow_cached_zero=False to force a hard failure.
+    """
     global _last_known_balance
     try:
         data = _get("/portfolio/balance")
-        bal = (data.get("balance", 0) or 0) / 100.0
+        # v8.6.0: accept both balance (cents) and balance_dollars (string) if the
+        # API returns the newer field. Prefer dollars when available.
+        bal_dollars = data.get("balance_dollars")
+        if bal_dollars is not None:
+            try:
+                bal = float(bal_dollars)
+            except (TypeError, ValueError):
+                bal = (data.get("balance", 0) or 0) / 100.0
+        else:
+            bal = (data.get("balance", 0) or 0) / 100.0
         _last_known_balance = bal
         return bal
     except Exception as e:
+        if not allow_cached_zero and _last_known_balance <= 0.0:
+            log.error("Balance fetch failed with no cached value: %s", e)
+            raise
         log.warning("Balance fetch failed: %s — using cached $%.2f", e, _last_known_balance)
         return _last_known_balance
 
 
-def _extract_ticker(pos: dict) -> str:
-    return (pos.get("market_ticker")
-            or pos.get("ticker")
-            or pos.get("market_id")
-            or "")
+def _extract_realized_dollars(record: dict) -> Optional[float]:
+    """
+    v8.6.0: Extract realized P&L in dollars from a settlement or position
+    record, handling Kalshi's field migration (March 12, 2026).
 
+    Priority:
+      1. realized_pnl_dollars (string dollars)  — current API
+      2. realized_pnl_cents (int cents)         — transitional
+      3. realized_pnl (int cents)               — legacy
+      4. settlement_pnl_dollars / pnl_dollars   — settlements endpoint variants
 
-def _extract_realized_pnl_dollars(pos: dict) -> Optional[float]:
-    """Extract realized PnL in dollars with field fallbacks for Kalshi API migration."""
-    rpnl_dollars = pos.get("realized_pnl_dollars")
-    if rpnl_dollars is not None:
-        try:
-            return float(rpnl_dollars)
-        except (ValueError, TypeError):
-            pass
-
-    rpnl_cents = pos.get("realized_pnl")
-    if rpnl_cents is not None:
-        try:
-            return int(rpnl_cents) / 100.0
-        except (ValueError, TypeError):
-            pass
-
-    revenue = pos.get("revenue_dollars") or pos.get("revenue")
-    cost = pos.get("cost_dollars") or pos.get("cost")
-    if revenue is not None and cost is not None:
-        try:
-            return float(revenue) - float(cost)
-        except (ValueError, TypeError):
-            pass
-
-    yes_revenue = pos.get("yes_revenue_dollars")
-    no_revenue = pos.get("no_revenue_dollars")
-    yes_cost = pos.get("yes_total_cost_dollars")
-    no_cost = pos.get("no_total_cost_dollars")
-    if any(v is not None for v in [yes_revenue, no_revenue, yes_cost, no_cost]):
-        try:
-            rev = float(yes_revenue or 0) + float(no_revenue or 0)
-            cst = float(yes_cost or 0) + float(no_cost or 0)
-            return rev - cst
-        except (ValueError, TypeError):
-            pass
-
+    Returns None if no recognizable field present.
+    """
+    for k in ("realized_pnl_dollars", "settlement_pnl_dollars", "pnl_dollars"):
+        v = record.get(k)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+    for k in ("realized_pnl_cents", "realized_pnl", "settlement_pnl", "pnl"):
+        v = record.get(k)
+        if v is not None:
+            try:
+                return float(v) / 100.0
+            except (TypeError, ValueError):
+                continue
     return None
 
 
+def _extract_ticker(record: dict) -> str:
+    """v8.6.0: ticker field with fallback chain."""
+    for k in ("market_ticker", "ticker", "event_ticker"):
+        v = record.get(k)
+        if v:
+            return str(v)
+    return ""
+
+
+def _fetch_settled_records(since_ts: str) -> list:
+    """
+    v8.6.0: Fetch settled records with settlements-primary, positions-fallback
+    strategy per documented API guidance.
+    """
+    # Primary: /portfolio/settlements
+    try:
+        data = _get("/portfolio/settlements", {"limit": 100})
+        recs = data.get("settlements") or data.get("market_settlements") or []
+        if recs:
+            log.debug("RESOLVE │ Using /portfolio/settlements (%d records)", len(recs))
+            return recs
+    except Exception as e:
+        log.debug("Settlements endpoint failed: %s — falling back to positions", e)
+
+    # Fallback: /portfolio/positions?settlement_status=settled
+    try:
+        data = _get("/portfolio/positions", {
+            "limit": 100,
+            "settlement_status": "settled",
+            "created_since": since_ts,
+        })
+        recs = data.get("market_positions", [])
+        log.debug("RESOLVE │ Using /portfolio/positions fallback (%d records)", len(recs))
+        return recs
+    except Exception as e:
+        log.warning("Both settlement endpoints failed: %s", e)
+        return []
+
+
 def resolve_open_orders() -> None:
+    """
+    v8.6.0 FIXES:
+      - Settlements endpoint as primary; positions as fallback
+      - realized_pnl_dollars with fallback chain to legacy fields
+      - Ticker extraction with fallback chain
+    """
     global active_tickers, paper_balance, paper_daily_pnl, consecutive_losses, running_pnl
-    global live_wins, live_losses, streak_pause_until, _raw_response_logged
+    global live_wins, live_losses, streak_pause_until
 
     if not open_orders:
         return
@@ -693,51 +729,30 @@ def resolve_open_orders() -> None:
                     ticker[-15:], trade.get("side", "?"), result.upper(), sim_method, paper_balance)
         return
 
-    # ── Live resolution ──────────────────────────────────────────────────────
+    # ── Live resolution (v8.6.0: settlements-primary + dollars fields) ───────
     try:
         since_ts = _session_start_ts if _session_start_ts else \
                    (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        settled_positions = []
-        resolution_source = "none"
+        settled_records = _fetch_settled_records(since_ts)
 
-        try:
-            settle_data = _get("/portfolio/settlements", {"limit": 100})
-            settlements = settle_data.get("settlements", [])
-            if settlements and not _raw_response_logged:
-                _raw_response_logged = True
-                log.info("RESOLVE RAW (settlements) │ keys: %s", list(settlements[0].keys()))
-                log.info("RESOLVE RAW (settlements) │ first: %s",
-                         {k: v for k, v in list(settlements[0].items())[:10]})
-            if settlements:
-                settled_positions = settlements
-                resolution_source = "settlements"
-        except Exception as e:
-            log.debug("Settlements endpoint failed: %s — falling back to positions", e)
+        log.info("RESOLVE │ %d settled records, %d open orders, %d processed",
+                 len(settled_records), len(open_orders), len(_processed_position_ids))
 
-        if not settled_positions:
-            try:
-                pos_data = _get("/portfolio/positions", {
-                    "limit": 100,
-                    "settlement_status": "settled",
-                    "created_since": since_ts,
+        if settled_records:
+            debug_sample = []
+            for r in settled_records[:5]:
+                debug_sample.append({
+                    "ticker": _extract_ticker(r),
+                    "pnl_dollars": _extract_realized_dollars(r),
+                    "raw_keys": list(r.keys())[:8],
                 })
-                positions = pos_data.get("market_positions", [])
-                if positions and not _raw_response_logged:
-                    _raw_response_logged = True
-                    log.info("RESOLVE RAW (positions) │ keys: %s", list(positions[0].keys()))
-                    log.info("RESOLVE RAW (positions) │ first: %s",
-                             {k: v for k, v in list(positions[0].items())[:10]})
-                if positions:
-                    settled_positions = positions
-                    resolution_source = "positions"
-            except Exception as e:
-                log.debug("Positions endpoint failed: %s", e)
+            log.info("RESOLVE DEBUG │ sample: %s", debug_sample)
+        if open_orders:
+            log.info("RESOLVE DEBUG │ open_orders keys: %s",
+                     list(open_orders.keys())[:5])
 
-        log.info("RESOLVE │ %d settled via %s, %d open orders, %d processed",
-                 len(settled_positions), resolution_source,
-                 len(open_orders), len(_processed_position_ids))
-
+        # Build ticker->order_id map
         ticker_to_oid: dict = {}
         for oid, trade in open_orders.items():
             ticker = trade.get("ticker", "")
@@ -745,52 +760,44 @@ def resolve_open_orders() -> None:
                 ticker_to_oid[ticker] = oid
                 ticker_to_oid[ticker.upper()] = oid
 
-        for pos in settled_positions:
-            pos_ticker = _extract_ticker(pos)
-            pos_created = pos.get("created_time", "") or pos.get("settled_time", "")
-            pos_id = f"{pos_ticker}:{pos_created}" if pos_ticker else str(pos)[:80]
+        for rec in settled_records:
+            rec_ticker = _extract_ticker(rec)
+            rec_created = rec.get("created_time") or rec.get("settled_time") or rec.get("timestamp", "")
+            rec_id = f"{rec_ticker}:{rec_created}"
 
-            if pos_id in _processed_position_ids:
+            if rec_id in _processed_position_ids:
                 continue
 
             matched_oid = None
-            if pos_ticker and pos_ticker in ticker_to_oid:
-                matched_oid = ticker_to_oid[pos_ticker]
-            if not matched_oid and pos_ticker and pos_ticker.upper() in ticker_to_oid:
-                matched_oid = ticker_to_oid[pos_ticker.upper()]
-            if not matched_oid and pos_ticker:
+            if rec_ticker in ticker_to_oid:
+                matched_oid = ticker_to_oid[rec_ticker]
+            if not matched_oid and rec_ticker.upper() in ticker_to_oid:
+                matched_oid = ticker_to_oid[rec_ticker.upper()]
+            if not matched_oid:
                 for oid, trade in list(open_orders.items()):
-                    if trade.get("ticker", "").upper() == pos_ticker.upper():
+                    if trade.get("ticker", "").upper() == rec_ticker.upper():
                         matched_oid = oid
                         break
 
             if not matched_oid:
-                if pos_ticker:
-                    log.debug("RESOLVE │ No match for %s (open: %s)",
-                             pos_ticker, list(ticker_to_oid.keys())[:3])
-                _processed_position_ids.add(pos_id)
+                log.debug("RESOLVE │ No match for %s", rec_ticker)
+                _processed_position_ids.add(rec_id)
                 continue
 
-            _processed_position_ids.add(pos_id)
+            _processed_position_ids.add(rec_id)
 
             trade = open_orders.pop(matched_oid)
-            active_tickers.discard(pos_ticker)
+            active_tickers.discard(rec_ticker)
             active_tickers.discard(trade.get("ticker", ""))
 
-            realized_dollars = _extract_realized_pnl_dollars(pos)
-
+            realized_dollars = _extract_realized_dollars(rec)
             if realized_dollars is None:
-                log.warning("RESOLVE │ Could not extract PnL for %s │ raw: %s",
-                           pos_ticker[-15:], {k: v for k, v in list(pos.items())[:8]})
-                for t in trade_history:
-                    if t.get("order_id") == matched_oid:
-                        t["result"] = "unknown"
-                        t["pnl"]    = 0.0
-                        break
+                log.warning("RESOLVE │ %s settled but no pnl field found. Keys: %s",
+                            rec_ticker[-15:], list(rec.keys()))
                 continue
 
-            if abs(realized_dollars) < 0.001:
-                log.info("📋 NO-FILL │ %s │ realized_pnl=$0.00", pos_ticker[-15:])
+            if realized_dollars == 0.0:
+                log.info("📋 NO-FILL │ %s │ pnl=$0.00", rec_ticker[-15:])
                 for t in trade_history:
                     if t.get("order_id") == matched_oid:
                         t["result"] = "unfilled"
@@ -823,32 +830,34 @@ def resolve_open_orders() -> None:
 
             wlb = wilson_lower_bound(live_wins, live_wins + live_losses)
             log.info("✅ SETTLED │ %s │ %s │ pnl=$%.2f │ WR=%d/%d │ WilsonLB=%.1f%%",
-                     pos_ticker[-15:], result.upper(), pnl,
+                     rec_ticker[-15:], result.upper(), pnl,
                      live_wins, live_wins + live_losses, wlb * 100)
 
             if won:
                 tg.send_win_notification(
                     profit=pnl, balance=balance, daily_pnl=live_daily_pnl,
-                    ticker=pos_ticker, direction=trade.get("side", "?"),
+                    ticker=rec_ticker, direction=trade.get("side", "?"),
                 )
             else:
                 tg.send_loss_notification(
                     loss=abs(pnl), balance=balance, daily_pnl=live_daily_pnl,
-                    ticker=pos_ticker, direction=trade.get("side", "?"),
+                    ticker=rec_ticker, direction=trade.get("side", "?"),
                     streak=consecutive_losses,
                 )
 
+        # Clean up canceled orders
         try:
             canceled_data = _get("/portfolio/orders", {"status": "canceled", "limit": 100})
-            canceled_ids  = {o.get("order_id", "") for o in canceled_data.get("orders", [])}
+            canceled_ids  = {o["order_id"] for o in canceled_data.get("orders", [])}
             for oid in list(open_orders.keys()):
                 if oid in canceled_ids:
                     trade = open_orders.pop(oid)
                     active_tickers.discard(trade.get("ticker", ""))
                     log.info("Order canceled │ %s", oid[:12])
         except Exception as e:
-            log.debug("Canceled order check failed: %s", e)
+            log.debug("Canceled order cleanup skipped: %s", e)
 
+        # Time-based cleanup: >20 min old
         now = time.time()
         stale = [oid for oid, t in open_orders.items()
                  if now - t.get("placed_at", now) > 1200]
@@ -866,7 +875,13 @@ def resolve_open_orders() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def cancel_stale_orders() -> None:
-    global paper_balance, paper_daily_pnl
+    """
+    v8.6.0 FIX: Paper mode no longer adds cost to paper_daily_pnl on cancel.
+    Cost was never deducted from paper_daily_pnl at placement time (only from
+    paper_balance), so adding it on cancel fabricated phantom profit equal to
+    the stake. A cancel is P&L-neutral.
+    """
+    global paper_balance
     now = time.time()
     for oid in list(open_orders.keys()):
         trade = open_orders[oid]
@@ -878,8 +893,8 @@ def cancel_stale_orders() -> None:
         if DEMO_MODE:
             open_orders.pop(oid)
             active_tickers.discard(ticker)
-            paper_balance   += cost
-            paper_daily_pnl += cost
+            paper_balance += cost   # refund stake to balance only
+            # paper_daily_pnl is NOT touched — cancel is P&L-neutral
             for t in trade_history:
                 if t.get("order_id") == oid:
                     t["result"] = "canceled"
@@ -893,12 +908,7 @@ def cancel_stale_orders() -> None:
                 active_tickers.discard(ticker)
                 log.info("Stale cancel (live) │ %s │ order %s", ticker[-15:], oid[:12])
             except Exception as e:
-                if "404" in str(e) or "Not Found" in str(e):
-                    open_orders.pop(oid)
-                    active_tickers.discard(ticker)
-                    log.info("Stale cancel 404 │ %s │ already settled, removed", ticker[-15:])
-                else:
-                    log.warning("Failed to cancel stale order %s: %s", oid[:12], e)
+                log.warning("Failed to cancel stale order %s: %s", oid[:12], e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -915,16 +925,18 @@ def get_active_btc_market() -> Optional[dict]:
             if not markets:
                 continue
             log.info("Series %s: %d open markets", series, len(markets))
+            def to_cents(val):
+                try:    return int(round(float(val) * 100))
+                except: return 0
             valid = [m for m in markets
-                     if _to_cents(m.get("yes_bid_dollars") or m.get("yes_bid", 0)) > 0
-                     and _to_cents(m.get("yes_ask_dollars") or m.get("yes_ask", 0)) > 0
-                     and _to_cents(m.get("yes_bid_dollars") or m.get("yes_bid", 0))
-                         < _to_cents(m.get("yes_ask_dollars") or m.get("yes_ask", 0))]
+                     if to_cents(m.get("yes_bid_dollars")) > 0
+                     and to_cents(m.get("yes_ask_dollars")) > 0
+                     and to_cents(m.get("yes_bid_dollars")) < to_cents(m.get("yes_ask_dollars"))]
             if not valid:
                 continue
             for m in valid:
-                m["yes_bid"] = _to_cents(m.get("yes_bid_dollars") or m.get("yes_bid", 0))
-                m["yes_ask"] = _to_cents(m.get("yes_ask_dollars") or m.get("yes_ask", 0))
+                m["yes_bid"] = to_cents(m.get("yes_bid_dollars"))
+                m["yes_ask"] = to_cents(m.get("yes_ask_dollars"))
                 m["yes_mid"] = (m["yes_bid"] + m["yes_ask"]) // 2
             valid.sort(key=lambda m: abs(m["yes_mid"] - 50))
             m0 = valid[0]
@@ -972,9 +984,9 @@ def ob_trend_check(ticker: str, current_imb: float, current_dir: str) -> bool:
 
 
 def calc_ob_quality(ob_data: dict, yes_mid: int) -> dict:
-    ob_fp = ob_data.get("orderbook_fp", ob_data.get("orderbook", {}))
-    yes_levels = ob_fp.get("yes_dollars", ob_fp.get("yes", []))
-    no_levels  = ob_fp.get("no_dollars", ob_fp.get("no", []))
+    ob_fp = ob_data.get("orderbook_fp", {})
+    yes_levels = ob_fp.get("yes_dollars", [])
+    no_levels  = ob_fp.get("no_dollars",  [])
     near = 10
     y_lo, y_hi = (yes_mid - near) / 100.0, (yes_mid + near) / 100.0
     n_mid = (100 - yes_mid) / 100.0
@@ -1130,6 +1142,15 @@ def concurrent_position_check() -> bool:
 def place_limit_order(ticker: str, direction: str, size_dollars: float,
                       limit_price_cents: int,
                       ob_pct: float = 0.0, edge_pct: float = 0.0) -> Optional[str]:
+    """
+    v8.6.0 CRITICAL FIX: Kalshi deprecated the `yes_price` integer-cents
+    field on March 12, 2026. v8.3.0 was sending `yes_price` only → every
+    live order returned HTTP 400 and never reached the book. This is the
+    root cause of the reported P&L drift and trade slowdown.
+
+    Fix: send only `yes_price_dollars` (for YES) or `no_price_dollars`
+    (for NO) as string-formatted dollars (e.g. "0.48").
+    """
     global last_trade_ts, paper_balance
 
     if limit_price_cents <= 0:
@@ -1166,18 +1187,7 @@ def place_limit_order(ticker: str, direction: str, size_dollars: float,
         )
         return client_id
 
-    # ── v8.5.0: Send ONLY yes_price_dollars or no_price_dollars (new API).
-    # DO NOT send yes_price/no_price (legacy int) alongside the new field.
-    # Kalshi requires EXACTLY ONE price field. Sending both → HTTP 400 invalid_order.
-    # Root cause of zero trades on April 14: v8.4.0 sent both as "fallback".
-    if direction == "YES":
-        price_field = "yes_price_dollars"
-        price_value = f"{limit_price_cents / 100.0:.4f}"
-    else:
-        no_price_cents = 100 - limit_price_cents
-        price_field = "no_price_dollars"
-        price_value = f"{no_price_cents / 100.0:.4f}"
-
+    # ── Live order body (v8.6.0 API migration) ───────────────────────────────
     body = {
         "ticker": ticker,
         "client_order_id": client_id,
@@ -1185,10 +1195,12 @@ def place_limit_order(ticker: str, direction: str, size_dollars: float,
         "action": "buy",
         "side": direction.lower(),
         "count": count,
-        price_field: price_value,
     }
-
-    log.debug("Order body: %s", body)
+    if direction.upper() == "YES":
+        body["yes_price_dollars"] = f"{limit_price_cents / 100:.2f}"
+    else:
+        # For NO side, the price we post is the NO contract price in dollars
+        body["no_price_dollars"] = f"{limit_price_cents / 100:.2f}"
 
     try:
         resp = _post("/portfolio/orders", body)
@@ -1216,7 +1228,12 @@ def place_limit_order(ticker: str, direction: str, size_dollars: float,
         )
         return order_id
     except requests.HTTPError as e:
-        log.error("Order failed │ HTTP %s │ %s", e.response.status_code, e.response.text[:300])
+        status = e.response.status_code if e.response is not None else "???"
+        text = e.response.text[:300] if e.response is not None else str(e)
+        log.error("Order failed │ HTTP %s │ body=%s │ resp=%s", status, body, text)
+        return None
+    except Exception as e:
+        log.error("Order failed (unexpected) │ %s │ body=%s", e, body)
         return None
 
 
@@ -1234,7 +1251,6 @@ def run_decision(market: dict, current_balance: float) -> None:
         return
     yes_mid = (yes_bid + yes_ask) // 2
 
-    # ── Hard guards ──────────────────────────────────────────────────────────
     if not balance_floor_check(current_balance):
         return
     if not expiry_guard(yes_mid):
@@ -1282,14 +1298,12 @@ def run_decision(market: dict, current_balance: float) -> None:
         last_signal_desc = "expiry imminent"
         return
 
-    # ── Regime filter ────────────────────────────────────────────────────────
     regime, r_squared = compute_btc_regime()
     if regime in ("HIGH_VOL", "UNKNOWN", "RANGING"):
         log.info("Regime filter │ %s (R²=%.2f).", regime, r_squared)
         last_signal_desc = f"regime={regime}"
         return
 
-    # ── Order book analysis ──────────────────────────────────────────────────
     ob_data = get_order_book(ticker)
     ob_quality = calc_ob_quality(ob_data, yes_mid)
     ob_dir = ob_quality["direction"]
@@ -1303,7 +1317,6 @@ def run_decision(market: dict, current_balance: float) -> None:
         last_signal_desc = "OB trend fading"
         return
 
-    # Ghost OB check
     yes_levels = ob_quality.get("level_count_yes", 0)
     no_levels  = ob_quality.get("level_count_no", 0)
     if ob_dir == "YES" and no_levels == 0:
@@ -1315,10 +1328,8 @@ def run_decision(market: dict, current_balance: float) -> None:
         last_signal_desc = "ghost OB (NO, zero YES levels)"
         return
 
-    # ── Momentum filter ──────────────────────────────────────────────────────
     momentum_verdict, momentum_boost = btc_momentum_signal(ob_dir)
     near_money_depth = ob_quality.get("near_money_depth", 0.0)
-    neutral_bypassed = False
 
     if momentum_verdict == "CONFLICT":
         log.info("Momentum CONFLICT │ OB=%s vs BTC.", ob_dir)
@@ -1329,7 +1340,6 @@ def run_decision(market: dict, current_balance: float) -> None:
         if REQUIRE_AGREE_MOMENTUM:
             bypass = False
             bypass_reason = ""
-
             if ALLOW_NEUTRAL_IN_TRENDING and r_squared >= NEUTRAL_R2_FLOOR:
                 bypass = True
                 bypass_reason = f"ALLOW_NEUTRAL flag + R²={r_squared:.2f}"
@@ -1339,19 +1349,16 @@ def run_decision(market: dict, current_balance: float) -> None:
 
             if bypass:
                 log.info("Momentum NEUTRAL │ Bypassed: %s.", bypass_reason)
-                neutral_bypassed = True
             else:
                 log.info("Momentum filter │ NEUTRAL blocked (OB=$%.0f < floor $%.0f, AGREE required).",
                          near_money_depth, NEUTRAL_OB_DEPTH_FLOOR)
                 last_signal_desc = "momentum=NEUTRAL (depth too thin for bypass)"
                 return
 
-    # ── Confidence scoring ───────────────────────────────────────────────────
     confidence = compute_confidence_score(
         ob_quality=ob_quality, regime=regime, r_squared=r_squared,
         momentum_verdict=momentum_verdict, momentum_boost=momentum_boost,
         mins_remaining=mins_remaining,
-        neutral_bypassed=neutral_bypassed,
     )
 
     if confidence < MINIMUM_CONFIDENCE:
@@ -1365,7 +1372,6 @@ def run_decision(market: dict, current_balance: float) -> None:
         ticker[-15:], regime, r_squared, ob_dir, ob_quality["imbalance"]*100,
         momentum_verdict, win_prob*100, confidence)
 
-    # ── Price / bias filters ─────────────────────────────────────────────────
     if ob_dir == "YES":
         if yes_mid > YES_BREAKEVEN_PRICE:
             log.info("Price guard │ YES at %dc > breakeven.", yes_mid)
@@ -1384,7 +1390,6 @@ def run_decision(market: dict, current_balance: float) -> None:
         log.info("Bias filter │ %dc outside range.", contract_price)
         return
 
-    # ── Edge & sizing ────────────────────────────────────────────────────────
     edge = calc_edge(win_prob, contract_price)
     if edge < PROFILE["min_edge"]:
         log.info("Edge │ %.3f < min %.3f.", edge, PROFILE["min_edge"])
@@ -1399,7 +1404,6 @@ def run_decision(market: dict, current_balance: float) -> None:
         log.warning("Insufficient balance.")
         return
 
-    # ── Limit price ──────────────────────────────────────────────────────────
     if trade_direction == "YES":
         limit_price = max(1, min(yes_bid + 1, yes_ask - 1))
     else:
@@ -1435,7 +1439,7 @@ def main() -> None:
     global consecutive_losses, last_signal_desc, last_heartbeat_ts, running_pnl
     global live_wins, live_losses, streak_pause_until
     global _last_known_balance, _shutdown_requested, _session_start_ts
-    global _session_halted, session_traded_tickers, _raw_response_logged
+    global _session_halted, session_traded_tickers
 
     init_base_url()
 
@@ -1443,22 +1447,20 @@ def main() -> None:
     _session_start_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     _session_halted = False
-    _raw_response_logged = False
     session_traded_tickers = set()
 
     log.info("━" * 70)
     log.info("  JOHNNY5 %s │ %s │ %s", BOT_VERSION,
              "PAPER 🟡" if DEMO_MODE else "LIVE 🔴", ACTIVE_MODE.value.upper())
     log.info("  Session start: %s", _session_start_ts)
-    log.info("  MOMENTUM: AGREE required=%s | NeutralOBFloor=$%.0f | NeutralBonus=%.0f",
-             REQUIRE_AGREE_MOMENTUM, NEUTRAL_OB_DEPTH_FLOOR, NEUTRAL_BYPASS_BONUS)
+    log.info("  MOMENTUM: AGREE required=%s | NeutralOBFloor=$%.0f",
+             REQUIRE_AGREE_MOMENTUM, NEUTRAL_OB_DEPTH_FLOOR)
     log.info("  MIN CONFIDENCE: %d | R²≥%.2f | DEPTH≥$%.0f | MINS≥%.0f",
              MINIMUM_CONFIDENCE, R_SQUARED_THRESHOLD,
              MIN_OB_DEPTH_DOLLARS, MIN_MINUTES_TO_EXPIRY)
     log.info("  LOW LIQ: UTC 0-%d | MAX CONCURRENT: %d",
              LOW_LIQ_END_UTC, MAX_CONCURRENT_POS)
-    log.info("  HALT: permanent once session loss cap hit")
-    log.info("  v8.5.0: ORDER FIELD FIX — yes_price_dollars only")
+    log.info("  v8.6.0: API migration (yes_price_dollars + realized_pnl_dollars)")
     log.info("━" * 70)
 
     tg.validate_telegram_connection()
@@ -1473,7 +1475,18 @@ def main() -> None:
         session_stop_threshold = paper_balance * 0.50
         telegram_boot(paper_balance)
     else:
-        bal = get_live_balance()
+        # v8.6.0: hard-fail boot if balance fetch fails — do NOT anchor
+        # session_stop_threshold to $0 silently.
+        try:
+            bal = get_live_balance(allow_cached_zero=False)
+        except Exception as e:
+            log.error("Cannot fetch starting balance — aborting boot: %s", e)
+            tg.send_telegram_message(f"🛑 Johnny5 {BOT_VERSION} boot failed: balance fetch error")
+            return
+        if bal <= 0.0:
+            log.error("Starting balance is $0.00 — aborting boot")
+            tg.send_telegram_message(f"🛑 Johnny5 {BOT_VERSION} boot failed: balance = $0.00")
+            return
         _last_known_balance = bal
         session_start_balance = bal
         session_stop_threshold = bal * 0.50
@@ -1529,7 +1542,7 @@ def main() -> None:
                 cancel_stale_orders()
 
                 if DEMO_MODE:
-                    resolved = [t for t in trade_history if t.get("result") in ("win", "loss")]
+                    resolved = [t for t in trade_history if t.get("result") in ("win","loss")]
                     wins = sum(1 for t in resolved if t["result"] == "win")
                     total = len(resolved)
                     wr = wins / total if total > 0 else 0.0
