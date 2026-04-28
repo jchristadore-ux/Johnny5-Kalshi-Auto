@@ -1,55 +1,39 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  JOHNNY5-KALSHI-AUTO  v8.6.0  —  Production Build                            ║
+║  JOHNNY5-KALSHI-AUTO  v9.0.0  —  GROUND-UP REBUILD                         ║
 ║  "No disassemble."                                                           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  v8.6.0 — FORENSIC FIX PACK (April 17, 2026)                                 ║
-║  ─────────────────────────────────────────────────────────────────────────   ║
-║  P&L CHAIN AUDIT — ROOT CAUSE FIXES:                                         ║
+║  v9.0.0 — COMPLETE TRADING BRAIN REPLACEMENT                                ║
+║  Trigger: catastrophic April 20 session, full halt.                         ║
 ║                                                                              ║
-║  1. [CRITICAL] Order body was sending deprecated `yes_price` (integer        ║
-║     cents) field. Kalshi removed this March 12, 2026. Every live order       ║
-║     was returning HTTP 400 and never reaching the book — explaining          ║
-║     the reported P&L drift and trade slowdown.                               ║
-║     FIX: send `yes_price_dollars` / `no_price_dollars` as string dollars.    ║
-║                                                                              ║
-║  2. [CRITICAL] `resolve_open_orders` read deprecated `realized_pnl`          ║
-║     (int cents), always returned 0. WR stuck at 0/0 across versions.         ║
-║     FIX: read `realized_pnl_dollars` with fallback chain.                    ║
-║                                                                              ║
-║  3. [CRITICAL] Primary resolution endpoint moved from `/portfolio/           ║
-║     positions` to `/portfolio/settlements` per API doc. Positions was        ║
-║     missing consolidated settlements.                                        ║
-║     FIX: settlements-primary, positions-fallback.                            ║
-║                                                                              ║
-║  4. [HIGH] `get_live_balance()` returned 0.0 on cold-start API failure,      ║
-║     anchoring `session_stop_threshold` to $0 for the whole session.          ║
-║     FIX: raise on cold-start failure so main() aborts cleanly.               ║
-║                                                                              ║
-║  5. [HIGH] `cancel_stale_orders` paper branch did `paper_daily_pnl +=        ║
-║     cost`, fabricating phantom profit equal to the stake on every            ║
-║     cancel. Cost was never added to daily_pnl at placement time.             ║
-║     FIX: refund paper_balance only; leave paper_daily_pnl untouched.         ║
-║                                                                              ║
-║  v8.3.0 strategy logic preserved unchanged. No filter tuning in this         ║
-║  release — only correctness fixes to the execution chain.                    ║
+║  CORE REDESIGN:                                                              ║
+║  - Bayesian probability model replaces flat OB ratio heuristic              ║
+║  - Structural regime engine: trend + volatility + microstructure            ║
+║  - Multi-factor edge score with independent veto layers                     ║
+║  - Adaptive Kelly with volatility-scaled fraction                           ║
+║  - Circuit breakers: vol spike, spread explosion, book collapse             ║
+║  - Recovery protocol after red session                                      ║
+║  - Time-of-day session quality scoring                                      ║
+║  - 15-minute decision cycle aligned to market windows                      ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
 from __future__ import annotations
 
-BOT_VERSION = "8.6.0"
+BOT_VERSION = "9.0.0"
 
 import base64
 import logging
+import math
 import os
+import random
 import signal
 import time
 import uuid
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from enum import Enum
-from typing import Optional, Set
+from typing import Optional, Set, Tuple
 
 import requests
 from cryptography.hazmat.primitives import hashes, serialization
@@ -69,79 +53,26 @@ log = logging.getLogger("Johnny5")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TRADER ARCHETYPES
+# ENUMERATIONS
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TraderMode(Enum):
-    QUANT       = "quant"
-    DOMAHHHH    = "domahhhh"
-    GAETEND     = "gaetend"
-    DEBL00B     = "debl00b"
-    SUDEITH     = "sudeith"
+class Regime(Enum):
+    TRENDING_UP   = "TRENDING_UP"
+    TRENDING_DOWN = "TRENDING_DOWN"
+    RANGING       = "RANGING"
+    HIGH_VOL      = "HIGH_VOL"
+    UNKNOWN       = "UNKNOWN"
 
 
-PROFILES: dict = {
-    TraderMode.QUANT: {
-        "description":  "Regime-aware quant. Adaptive OB threshold. Kelly 35%.",
-        "min_price":    25,
-        "max_price":    75,
-        "kelly_frac":   float(os.environ.get("KELLY_FRACTION", "0.35")),
-        "ob_thresh":    float(os.environ.get("OB_THRESH", "0.58")),
-        "vol_filter":   "both",
-        "min_edge":     0.04,
-        "cooldown":     60,
-        "maker_only":   True,
-        "min_spread":   2,
-    },
-    TraderMode.DOMAHHHH: {
-        "description":  "$980K profit archetype. 55-92c contracts.",
-        "min_price":    55,
-        "max_price":    65,
-        "kelly_frac":   0.35,
-        "ob_thresh":    0.60,
-        "vol_filter":   "both",
-        "min_edge":     0.04,
-        "cooldown":     120,
-        "maker_only":   True,
-        "min_spread":   2,
-    },
-    TraderMode.GAETEND: {
-        "description":  "$420K profit. Momentum. Fast entries.",
-        "min_price":    35,
-        "max_price":    65,
-        "kelly_frac":   0.25,
-        "ob_thresh":    0.60,
-        "vol_filter":   "both",
-        "min_edge":     0.03,
-        "cooldown":     45,
-        "maker_only":   False,
-        "min_spread":   1,
-    },
-    TraderMode.DEBL00B: {
-        "description":  "$42M volume. Market-maker. 40-60c contracts.",
-        "min_price":    40,
-        "max_price":    60,
-        "kelly_frac":   0.15,
-        "ob_thresh":    0.55,
-        "vol_filter":   "both",
-        "min_edge":     0.01,
-        "cooldown":     15,
-        "maker_only":   True,
-        "min_spread":   2,
-    },
-    TraderMode.SUDEITH: {
-        "description":  "100hr/wk analyst. Highest edge bar. Momentum required.",
-        "min_price":    40,
-        "max_price":    65,
-        "kelly_frac":   0.30,
-        "ob_thresh":    0.65,
-        "vol_filter":   "both",
-        "min_edge":     0.08,
-        "cooldown":     90,
-        "maker_only":   True,
-        "min_spread":   2,
-    },
-}
+class SessionState(Enum):
+    ACTIVE    = "ACTIVE"
+    RECOVERY  = "RECOVERY"   # post-red session: halved sizing, strict filters
+    HALTED    = "HALTED"     # permanent until restart
+
+
+class TradeDirection(Enum):
+    YES = "YES"
+    NO  = "NO"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -154,47 +85,87 @@ def _require(key: str) -> str:
         raise EnvironmentError(f"Required env var missing: {key}")
     return val
 
-KALSHI_API_KEY_ID    = _require("KALSHI_API_KEY_ID")
-_RAW_PEM             = _require("KALSHI_PRIVATE_KEY_PEM")
-DEMO_MODE            = os.environ.get("DEMO_MODE", "true").lower() == "true"
-TRADE_SIZE_DOLLARS   = float(os.environ.get("TRADE_SIZE_DOLLARS", "5"))
-MAX_DAILY_LOSS       = float(os.environ.get("MAX_DAILY_LOSS_DOLLARS", "20"))
-VOL_HIGH_THRESH      = float(os.environ.get("VOL_HIGH_THRESH", "0.008"))
-POLL_INTERVAL        = int(os.environ.get("POLL_INTERVAL_SECS", "30"))
-MIN_BALANCE_FLOOR    = float(os.environ.get("MIN_BALANCE_FLOOR", "5.00"))
-YES_BREAKEVEN_PRICE  = int(os.environ.get("YES_BREAKEVEN_PRICE", "78"))
 
-_mode_raw = os.environ.get("TRADER_MODE", "quant").lower().strip()
-try:
-    ACTIVE_MODE = TraderMode(_mode_raw)
-except ValueError:
-    log.warning("Unknown TRADER_MODE '%s' — defaulting to QUANT.", _mode_raw)
-    ACTIVE_MODE = TraderMode.QUANT
+def _env_float(key: str, default: float) -> float:
+    try:
+        return float(os.environ.get(key, str(default)))
+    except (TypeError, ValueError):
+        return default
 
-PROFILE  = PROFILES[ACTIVE_MODE]
-BASE_URL = ""
 
-# ── Quantitative safeguard parameters ────────────────────────────────────────
-MINIMUM_CONFIDENCE    = int(os.environ.get("MINIMUM_CONFIDENCE", "55"))
-MIN_OB_DEPTH_DOLLARS  = float(os.environ.get("MIN_OB_DEPTH_DOLLARS", "50.0"))
-MIN_MINUTES_TO_EXPIRY = float(os.environ.get("MIN_MINUTES_TO_EXPIRY", "7.0"))
-REQUIRE_AGREE_MOMENTUM = os.environ.get("REQUIRE_AGREE_MOMENTUM", "true").lower() == "true"
-MAX_BET_FRACTION      = float(os.environ.get("MAX_BET_FRACTION", "0.10"))
-MIN_SAMPLE_TRADES     = int(os.environ.get("MIN_SAMPLE_TRADES", "20"))
-R_SQUARED_THRESHOLD   = float(os.environ.get("R_SQUARED_THRESHOLD", "0.65"))
+def _env_int(key: str, default: int) -> int:
+    try:
+        return int(os.environ.get(key, str(default)))
+    except (TypeError, ValueError):
+        return default
 
-_low_liq_raw = os.environ.get("LOW_LIQ_HOURS_UTC", "0,1,2,3")
-LOW_LIQ_HOURS_UTC: set = {int(h.strip()) for h in _low_liq_raw.split(",") if h.strip()}
 
-LOW_LIQ_START_UTC = int(os.environ.get("LOW_LIQ_START_UTC", "0"))
-LOW_LIQ_END_UTC   = int(os.environ.get("LOW_LIQ_END_UTC", "4"))
-MAX_CONCURRENT_POS = int(os.environ.get("MAX_CONCURRENT_POS", "1"))
-STALE_ORDER_TIMEOUT = int(os.environ.get("STALE_ORDER_TIMEOUT", "300"))
+def _env_bool(key: str, default: bool) -> bool:
+    raw = os.environ.get(key, "").lower().strip()
+    if not raw:
+        return default
+    return raw in ("true", "1", "yes")
 
-MOMENTUM_AGREE_THRESHOLD = float(os.environ.get("MOMENTUM_AGREE_THRESHOLD", "0.15"))
-ALLOW_NEUTRAL_IN_TRENDING = os.environ.get("ALLOW_NEUTRAL_IN_TRENDING", "false").lower() == "true"
-NEUTRAL_R2_FLOOR = float(os.environ.get("NEUTRAL_R2_FLOOR", "0.55"))
-NEUTRAL_OB_DEPTH_FLOOR = float(os.environ.get("NEUTRAL_OB_DEPTH_FLOOR", "3000.0"))
+
+KALSHI_API_KEY_ID   = _require("KALSHI_API_KEY_ID")
+_RAW_PEM            = _require("KALSHI_PRIVATE_KEY_PEM")
+DEMO_MODE           = _env_bool("DEMO_MODE", True)
+POLL_INTERVAL       = _env_int("POLL_INTERVAL_SECS", 30)
+
+# ── Capital & sizing ──────────────────────────────────────────────────────────
+TRADE_SIZE_CAP      = _env_float("TRADE_SIZE_DOLLARS", 5.0)
+MAX_BET_FRACTION    = _env_float("MAX_BET_FRACTION", 0.08)       # 8% of balance
+KELLY_FRACTION      = _env_float("KELLY_FRACTION", 0.30)         # 30% fractional Kelly
+KELLY_RECOVERY_MULT = _env_float("KELLY_RECOVERY_MULT", 0.50)    # halve sizing in recovery
+
+# ── Risk controls ─────────────────────────────────────────────────────────────
+MIN_BALANCE_FLOOR     = _env_float("MIN_BALANCE_FLOOR", 5.0)
+MAX_DAILY_LOSS        = _env_float("MAX_DAILY_LOSS_DOLLARS", 15.0)
+SESSION_STOP_FRACTION = _env_float("SESSION_STOP_FRACTION", 0.40)  # halt at 40% drawdown
+MAX_CONSEC_LOSSES     = _env_int("MAX_CONSEC_LOSSES", 2)
+STREAK_PAUSE_SECS     = _env_int("STREAK_PAUSE_SECS", 1800)
+STALE_ORDER_TIMEOUT   = _env_int("STALE_ORDER_TIMEOUT", 300)
+MAX_CONCURRENT_POS    = _env_int("MAX_CONCURRENT_POS", 1)
+MIN_SAMPLE_TRADES     = _env_int("MIN_SAMPLE_TRADES", 20)
+
+# ── Regime detection ──────────────────────────────────────────────────────────
+R2_TREND_THRESHOLD    = _env_float("R2_TREND_THRESHOLD", 0.70)
+VOLATILITY_CAP_PCT    = _env_float("VOLATILITY_CAP_PCT", 0.18)   # max 0.18% mean abs return/bar
+VOL_CIRCUIT_BREAKER   = _env_float("VOL_CIRCUIT_BREAKER", 0.40)  # single-bar spike kills session
+TREND_LOOKBACK        = _env_int("TREND_LOOKBACK", 12)           # bars for regression
+MIN_PRICES_FOR_REGIME = _env_int("MIN_PRICES_FOR_REGIME", 10)
+
+# ── Signal thresholds ─────────────────────────────────────────────────────────
+MIN_OB_DEPTH          = _env_float("MIN_OB_DEPTH_DOLLARS", 75.0)
+OB_IMBALANCE_THRESH   = _env_float("OB_IMBALANCE_THRESH", 0.62)
+MOMENTUM_THRESH_PCT   = _env_float("MOMENTUM_THRESH_PCT", 0.15)  # % move to call directional
+MIN_EDGE_PCT          = _env_float("MIN_EDGE_PCT", 0.06)          # 6% minimum EV edge
+MIN_CONFIDENCE        = _env_int("MIN_CONFIDENCE", 60)
+MIN_WIN_PROB          = _env_float("MIN_WIN_PROB", 0.60)          # never trade below 60% est win prob
+MIN_MINUTES_TO_EXPIRY = _env_float("MIN_MINUTES_TO_EXPIRY", 6.0)
+YES_BREAKEVEN_PRICE   = _env_int("YES_BREAKEVEN_PRICE", 78)       # cents
+
+# ── Time-of-day filter ────────────────────────────────────────────────────────
+# Sessions scored 0-100. Only trade in UTC hours with score >= MIN_SESSION_SCORE
+# High-quality: 13-22 UTC (US market hours). Low-quality: 0-5 UTC
+SESSION_QUALITY: dict = {
+    0: 20, 1: 10, 2: 10, 3: 10, 4: 15, 5: 30,
+    6: 45, 7: 50, 8: 60, 9: 65, 10: 70, 11: 75,
+    12: 80, 13: 90, 14: 95, 15: 95, 16: 95, 17: 90,
+    18: 90, 19: 85, 20: 80, 21: 75, 22: 65, 23: 45,
+}
+MIN_SESSION_SCORE = _env_int("MIN_SESSION_SCORE", 60)
+
+# ── Bayesian priors ───────────────────────────────────────────────────────────
+# Base rate for OB signal accuracy in live data. Updated via performance guard.
+OB_BASE_ACCURACY       = _env_float("OB_BASE_ACCURACY", 0.635)   # prior win rate given signal
+MOMENTUM_ACCURACY_LIFT = _env_float("MOMENTUM_ACCURACY_LIFT", 0.045)  # additional accuracy when momentum agrees
+NEUTRAL_ACCURACY_DRAG  = _env_float("NEUTRAL_ACCURACY_DRAG", 0.02)    # deduct when no momentum confirm
+
+# ── Recovery protocol ─────────────────────────────────────────────────────────
+RECOVERY_TRIGGER_PCT  = _env_float("RECOVERY_TRIGGER_PCT", 0.10)  # enter recovery if session loss > 10%
+RECOVERY_EXIT_TRADES  = _env_int("RECOVERY_EXIT_TRADES", 5)       # min trades before exiting recovery
+RECOVERY_WIN_RATE_MIN = _env_float("RECOVERY_WIN_RATE_MIN", 0.60) # must show >= 60% WR to exit recovery
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -223,7 +194,7 @@ try:
     _private_key = serialization.load_pem_private_key(
         KALSHI_PRIVATE_KEY_PEM.encode("utf-8"), password=None,
     )
-    log.info("✅ RSA private key loaded successfully.")
+    log.info("✅ RSA private key loaded.")
 except Exception as e:
     raise ValueError(f"Failed to load PEM key: {e}") from e
 
@@ -250,28 +221,30 @@ def _auth_headers(method: str, path: str) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# HTTP SESSION
+# HTTP
 # ─────────────────────────────────────────────────────────────────────────────
-_http_session: requests.Session = requests.Session()
+
+_http = requests.Session()
+BASE_URL = ""
 
 
 def _get(path: str, params: Optional[dict] = None) -> dict:
-    r = _http_session.get(BASE_URL + path, params=params,
-                          headers=_auth_headers("GET", path), timeout=12)
+    r = _http.get(BASE_URL + path, params=params,
+                  headers=_auth_headers("GET", path), timeout=12)
     r.raise_for_status()
     return r.json()
 
 
 def _post(path: str, body: dict) -> dict:
-    r = _http_session.post(BASE_URL + path, json=body,
-                           headers=_auth_headers("POST", path), timeout=12)
+    r = _http.post(BASE_URL + path, json=body,
+                   headers=_auth_headers("POST", path), timeout=12)
     r.raise_for_status()
     return r.json()
 
 
 def _delete(path: str) -> dict:
-    r = _http_session.delete(BASE_URL + path,
-                             headers=_auth_headers("DELETE", path), timeout=12)
+    r = _http.delete(BASE_URL + path,
+                     headers=_auth_headers("DELETE", path), timeout=12)
     r.raise_for_status()
     return r.json()
 
@@ -280,241 +253,516 @@ def init_base_url() -> None:
     global BASE_URL
     for host in ["https://api.elections.kalshi.com", "https://trading-api.kalshi.com"]:
         try:
-            r = _http_session.get(host + "/trade-api/v2/exchange/status", timeout=6)
+            r = _http.get(host + "/trade-api/v2/exchange/status", timeout=6)
             if r.status_code == 200:
                 BASE_URL = host + "/trade-api/v2"
-                log.info("✅ API host confirmed: %s", host)
+                log.info("✅ API host: %s", host)
                 return
         except Exception:
             continue
     BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
-    log.warning("Host probe failed — using default")
+    log.warning("Host probe failed — using default.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# STATE
+# GLOBAL STATE
 # ─────────────────────────────────────────────────────────────────────────────
 
-btc_prices:    deque = deque(maxlen=30)
-trade_history: deque = deque(maxlen=200)
-open_orders:   dict  = {}
+# Price history
+btc_prices:  deque = deque(maxlen=60)   # 30-min window at 30s intervals
+btc_returns: deque = deque(maxlen=59)   # pct returns between consecutive prices
+
+# Trade state
+open_orders:    dict = {}
 active_tickers: set  = set()
-
-paper_balance:         float = 25.0
-paper_daily_pnl:       float = 0.0
-session_start_balance: float = 0.0
-session_stop_threshold: float = 0.0
-daily_pnl:             float = 0.0
-last_trade_ts:         float = -9999.0
-last_daily_summary_ts: float = 0.0
-consecutive_losses:    int   = 0
-last_signal_desc:      str   = "none yet"
-running_pnl:           float = 0.0
-last_heartbeat_ts:     float = 0.0
-
-streak_pause_until:    float = 0.0
-live_wins:             int   = 0
-live_losses:           int   = 0
-
-_last_known_balance:   float = 0.0
-_prev_ob: dict = {}
-_shutdown_requested: bool = False
-
-_processed_position_ids: Set[str] = set()
-_processed_settlement_ids: Set[str] = set()
-_session_start_ts: str = ""
-
-_session_halted: bool = False
+trade_history:  deque = deque(maxlen=500)
 session_traded_tickers: Set[str] = set()
+_processed_settlement_ids: Set[str] = set()
+
+# Session accounting
+paper_balance:          float = 25.0
+paper_daily_pnl:        float = 0.0
+session_start_balance:  float = 0.0
+session_stop_threshold: float = 0.0
+live_wins:              int   = 0
+live_losses:            int   = 0
+consecutive_losses:     int   = 0
+streak_pause_until:     float = 0.0
+running_pnl:            float = 0.0
+daily_pnl:              float = 0.0
+last_trade_ts:          float = -9999.0
+last_heartbeat_ts:      float = 0.0
+last_daily_summary_ts:  float = 0.0
+last_signal_desc:       str   = "none yet"
+
+# Session management
+session_state:     SessionState = SessionState.ACTIVE
+recovery_trades:   int          = 0
+_session_start_ts: str          = ""
+_session_halted:   bool         = False
+_shutdown_requested: bool       = False
+_last_known_balance: float      = 0.0
+
+# OB history for trend detection
+_prev_ob: dict = {}
+
+# Circuit breaker state
+_vol_circuit_open:   bool  = False
+_vol_circuit_until:  float = 0.0
+
+# Performance tracking (Bayesian update)
+_live_prior: float = OB_BASE_ACCURACY
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIGTERM HANDLER
+# SIGTERM
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _sigterm_handler(signum, frame):
     global _shutdown_requested
     _shutdown_requested = True
-    log.info("SIGTERM received — initiating graceful shutdown.")
+    log.info("SIGTERM — graceful shutdown.")
 
 
 signal.signal(signal.SIGTERM, _sigterm_handler)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TELEGRAM
-# ─────────────────────────────────────────────────────────────────────────────
-
-def telegram_boot(balance: float) -> None:
-    mode = "📋 PAPER" if DEMO_MODE else "🔴 LIVE"
-    tg.send_telegram_message(
-        f"🤖 Johnny5 {BOT_VERSION} STARTED\n"
-        f"Mode: {mode} | Archetype: {ACTIVE_MODE.value.upper()}\n"
-        f"Balance: ${balance:.2f} | Max bet: ${TRADE_SIZE_DOLLARS:.2f}\n"
-        f"Daily loss cap: ${MAX_DAILY_LOSS:.2f} | Floor: ${MIN_BALANCE_FLOOR:.2f}\n"
-        f"Conf≥{MINIMUM_CONFIDENCE} | OB≥{PROFILE['ob_thresh']*100:.0f}% | R²≥{R_SQUARED_THRESHOLD}\n"
-        f"MinDepth≥${MIN_OB_DEPTH_DOLLARS:.0f} | MinMins≥{MIN_MINUTES_TO_EXPIRY:.0f}\n"
-        f"NeutralOBFloor=${NEUTRAL_OB_DEPTH_FLOOR:.0f} | LowLiqEnd=UTC{LOW_LIQ_END_UTC}\n"
-        f"v8.6.0: API field migration (yes_price_dollars + realized_pnl_dollars)"
-    )
-
-
-def telegram_halt(reason: str, balance: float) -> None:
-    tg.send_telegram_message(f"⛔ Johnny5 HALTED (PERMANENT THIS SESSION)\nReason: {reason}\nBalance: ${balance:.2f}")
-
-
-def telegram_daily_summary(balance: float, pnl: float, wins: int, losses: int) -> None:
-    total = wins + losses
-    wr    = wins / total * 100 if total > 0 else 0.0
-    emoji = "📈" if pnl >= 0 else "📉"
-    ci_str = ""
-    if total >= 10:
-        wlb = wilson_lower_bound(wins, total)
-        ci_str = f" (WilsonLB: {wlb*100:.0f}%)"
-    tg.send_telegram_message(
-        f"{emoji} Daily Summary\n"
-        f"P&L: ${pnl:+.2f} | Balance: ${balance:.2f}\n"
-        f"Trades: {total} | WR: {wr:.0f}%{ci_str} ({wins}W/{losses}L)"
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # BTC PRICE FEED
 # ─────────────────────────────────────────────────────────────────────────────
 
-_btc_feed_backoff_until: float = 0.0
+_btc_backoff_until: float = 0.0
+
 
 def fetch_btc_price() -> Optional[float]:
-    global _btc_feed_backoff_until
-    if time.time() < _btc_feed_backoff_until:
+    global _btc_backoff_until
+    if time.time() < _btc_backoff_until:
         return None
+    # Primary: Kraken
     try:
         r = requests.get("https://api.kraken.com/0/public/Ticker?pair=XBTUSD", timeout=5)
         if r.status_code == 200:
-            data = r.json()
-            result = data.get("result", {})
+            result = r.json().get("result", {})
             if result:
                 key = next(iter(result))
-                return float(result[key]["c"][0])
+                price = float(result[key]["c"][0])
+                if price > 1000:
+                    return price
     except Exception:
         pass
+    # Fallback: Coinbase
     try:
         r = requests.get("https://api.coinbase.com/v2/prices/BTC-USD/spot", timeout=5)
         if r.status_code == 200:
-            return float(r.json()["data"]["amount"])
+            price = float(r.json()["data"]["amount"])
+            if price > 1000:
+                return price
     except Exception:
         pass
-    log.debug("BTC price feed unavailable — backing off 5 min")
-    _btc_feed_backoff_until = time.time() + 300
+    _btc_backoff_until = time.time() + 300
+    log.debug("BTC feed failed — backing off 5 min")
     return None
 
 
-def btc_momentum_signal(ob_direction: str) -> tuple[str, float]:
-    if len(btc_prices) < 4:
-        return "NEUTRAL", 0.0
+def ingest_btc_price() -> None:
+    """Fetch BTC price, append to deque, compute return."""
+    price = fetch_btc_price()
+    if price is None:
+        return
+    if btc_prices:
+        prev = btc_prices[-1]
+        if prev > 0:
+            ret = (price - prev) / prev * 100.0
+            btc_returns.append(ret)
+    btc_prices.append(price)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# REGIME ENGINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _linear_regression(ys: list) -> Tuple[float, float, float]:
+    """Return slope, intercept, r_squared for a list of y values (x = 0,1,...n-1)."""
+    n = len(ys)
+    if n < 3:
+        return 0.0, ys[0] if ys else 0.0, 0.0
+    xs = list(range(n))
+    mx = (n - 1) / 2.0
+    my = sum(ys) / n
+    ss_xx = sum((x - mx) ** 2 for x in xs)
+    ss_xy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    ss_yy = sum((y - my) ** 2 for y in ys)
+    if ss_xx == 0 or ss_yy == 0:
+        return 0.0, my, 0.0
+    slope = ss_xy / ss_xx
+    intercept = my - slope * mx
+    r_squared = (ss_xy ** 2) / (ss_xx * ss_yy)
+    return slope, intercept, r_squared
+
+
+def compute_regime() -> Tuple[Regime, float, float]:
+    """
+    Returns (regime, r_squared, realized_vol_pct).
+
+    Regime classification hierarchy:
+      1. HIGH_VOL: mean absolute return per bar > VOLATILITY_CAP_PCT
+      2. TRENDING_UP / TRENDING_DOWN: R² > R2_TREND_THRESHOLD on last TREND_LOOKBACK bars
+      3. RANGING: sufficient data but no trend
+      4. UNKNOWN: insufficient data
+    """
+    if len(btc_prices) < MIN_PRICES_FOR_REGIME:
+        return Regime.UNKNOWN, 0.0, 0.0
+
+    prices = list(btc_prices)[-TREND_LOOKBACK:]
+    returns = list(btc_returns)[-(TREND_LOOKBACK - 1):]
+
+    # Realized volatility: mean absolute return
+    if returns:
+        realized_vol = sum(abs(r) for r in returns) / len(returns)
+    else:
+        realized_vol = 0.0
+
+    # Circuit breaker: single-bar spike
+    if returns and max(abs(r) for r in returns[-3:]) > VOL_CIRCUIT_BREAKER:
+        log.warning("VOL CIRCUIT │ single-bar spike %.3f%% — regime=HIGH_VOL", max(abs(r) for r in returns[-3:]))
+        return Regime.HIGH_VOL, 0.0, realized_vol
+
+    if realized_vol > VOLATILITY_CAP_PCT:
+        log.info("Regime │ HIGH_VOL (vol=%.4f%% > cap=%.4f%%)", realized_vol, VOLATILITY_CAP_PCT)
+        return Regime.HIGH_VOL, 0.0, realized_vol
+
+    slope, _, r_squared = _linear_regression(prices)
+
+    if r_squared >= R2_TREND_THRESHOLD:
+        regime = Regime.TRENDING_UP if slope > 0 else Regime.TRENDING_DOWN
+        log.info("Regime │ %s (R²=%.3f, slope=%.2f)", regime.value, r_squared, slope)
+        return regime, r_squared, realized_vol
+
+    log.info("Regime │ RANGING (R²=%.3f)", r_squared)
+    return Regime.RANGING, r_squared, realized_vol
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# VOLATILITY CIRCUIT BREAKER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_vol_circuit() -> bool:
+    """Returns True if circuit is OPEN (trading blocked). Updates state."""
+    global _vol_circuit_open, _vol_circuit_until
+
+    if _vol_circuit_open:
+        if time.time() > _vol_circuit_until:
+            _vol_circuit_open = False
+            log.info("Vol circuit breaker CLOSED — resuming.")
+        else:
+            mins_left = (_vol_circuit_until - time.time()) / 60.0
+            log.info("Vol circuit OPEN — %.1f min remaining.", mins_left)
+            return True
+
+    if len(btc_returns) < 3:
+        return False
+
+    recent = list(btc_returns)[-6:]
+    max_move = max(abs(r) for r in recent)
+    if max_move > VOL_CIRCUIT_BREAKER:
+        _vol_circuit_open  = True
+        _vol_circuit_until = time.time() + 1800  # 30-min cooling period
+        log.warning("Vol circuit OPENED — max_move=%.3f%% > cap=%.3f%%", max_move, VOL_CIRCUIT_BREAKER)
+        tg.send_telegram_message(
+            f"⚡ VOL CIRCUIT BREAKER OPENED\n"
+            f"Max recent move: {max_move:.3f}%\nTrading paused 30 min."
+        )
+        return True
+
+    return False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MOMENTUM SIGNAL
+# ─────────────────────────────────────────────────────────────────────────────
+
+def compute_momentum(ob_direction: str) -> Tuple[str, float]:
+    """
+    Returns (verdict, accuracy_adjustment).
+    verdict: AGREE | CONFLICT | NEUTRAL
+    accuracy_adjustment: added to base prior for Bayesian estimate
+    """
+    if len(btc_prices) < 5:
+        return "NEUTRAL", -NEUTRAL_ACCURACY_DRAG
+
     prices = list(btc_prices)
+    # Use 4-bar lookback (~2 minutes at 30s intervals)
     recent  = prices[-1]
     earlier = prices[-4]
     if earlier <= 0:
-        return "NEUTRAL", 0.0
-    move_pct = (recent - earlier) / earlier * 100
-    btc_direction = "yes" if move_pct > 0 else "no" if move_pct < 0 else "flat"
-    ob_dir_lower  = ob_direction.lower()
-    if abs(move_pct) < MOMENTUM_AGREE_THRESHOLD:
-        return "NEUTRAL", 0.0
-    if btc_direction == ob_dir_lower:
-        boost = min(0.06, abs(move_pct) * 0.5)
-        return "AGREE", boost
+        return "NEUTRAL", -NEUTRAL_ACCURACY_DRAG
+
+    move_pct = (recent - earlier) / earlier * 100.0
+    btc_dir  = "YES" if move_pct > 0 else ("NO" if move_pct < 0 else "FLAT")
+    ob_dir   = ob_direction.upper()
+
+    if abs(move_pct) < MOMENTUM_THRESH_PCT:
+        return "NEUTRAL", -NEUTRAL_ACCURACY_DRAG
+
+    if btc_dir == ob_dir:
+        # Scale accuracy lift with move magnitude (capped at 2x base lift)
+        magnitude_scale = min(2.0, abs(move_pct) / MOMENTUM_THRESH_PCT)
+        return "AGREE", MOMENTUM_ACCURACY_LIFT * magnitude_scale
+
+    return "CONFLICT", 0.0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ORDER BOOK ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _parse_ob_levels(levels: list, lo: float, hi: float) -> Tuple[float, int]:
+    """Sum dollar depth within price range [lo, hi]. Returns (depth, level_count)."""
+    depth = 0.0
+    count = 0
+    for entry in levels:
+        try:
+            price = float(entry[0])
+            size  = float(entry[1])
+            if lo <= price <= hi and size > 0:
+                depth += size
+                count += 1
+        except Exception:
+            pass
+    return depth, count
+
+
+def analyze_order_book(ob_data: dict, yes_mid: int) -> Optional[dict]:
+    """
+    Returns None if book fails quality checks (thin, ghost, balanced).
+    Otherwise returns quality dict with signal direction and statistics.
+    """
+    ob_fp      = ob_data.get("orderbook_fp", {})
+    yes_levels = ob_fp.get("yes_dollars", [])
+    no_levels  = ob_fp.get("no_dollars",  [])
+
+    near = 10  # ±10 cents of mid
+    y_lo = (yes_mid - near) / 100.0
+    y_hi = (yes_mid + near) / 100.0
+    n_mid = (100 - yes_mid) / 100.0
+    n_lo  = n_mid - near / 100.0
+    n_hi  = n_mid + near / 100.0
+
+    yes_depth, yes_lc = _parse_ob_levels(yes_levels, y_lo, y_hi)
+    no_depth,  no_lc  = _parse_ob_levels(no_levels,  n_lo, n_hi)
+    total = yes_depth + no_depth
+
+    # Depth floor
+    if total < MIN_OB_DEPTH:
+        log.info("OB │ depth $%.0f < min $%.0f — no signal", total, MIN_OB_DEPTH)
+        return None
+
+    # Ghost OB: one side has zero levels — no counterparty to fill against
+    if yes_lc == 0 or no_lc == 0:
+        log.info("OB │ ghost book (YES:%d levels, NO:%d levels) — skipping", yes_lc, no_lc)
+        return None
+
+    yr = yes_depth / total
+    nr = no_depth  / total
+
+    # Adaptive threshold: deeper books relax imbalance requirement
+    if total >= 5000:
+        eff_thresh = max(0.58, OB_IMBALANCE_THRESH - 0.04)
+    elif total >= 500:
+        eff_thresh = max(0.58, OB_IMBALANCE_THRESH - 0.02)
+    elif total < 20:
+        eff_thresh = min(0.80, OB_IMBALANCE_THRESH + 0.08)
     else:
-        return "CONFLICT", 0.0
+        eff_thresh = OB_IMBALANCE_THRESH
+
+    if yr >= eff_thresh:
+        direction = "YES"
+        imbalance = yr
+    elif nr >= eff_thresh:
+        direction = "NO"
+        imbalance = nr
+    else:
+        log.info("OB │ no dominant side (YES:%.1f%% NO:%.1f%% thresh:%.1f%%)",
+                 yr * 100, nr * 100, eff_thresh * 100)
+        return None
+
+    log.info("OB │ %s %.1f%% │ depth=$%.0f │ thresh=%.1f%%",
+             direction, imbalance * 100, total, eff_thresh * 100)
+
+    return {
+        "direction":    direction,
+        "imbalance":    imbalance,
+        "total_depth":  total,
+        "yes_depth":    yes_depth,
+        "no_depth":     no_depth,
+        "yes_lc":       yes_lc,
+        "no_lc":        no_lc,
+        "eff_thresh":   eff_thresh,
+    }
 
 
-def update_btc_price(market: dict) -> None:
-    price = fetch_btc_price()
-    if price and price > 1000:
-        btc_prices.append(price)
+def check_ob_trend(ticker: str, direction: str, imbalance: float) -> bool:
+    """
+    True = pressure building or stable. False = fading (block trade).
+    Fading defined as same direction but >10% drop in imbalance ratio.
+    """
+    now  = time.time()
+    prev = _prev_ob.get(ticker)
+    _prev_ob[ticker] = (direction, imbalance, now)
+
+    if prev is None:
+        return True
+
+    prev_dir, prev_imb, prev_ts = prev
+    if now - prev_ts > 600:  # stale — reset
+        return True
+
+    if direction == prev_dir and imbalance < prev_imb - 0.10:
+        log.info("OB trend │ fading %.1f%%→%.1f%% — blocking", prev_imb * 100, imbalance * 100)
+        return False
+
+    return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# REGIME DETECTION
+# BAYESIAN PROBABILITY MODEL
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_btc_regime() -> tuple[str, float]:
-    if len(btc_prices) < 8:
-        return "UNKNOWN", 0.0
-    prices = list(btc_prices)[-10:]
-    n = len(prices)
-    xs     = list(range(n))
-    mean_x = sum(xs) / n
-    mean_y = sum(prices) / n
-    ss_xx  = sum((x - mean_x) ** 2 for x in xs)
-    ss_xy  = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, prices))
-    ss_yy  = sum((y - mean_y) ** 2 for y in prices)
-    if ss_xx == 0 or ss_yy == 0:
-        return "UNKNOWN", 0.0
-    r_squared = (ss_xy ** 2) / (ss_xx * ss_yy)
-    returns = [abs((prices[i] - prices[i - 1]) / prices[i - 1])
-               for i in range(1, n) if prices[i - 1] > 0]
-    mean_abs_return = sum(returns) / len(returns) if returns else 0.0
-    if mean_abs_return > 0.0015:
-        log.info("Regime │ HIGH_VOL (mean_abs_ret=%.4f%%, R²=%.2f)",
-                 mean_abs_return * 100, r_squared)
-        return "HIGH_VOL", r_squared
-    if r_squared > R_SQUARED_THRESHOLD:
-        direction = "UP" if ss_xy > 0 else "DOWN"
-        log.info("Regime │ TRENDING %s (R²=%.2f)", direction, r_squared)
-        return "TRENDING", r_squared
-    log.info("Regime │ RANGING (R²=%.2f)", r_squared)
-    return "RANGING", r_squared
+def bayesian_win_prob(
+    ob: dict,
+    momentum_verdict: str,
+    momentum_adj: float,
+    regime: Regime,
+    r_squared: float,
+    realized_vol: float,
+) -> float:
+    """
+    Estimate true win probability using Bayesian update from priors.
 
+    Prior: OB_BASE_ACCURACY (empirical accuracy of this signal class)
+    Likelihood updates:
+      + momentum confirms → +lift
+      - neutral momentum  → -drag
+      + high R² trend     → +bonus
+      + deep book         → +small bonus
+      - conflict          → return 0 (already blocked upstream)
 
-# ─────────────────────────────────────────────────────────────────────────────
-# UTILITY
-# ─────────────────────────────────────────────────────────────────────────────
+    Constrains final estimate to [0.50, 0.92] — never overconfident.
+    """
+    prior = _live_prior  # updated by performance guard over time
 
-def minutes_to_expiry(market: dict) -> float:
-    close_time_str = market.get("close_time")
-    if not close_time_str:
-        return 999.0
-    try:
-        close_dt = datetime.fromisoformat(close_time_str.replace("Z", "+00:00"))
-        now_dt   = datetime.now(timezone.utc)
-        delta    = (close_dt - now_dt).total_seconds() / 60.0
-        return max(0.0, delta)
-    except Exception:
-        return 999.0
+    # Regime adjustment
+    if regime in (Regime.TRENDING_UP, Regime.TRENDING_DOWN):
+        r2_bonus = (r_squared - R2_TREND_THRESHOLD) * 0.10
+        regime_adj = 0.02 + r2_bonus
+    else:
+        regime_adj = 0.0
+
+    # Depth adjustment: log-scale benefit for deeper books
+    depth_adj = 0.0
+    if ob["total_depth"] > 500:
+        depth_adj = min(0.02, math.log10(ob["total_depth"] / 500) * 0.02)
+
+    # Volatility penalty: higher vol → lower predictability
+    vol_penalty = min(0.04, realized_vol / VOLATILITY_CAP_PCT * 0.04)
+
+    win_prob = prior + momentum_adj + regime_adj + depth_adj - vol_penalty
+    win_prob = max(0.50, min(0.92, win_prob))
+
+    log.info("WinProb │ prior=%.3f mom=%.3f regime=%.3f depth=%.3f vol=-%.3f → P=%.3f",
+             prior, momentum_adj, regime_adj, depth_adj, vol_penalty, win_prob)
+    return win_prob
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIDENCE SCORING
 # ─────────────────────────────────────────────────────────────────────────────
 
-def compute_confidence_score(
-    ob_quality: dict, regime: str, r_squared: float,
-    momentum_verdict: str, momentum_boost: float, mins_remaining: float,
+def compute_confidence(
+    ob: dict,
+    regime: Regime,
+    r_squared: float,
+    momentum_verdict: str,
+    win_prob: float,
+    mins_remaining: float,
+    session_score: int,
 ) -> float:
-    imbalance = ob_quality.get("imbalance", 0.5)
-    depth     = ob_quality.get("near_money_depth", 0.0)
-    thresh    = ob_quality.get("effective_thresh", PROFILE["ob_thresh"])
-    imb_pts = max(0.0, (imbalance - thresh) / (1.0 - thresh)) * 30.0
-    if depth <= 50.0:
-        depth_pts = min(10.0, max(0.0, depth / 5.0))
-    else:
-        depth_pts = min(20.0, 10.0 + (depth - 50.0) / 15.0)
-    regime_base = {"TRENDING": 20.0, "UNKNOWN": 5.0, "RANGING": 0.0, "HIGH_VOL": -10.0}
-    regime_pts  = regime_base.get(regime, 0.0)
-    if regime == "TRENDING":
-        regime_pts += min(10.0, (r_squared - R_SQUARED_THRESHOLD) / (1.0 - R_SQUARED_THRESHOLD) * 10.0)
-    momentum_pts = 0.0
-    if momentum_verdict == "AGREE":
-        momentum_pts = min(15.0, momentum_boost * 250.0)
+    """
+    Returns score 0-100. Minimum to trade = MIN_CONFIDENCE.
+
+    Components:
+      OB imbalance strength      0-25
+      OB depth quality           0-15
+      Regime quality             0-20
+      Momentum alignment         0-15
+      Win probability            0-15
+      Time remaining             0-10
+    """
+    # OB imbalance: linear scale from threshold to 1.0
+    thresh = ob["eff_thresh"]
+    imb_pts = max(0.0, (ob["imbalance"] - thresh) / (1.0 - thresh)) * 25.0
+
+    # OB depth: log scale, capped at 15
+    depth_pts = min(15.0, math.log10(max(1, ob["total_depth"] / MIN_OB_DEPTH)) * 10.0)
+
+    # Regime
+    regime_map = {
+        Regime.TRENDING_UP:   20.0,
+        Regime.TRENDING_DOWN: 20.0,
+        Regime.RANGING:       0.0,
+        Regime.HIGH_VOL:      -20.0,
+        Regime.UNKNOWN:       0.0,
+    }
+    regime_pts = regime_map.get(regime, 0.0)
+    if regime in (Regime.TRENDING_UP, Regime.TRENDING_DOWN):
+        regime_pts += min(5.0, (r_squared - R2_TREND_THRESHOLD) * 15.0)
+
+    # Momentum
+    momentum_map = {"AGREE": 15.0, "NEUTRAL": 2.0, "CONFLICT": -20.0}
+    momentum_pts = momentum_map.get(momentum_verdict, 0.0)
+
+    # Win probability contribution
+    prob_pts = max(0.0, (win_prob - 0.50) / 0.42 * 15.0)  # 0 at 50%, 15 at 92%
+
+    # Time remaining
     time_pts = min(10.0, max(0.0,
-        (mins_remaining - MIN_MINUTES_TO_EXPIRY) / max(1.0, 10.0 - MIN_MINUTES_TO_EXPIRY) * 10.0
+        (mins_remaining - MIN_MINUTES_TO_EXPIRY) /
+        max(0.1, 10.0 - MIN_MINUTES_TO_EXPIRY) * 10.0
     ))
-    total = imb_pts + depth_pts + regime_pts + momentum_pts + time_pts
-    log.info("Confidence │ imb=%.1f depth=%.1f regime=%.1f momentum=%.1f time=%.1f → SCORE=%.0f",
-        imb_pts, depth_pts, regime_pts, momentum_pts, time_pts, total)
-    return max(0.0, min(100.0, total))
+
+    total = imb_pts + depth_pts + regime_pts + momentum_pts + prob_pts + time_pts
+    total = max(0.0, min(100.0, total))
+
+    log.info("Conf │ imb=%.1f depth=%.1f regime=%.1f mom=%.1f prob=%.1f time=%.1f → %.0f",
+             imb_pts, depth_pts, regime_pts, momentum_pts, prob_pts, time_pts, total)
+    return total
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EDGE & SIZING
+# ─────────────────────────────────────────────────────────────────────────────
+
+def calc_edge(win_prob: float, contract_price_cents: int) -> float:
+    if contract_price_cents <= 0 or contract_price_cents >= 100:
+        return 0.0
+    net   = (100 - contract_price_cents) / 100.0
+    stake = contract_price_cents / 100.0
+    return (win_prob * net) - ((1.0 - win_prob) * stake)
+
+
+def kelly_bet(win_prob: float, contract_price_cents: int, balance: float) -> float:
+    if contract_price_cents <= 0 or contract_price_cents >= 100:
+        return 0.0
+    b = (100 - contract_price_cents) / float(contract_price_cents)
+    full_kelly = max(0.0, (b * win_prob - (1.0 - win_prob)) / b)
+
+    # Adjust fraction for session state
+    kf = KELLY_FRACTION
+    if session_state == SessionState.RECOVERY:
+        kf *= KELLY_RECOVERY_MULT
+
+    bet = full_kelly * kf * balance
+    return round(min(bet, TRADE_SIZE_CAP, balance * MAX_BET_FRACTION), 2)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -531,16 +779,27 @@ def wilson_lower_bound(wins: int, total: int, z: float = 1.645) -> float:
     return max(0.0, center - spread)
 
 
-def wilson_confidence(wins: int, total: int, z: float = 1.96) -> tuple[float, float, float]:
+def wilson_confidence(wins: int, total: int, z: float = 1.96) -> Tuple[float, float, float]:
     if total == 0:
         return 0.0, 0.0, 0.0
     p      = wins / total
     denom  = 1.0 + z ** 2 / total
     center = (p + z ** 2 / (2.0 * total)) / denom
     spread = (z * (p * (1.0 - p) / total + z ** 2 / (4.0 * total ** 2)) ** 0.5) / denom
-    lo = max(0.0, center - spread) * 100
-    hi = min(1.0, center + spread) * 100
-    return round(p * 100, 1), round(lo, 1), round(hi, 1)
+    return round(p * 100, 1), round(max(0, center - spread) * 100, 1), round(min(1, center + spread) * 100, 1)
+
+
+def update_live_prior() -> None:
+    """Bayesian update of live prior from recent settled trades."""
+    global _live_prior
+    total = live_wins + live_losses
+    if total < 10:
+        return
+    # Blend empirical win rate with starting prior (shrinkage)
+    empirical = live_wins / total
+    weight    = min(1.0, total / 50.0)  # full weight at 50+ trades
+    _live_prior = OB_BASE_ACCURACY * (1.0 - weight) + empirical * weight
+    log.debug("Prior updated → %.3f (empirical=%.3f, weight=%.2f)", _live_prior, empirical, weight)
 
 
 def performance_guard() -> bool:
@@ -549,33 +808,72 @@ def performance_guard() -> bool:
         return True
     wlb = wilson_lower_bound(live_wins, total)
     if wlb < 0.50:
-        log.warning("PERFORMANCE GUARD │ Wilson CI lower bound %.1f%% < 50%%", wlb * 100)
+        log.warning("PERF GUARD │ Wilson LB %.1f%% < 50%%", wlb * 100)
         return False
     return True
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PORTFOLIO
+# SESSION QUALITY
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_session_score() -> int:
+    utc_hour = datetime.now(timezone.utc).hour
+    return SESSION_QUALITY.get(utc_hour, 50)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RECOVERY PROTOCOL
+# ─────────────────────────────────────────────────────────────────────────────
+
+def update_session_state(current_balance: float) -> None:
+    """
+    Evaluate whether to enter, maintain, or exit recovery mode.
+    Recovery: entered when session loss > RECOVERY_TRIGGER_PCT.
+    Exit: after RECOVERY_EXIT_TRADES with WR >= RECOVERY_WIN_RATE_MIN.
+    """
+    global session_state, recovery_trades
+
+    if session_state == SessionState.HALTED:
+        return
+
+    session_loss_pct = (session_start_balance - current_balance) / max(1.0, session_start_balance)
+
+    if session_state == SessionState.ACTIVE:
+        if session_loss_pct > RECOVERY_TRIGGER_PCT:
+            session_state = SessionState.RECOVERY
+            recovery_trades = 0
+            log.warning("SESSION RECOVERY │ Loss %.1f%% > trigger %.1f%%",
+                        session_loss_pct * 100, RECOVERY_TRIGGER_PCT * 100)
+            tg.send_telegram_message(
+                f"⚠️ SESSION RECOVERY MODE\n"
+                f"Loss: {session_loss_pct*100:.1f}%\n"
+                f"Sizing halved. Strict filters only."
+            )
+
+    elif session_state == SessionState.RECOVERY:
+        total_rec = live_wins + live_losses
+        if total_rec >= RECOVERY_EXIT_TRADES:
+            wr = live_wins / total_rec if total_rec > 0 else 0.0
+            if wr >= RECOVERY_WIN_RATE_MIN:
+                session_state = SessionState.ACTIVE
+                log.info("SESSION RECOVERY EXITED │ WR=%.1f%% over %d trades", wr * 100, total_rec)
+                tg.send_telegram_message(f"✅ Recovery mode exited — WR {wr*100:.0f}%")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PORTFOLIO / BALANCE
 # ─────────────────────────────────────────────────────────────────────────────
 
 def get_live_balance(allow_cached_zero: bool = True) -> float:
-    """
-    v8.6.0 FIX: When called at cold start (before _last_known_balance is
-    populated) and the API is unavailable, do NOT silently return 0.0 —
-    that anchors session_stop_threshold to $0 and breaks risk control for
-    the entire session. Caller in main() boot path passes
-    allow_cached_zero=False to force a hard failure.
-    """
     global _last_known_balance
     try:
         data = _get("/portfolio/balance")
-        # v8.6.0: accept both balance (cents) and balance_dollars (string) if the
-        # API returns the newer field. Prefer dollars when available.
-        bal_dollars = data.get("balance_dollars")
-        if bal_dollars is not None:
+        bal_d = data.get("balance_dollars")
+        if bal_d is not None:
             try:
-                bal = float(bal_dollars)
-            except (TypeError, ValueError):
+                bal = float(bal_d)
+            except Exception:
                 bal = (data.get("balance", 0) or 0) / 100.0
         else:
             bal = (data.get("balance", 0) or 0) / 100.0
@@ -585,238 +883,195 @@ def get_live_balance(allow_cached_zero: bool = True) -> float:
         if not allow_cached_zero and _last_known_balance <= 0.0:
             log.error("Balance fetch failed with no cached value: %s", e)
             raise
-        log.warning("Balance fetch failed: %s — using cached $%.2f", e, _last_known_balance)
+        log.warning("Balance fetch failed: %s — cached $%.2f", e, _last_known_balance)
         return _last_known_balance
 
 
-def _extract_realized_dollars(record: dict) -> Optional[float]:
-    """
-    v8.6.0: Extract realized P&L in dollars from a settlement or position
-    record, handling Kalshi's field migration (March 12, 2026).
-
-    Priority:
-      1. realized_pnl_dollars (string dollars)  — current API
-      2. realized_pnl_cents (int cents)         — transitional
-      3. realized_pnl (int cents)               — legacy
-      4. settlement_pnl_dollars / pnl_dollars   — settlements endpoint variants
-
-    Returns None if no recognizable field present.
-    """
+def _extract_realized_dollars(rec: dict) -> Optional[float]:
     for k in ("realized_pnl_dollars", "settlement_pnl_dollars", "pnl_dollars"):
-        v = record.get(k)
+        v = rec.get(k)
         if v is not None:
             try:
                 return float(v)
-            except (TypeError, ValueError):
+            except Exception:
                 continue
     for k in ("realized_pnl_cents", "realized_pnl", "settlement_pnl", "pnl"):
-        v = record.get(k)
+        v = rec.get(k)
         if v is not None:
             try:
                 return float(v) / 100.0
-            except (TypeError, ValueError):
+            except Exception:
                 continue
     return None
 
 
-def _extract_ticker(record: dict) -> str:
-    """v8.6.0: ticker field with fallback chain."""
+def _extract_ticker(rec: dict) -> str:
     for k in ("market_ticker", "ticker", "event_ticker"):
-        v = record.get(k)
+        v = rec.get(k)
         if v:
             return str(v)
     return ""
 
 
 def _fetch_settled_records(since_ts: str) -> list:
-    """
-    v8.6.0: Fetch settled records with settlements-primary, positions-fallback
-    strategy per documented API guidance.
-    """
-    # Primary: /portfolio/settlements
+    """Settlements-primary, positions-fallback."""
     try:
         data = _get("/portfolio/settlements", {"limit": 100})
         recs = data.get("settlements") or data.get("market_settlements") or []
         if recs:
-            log.debug("RESOLVE │ Using /portfolio/settlements (%d records)", len(recs))
             return recs
     except Exception as e:
-        log.debug("Settlements endpoint failed: %s — falling back to positions", e)
-
-    # Fallback: /portfolio/positions?settlement_status=settled
+        log.debug("Settlements endpoint failed: %s", e)
     try:
         data = _get("/portfolio/positions", {
             "limit": 100,
             "settlement_status": "settled",
             "created_since": since_ts,
         })
-        recs = data.get("market_positions", [])
-        log.debug("RESOLVE │ Using /portfolio/positions fallback (%d records)", len(recs))
-        return recs
+        return data.get("market_positions", [])
     except Exception as e:
         log.warning("Both settlement endpoints failed: %s", e)
         return []
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# RESOLUTION
+# ─────────────────────────────────────────────────────────────────────────────
+
 def resolve_open_orders() -> None:
-    """
-    v8.6.0 FIXES:
-      - Settlements endpoint as primary; positions as fallback
-      - realized_pnl_dollars with fallback chain to legacy fields
-      - Ticker extraction with fallback chain
-    """
-    global active_tickers, paper_balance, paper_daily_pnl, consecutive_losses, running_pnl
-    global live_wins, live_losses, streak_pause_until
+    global active_tickers, paper_balance, paper_daily_pnl, consecutive_losses
+    global running_pnl, live_wins, live_losses, streak_pause_until
 
     if not open_orders:
         return
-
-    STREAK_THRESHOLD = int(os.environ.get("MAX_CONSEC_LOSSES", "2"))
-    STREAK_PAUSE_SEC = int(os.environ.get("STREAK_PAUSE_SECS", "1800"))
 
     if DEMO_MODE:
         now = time.time()
         for oid in list(open_orders.keys()):
             trade = open_orders[oid]
-            if now - trade.get("placed_at", now) > 900:
-                open_orders.pop(oid)
-                ticker = trade.get("ticker", "")
-                active_tickers.discard(ticker)
-                count = trade.get("count", 0)
-                cost  = trade.get("cost", 0.0)
-                side  = trade.get("side", "YES").upper()
-                entry_price = trade.get("btc_entry_price", 0)
-                current_btc = fetch_btc_price()
-                if entry_price > 0 and current_btc and current_btc > 1000:
-                    btc_up = current_btc > entry_price
-                    won = btc_up if side == "YES" else not btc_up
-                    sim_method = "btc"
-                else:
-                    import random
-                    won = random.random() < 0.685
-                    sim_method = "rng"
-                if won:
-                    paper_balance   += count
-                    trade_pnl        = round(count - cost, 2)
-                    paper_daily_pnl += trade_pnl
-                else:
-                    trade_pnl        = round(-cost, 2)
-                    paper_daily_pnl += trade_pnl
-                result = "win" if won else "loss"
-                for t in trade_history:
-                    if t.get("order_id") == oid:
-                        t["result"] = result
-                        t["pnl"]    = round(trade_pnl, 4)
-                        break
-                running_pnl += trade_pnl
-                if won:
-                    consecutive_losses = 0
-                    live_wins += 1
-                    tg.send_win_notification(
-                        profit=trade_pnl, balance=paper_balance, daily_pnl=paper_daily_pnl,
-                        ticker=ticker, direction=trade.get("side", "?"),
-                    )
-                else:
-                    consecutive_losses += 1
-                    live_losses += 1
-                    if consecutive_losses >= STREAK_THRESHOLD:
-                        streak_pause_until = time.time() + STREAK_PAUSE_SEC
-                    tg.send_loss_notification(
-                        loss=abs(trade_pnl), balance=paper_balance, daily_pnl=paper_daily_pnl,
-                        ticker=ticker, direction=trade.get("side", "?"), streak=consecutive_losses,
-                    )
-                log.info("📋 PAPER SETTLED │ %s │ %s │ %s │ sim=%s │ bal=$%.2f",
-                    ticker[-15:], trade.get("side", "?"), result.upper(), sim_method, paper_balance)
+            if now - trade.get("placed_at", now) < 900:
+                continue
+            open_orders.pop(oid)
+            ticker = trade.get("ticker", "")
+            active_tickers.discard(ticker)
+            count = trade.get("count", 0)
+            cost  = trade.get("cost", 0.0)
+            side  = trade.get("side", "YES").upper()
+            entry_btc = trade.get("btc_entry_price", 0)
+            cur_btc   = fetch_btc_price()
+
+            if entry_btc > 0 and cur_btc and cur_btc > 1000:
+                btc_up = cur_btc > entry_btc
+                won = btc_up if side == "YES" else not btc_up
+                sim = "btc"
+            else:
+                won = random.random() < _live_prior
+                sim = "rng"
+
+            if won:
+                paper_balance   += count
+                trade_pnl        = round(count - cost, 2)
+                paper_daily_pnl += trade_pnl
+            else:
+                trade_pnl        = round(-cost, 2)
+                paper_daily_pnl += trade_pnl
+
+            running_pnl += trade_pnl
+            result = "win" if won else "loss"
+            for t in trade_history:
+                if t.get("order_id") == oid:
+                    t["result"] = result
+                    t["pnl"]    = round(trade_pnl, 4)
+                    break
+
+            if won:
+                consecutive_losses = 0
+                live_wins += 1
+                tg.send_win_notification(
+                    profit=trade_pnl, balance=paper_balance, daily_pnl=paper_daily_pnl,
+                    ticker=ticker, direction=trade.get("side", "?"),
+                )
+            else:
+                consecutive_losses += 1
+                live_losses += 1
+                if consecutive_losses >= MAX_CONSEC_LOSSES:
+                    streak_pause_until = time.time() + STREAK_PAUSE_SECS
+                tg.send_loss_notification(
+                    loss=abs(trade_pnl), balance=paper_balance, daily_pnl=paper_daily_pnl,
+                    ticker=ticker, direction=trade.get("side", "?"), streak=consecutive_losses,
+                )
+
+            log.info("📋 PAPER SETTLED │ %s │ %s │ %s │ sim=%s │ bal=$%.2f",
+                     ticker[-15:], side, result.upper(), sim, paper_balance)
+
+        update_live_prior()
         return
 
-    # ── Live resolution (v8.6.0: settlements-primary + dollars fields) ───────
+    # ── Live ──────────────────────────────────────────────────────────────────
     try:
-        since_ts = _session_start_ts if _session_start_ts else \
-                   (datetime.now(timezone.utc) - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        since_ts = _session_start_ts or (
+            datetime.now(timezone.utc) - timedelta(hours=2)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-        settled_records = _fetch_settled_records(since_ts)
+        records = _fetch_settled_records(since_ts)
+        log.info("RESOLVE │ %d settled, %d open, %d processed",
+                 len(records), len(open_orders), len(_processed_settlement_ids))
 
-        log.info("RESOLVE │ %d settled records, %d open orders, %d processed",
-                 len(settled_records), len(open_orders), len(_processed_position_ids))
-
-        if settled_records:
-            debug_sample = []
-            for r in settled_records[:5]:
-                debug_sample.append({
-                    "ticker": _extract_ticker(r),
-                    "pnl_dollars": _extract_realized_dollars(r),
-                    "raw_keys": list(r.keys())[:8],
-                })
-            log.info("RESOLVE DEBUG │ sample: %s", debug_sample)
-        if open_orders:
-            log.info("RESOLVE DEBUG │ open_orders keys: %s",
-                     list(open_orders.keys())[:5])
-
-        # Build ticker->order_id map
         ticker_to_oid: dict = {}
         for oid, trade in open_orders.items():
-            ticker = trade.get("ticker", "")
-            if ticker:
-                ticker_to_oid[ticker] = oid
-                ticker_to_oid[ticker.upper()] = oid
+            tk = trade.get("ticker", "")
+            if tk:
+                ticker_to_oid[tk] = oid
+                ticker_to_oid[tk.upper()] = oid
 
-        for rec in settled_records:
-            rec_ticker = _extract_ticker(rec)
+        for rec in records:
+            rec_ticker  = _extract_ticker(rec)
             rec_created = rec.get("created_time") or rec.get("settled_time") or rec.get("timestamp", "")
-            rec_id = f"{rec_ticker}:{rec_created}"
+            rec_id      = f"{rec_ticker}:{rec_created}"
 
-            if rec_id in _processed_position_ids:
+            if rec_id in _processed_settlement_ids:
                 continue
 
-            matched_oid = None
-            if rec_ticker in ticker_to_oid:
-                matched_oid = ticker_to_oid[rec_ticker]
-            if not matched_oid and rec_ticker.upper() in ticker_to_oid:
-                matched_oid = ticker_to_oid[rec_ticker.upper()]
+            matched_oid = ticker_to_oid.get(rec_ticker) or ticker_to_oid.get(rec_ticker.upper())
             if not matched_oid:
                 for oid, trade in list(open_orders.items()):
                     if trade.get("ticker", "").upper() == rec_ticker.upper():
                         matched_oid = oid
                         break
 
+            _processed_settlement_ids.add(rec_id)
             if not matched_oid:
-                log.debug("RESOLVE │ No match for %s", rec_ticker)
-                _processed_position_ids.add(rec_id)
                 continue
-
-            _processed_position_ids.add(rec_id)
 
             trade = open_orders.pop(matched_oid)
             active_tickers.discard(rec_ticker)
             active_tickers.discard(trade.get("ticker", ""))
 
-            realized_dollars = _extract_realized_dollars(rec)
-            if realized_dollars is None:
-                log.warning("RESOLVE │ %s settled but no pnl field found. Keys: %s",
-                            rec_ticker[-15:], list(rec.keys()))
+            pnl_d = _extract_realized_dollars(rec)
+            if pnl_d is None:
+                log.warning("RESOLVE │ %s — no pnl field. Keys: %s", rec_ticker[-15:], list(rec.keys()))
                 continue
 
-            if realized_dollars == 0.0:
-                log.info("📋 NO-FILL │ %s │ pnl=$0.00", rec_ticker[-15:])
+            if pnl_d == 0.0:
+                log.info("NO-FILL │ %s", rec_ticker[-15:])
                 for t in trade_history:
                     if t.get("order_id") == matched_oid:
                         t["result"] = "unfilled"
-                        t["pnl"]    = 0.0
+                        t["pnl"] = 0.0
                         break
                 continue
 
-            won = realized_dollars > 0
-            pnl = round(realized_dollars, 2)
+            won    = pnl_d > 0
+            pnl    = round(pnl_d, 2)
             result = "win" if won else "loss"
-
             for t in trade_history:
                 if t.get("order_id") == matched_oid:
                     t["result"] = result
                     t["pnl"]    = pnl
                     break
 
-            balance = get_live_balance()
-            running_pnl += pnl
+            balance       = get_live_balance()
+            running_pnl  += pnl
             live_daily_pnl = balance - session_start_balance
 
             if won:
@@ -825,11 +1080,11 @@ def resolve_open_orders() -> None:
             else:
                 consecutive_losses += 1
                 live_losses += 1
-                if consecutive_losses >= STREAK_THRESHOLD:
-                    streak_pause_until = time.time() + STREAK_PAUSE_SEC
+                if consecutive_losses >= MAX_CONSEC_LOSSES:
+                    streak_pause_until = time.time() + STREAK_PAUSE_SECS
 
             wlb = wilson_lower_bound(live_wins, live_wins + live_losses)
-            log.info("✅ SETTLED │ %s │ %s │ pnl=$%.2f │ WR=%d/%d │ WilsonLB=%.1f%%",
+            log.info("✅ SETTLED │ %s │ %s │ $%.2f │ WR=%d/%d │ LB=%.1f%%",
                      rec_ticker[-15:], result.upper(), pnl,
                      live_wins, live_wins + live_losses, wlb * 100)
 
@@ -845,29 +1100,30 @@ def resolve_open_orders() -> None:
                     streak=consecutive_losses,
                 )
 
-        # Clean up canceled orders
+        update_live_prior()
+
+        # Canceled order cleanup
         try:
-            canceled_data = _get("/portfolio/orders", {"status": "canceled", "limit": 100})
-            canceled_ids  = {o["order_id"] for o in canceled_data.get("orders", [])}
+            canceled = _get("/portfolio/orders", {"status": "canceled", "limit": 100})
+            canceled_ids = {o["order_id"] for o in canceled.get("orders", [])}
             for oid in list(open_orders.keys()):
                 if oid in canceled_ids:
                     trade = open_orders.pop(oid)
                     active_tickers.discard(trade.get("ticker", ""))
                     log.info("Order canceled │ %s", oid[:12])
-        except Exception as e:
-            log.debug("Canceled order cleanup skipped: %s", e)
+        except Exception:
+            pass
 
-        # Time-based cleanup: >20 min old
+        # Age-based purge: >20 min
         now = time.time()
-        stale = [oid for oid, t in open_orders.items()
-                 if now - t.get("placed_at", now) > 1200]
+        stale = [oid for oid, t in open_orders.items() if now - t.get("placed_at", now) > 1200]
         for oid in stale:
             trade = open_orders.pop(oid)
             active_tickers.discard(trade.get("ticker", ""))
-            log.info("Stale order purged │ >20min old │ %s", trade.get("ticker", "?")[-15:])
+            log.info("Stale purged │ %s", trade.get("ticker", "?")[-15:])
 
     except Exception as e:
-        log.warning("Order resolution error: %s", e)
+        log.warning("Resolution error: %s", e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -875,40 +1131,32 @@ def resolve_open_orders() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def cancel_stale_orders() -> None:
-    """
-    v8.6.0 FIX: Paper mode no longer adds cost to paper_daily_pnl on cancel.
-    Cost was never deducted from paper_daily_pnl at placement time (only from
-    paper_balance), so adding it on cancel fabricated phantom profit equal to
-    the stake. A cancel is P&L-neutral.
-    """
     global paper_balance
     now = time.time()
     for oid in list(open_orders.keys()):
         trade = open_orders[oid]
-        age = now - trade.get("placed_at", now)
-        if age < STALE_ORDER_TIMEOUT:
+        if now - trade.get("placed_at", now) < STALE_ORDER_TIMEOUT:
             continue
         ticker = trade.get("ticker", "")
         cost   = trade.get("cost", 0.0)
         if DEMO_MODE:
             open_orders.pop(oid)
             active_tickers.discard(ticker)
-            paper_balance += cost   # refund stake to balance only
-            # paper_daily_pnl is NOT touched — cancel is P&L-neutral
+            paper_balance += cost  # refund only — no daily_pnl touch
             for t in trade_history:
                 if t.get("order_id") == oid:
                     t["result"] = "canceled"
                     t["pnl"]    = 0.0
                     break
-            log.info("Stale cancel (paper) │ %s │ refund $%.2f", ticker[-15:], cost)
+            log.info("Stale cancel (paper) │ %s │ $%.2f refunded", ticker[-15:], cost)
         else:
             try:
                 _delete(f"/portfolio/orders/{oid}")
                 open_orders.pop(oid)
                 active_tickers.discard(ticker)
-                log.info("Stale cancel (live) │ %s │ order %s", ticker[-15:], oid[:12])
+                log.info("Stale cancel (live) │ %s │ %s", ticker[-15:], oid[:12])
             except Exception as e:
-                log.warning("Failed to cancel stale order %s: %s", oid[:12], e)
+                log.warning("Stale cancel failed %s: %s", oid[:12], e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -917,160 +1165,65 @@ def cancel_stale_orders() -> None:
 
 BTC_SERIES = ["KXBTC15M", "KXBTCD", "KXBTC"]
 
-def get_active_btc_market() -> Optional[dict]:
+
+def _to_cents(val) -> int:
+    try:
+        return int(round(float(val) * 100))
+    except Exception:
+        return 0
+
+
+def get_active_market() -> Optional[dict]:
     for series in BTC_SERIES:
         try:
-            data = _get("/markets", {"series_ticker": series, "status": "open", "limit": 20})
+            data    = _get("/markets", {"series_ticker": series, "status": "open", "limit": 20})
             markets = data.get("markets", [])
             if not markets:
                 continue
-            log.info("Series %s: %d open markets", series, len(markets))
-            def to_cents(val):
-                try:    return int(round(float(val) * 100))
-                except: return 0
-            valid = [m for m in markets
-                     if to_cents(m.get("yes_bid_dollars")) > 0
-                     and to_cents(m.get("yes_ask_dollars")) > 0
-                     and to_cents(m.get("yes_bid_dollars")) < to_cents(m.get("yes_ask_dollars"))]
+            valid = []
+            for m in markets:
+                bid = _to_cents(m.get("yes_bid_dollars"))
+                ask = _to_cents(m.get("yes_ask_dollars"))
+                if bid > 0 and ask > 0 and bid < ask:
+                    m["yes_bid"] = bid
+                    m["yes_ask"] = ask
+                    m["yes_mid"] = (bid + ask) // 2
+                    valid.append(m)
             if not valid:
                 continue
-            for m in valid:
-                m["yes_bid"] = to_cents(m.get("yes_bid_dollars"))
-                m["yes_ask"] = to_cents(m.get("yes_ask_dollars"))
-                m["yes_mid"] = (m["yes_bid"] + m["yes_ask"]) // 2
             valid.sort(key=lambda m: abs(m["yes_mid"] - 50))
             m0 = valid[0]
-            log.info("✅ Market: %s (bid=%dc mid=%dc ask=%dc)",
-                m0.get("ticker"), m0["yes_bid"], m0["yes_mid"], m0["yes_ask"])
+            log.info("Market │ %s bid=%dc mid=%dc ask=%dc",
+                     m0.get("ticker"), m0["yes_bid"], m0["yes_mid"], m0["yes_ask"])
             return m0
         except Exception as e:
-            log.warning("Market discovery failed for %s: %s", series, e)
+            log.warning("Market discovery %s: %s", series, e)
     return None
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# ORDER BOOK ANALYSIS
-# ─────────────────────────────────────────────────────────────────────────────
 
 def get_order_book(ticker: str) -> dict:
     return _get(f"/markets/{ticker}/orderbook")
 
 
-def adaptive_ob_threshold(total_depth: float) -> float:
-    default = PROFILE["ob_thresh"]
-    if total_depth < 15.0:
-        return max(default, 0.70)
-    elif total_depth >= 50.0:
-        return min(default, 0.58)
-    else:
-        return default
-
-
-def ob_trend_check(ticker: str, current_imb: float, current_dir: str) -> bool:
-    now = time.time()
-    prev = _prev_ob.get(ticker)
-    if prev is None:
-        _prev_ob[ticker] = (current_imb, current_dir, now)
-        return True
-    prev_imb, prev_dir, prev_time = prev
-    _prev_ob[ticker] = (current_imb, current_dir, now)
-    if now - prev_time > 600:
-        return True
-    if current_dir == prev_dir and current_imb < prev_imb - 0.10:
-        log.info("OB trend │ Fading %.0f%%→%.0f%%. Blocking.",
-                 prev_imb * 100, current_imb * 100)
-        return False
-    return True
-
-
-def calc_ob_quality(ob_data: dict, yes_mid: int) -> dict:
-    ob_fp = ob_data.get("orderbook_fp", {})
-    yes_levels = ob_fp.get("yes_dollars", [])
-    no_levels  = ob_fp.get("no_dollars",  [])
-    near = 10
-    y_lo, y_hi = (yes_mid - near) / 100.0, (yes_mid + near) / 100.0
-    n_mid = (100 - yes_mid) / 100.0
-    n_lo, n_hi = n_mid - near / 100.0, n_mid + near / 100.0
-
-    def near_depth_info(levels, lo, hi):
-        total_depth = 0.0
-        level_count = 0
-        for e in levels:
-            try:
-                price = float(e[0])
-                size  = float(e[1])
-                if lo <= price <= hi and size > 0:
-                    total_depth += size
-                    level_count += 1
-            except Exception:
-                pass
-        return total_depth, level_count
-
-    yes_d, yes_lc = near_depth_info(yes_levels, y_lo, y_hi)
-    no_d,  no_lc  = near_depth_info(no_levels,  n_lo, n_hi)
-    total = yes_d + no_d
-    thresh = adaptive_ob_threshold(total)
-
-    log.info("Near-money: YES=$%.0f(%dlvl) NO=$%.0f(%dlvl) total=$%.0f thresh=%.0f%%",
-        yes_d, yes_lc, no_d, no_lc, total, thresh * 100)
-
-    if total < MIN_OB_DEPTH_DOLLARS:
-        return {"imbalance": 0.5, "direction": "NONE",
-                "near_money_depth": total, "effective_thresh": thresh,
-                "level_count_yes": yes_lc, "level_count_no": no_lc}
-
-    yr = yes_d / total
-    nr = no_d / total
-
-    if yr >= thresh:
-        direction = "YES"
-        imbalance = yr
-    elif nr >= thresh:
-        direction = "NO"
-        imbalance = nr
-    else:
-        direction = "NONE"
-        imbalance = max(yr, nr)
-
-    return {"imbalance": imbalance, "direction": direction,
-            "near_money_depth": total, "effective_thresh": thresh,
-            "level_count_yes": yes_lc, "level_count_no": no_lc}
-
-
-def calc_ob_imbalance(ob_data: dict, yes_mid: int) -> tuple:
-    q = calc_ob_quality(ob_data, yes_mid)
-    return q["imbalance"], q["direction"], q["near_money_depth"]
+def minutes_to_expiry(market: dict) -> float:
+    ct = market.get("close_time")
+    if not ct:
+        return 999.0
+    try:
+        close_dt = datetime.fromisoformat(ct.replace("Z", "+00:00"))
+        delta    = (close_dt - datetime.now(timezone.utc)).total_seconds() / 60.0
+        return max(0.0, delta)
+    except Exception:
+        return 999.0
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EDGE & KELLY
+# GUARD STACK
 # ─────────────────────────────────────────────────────────────────────────────
 
-def calc_edge(win_prob: float, contract_price_cents: int) -> float:
-    if contract_price_cents <= 0 or contract_price_cents >= 100:
-        return 0.0
-    net = (100 - contract_price_cents) / 100.0
-    return (win_prob * net) - ((1.0 - win_prob) * (contract_price_cents / 100.0))
-
-
-def kelly_bet_size(win_prob: float, contract_price_cents: int, balance: float) -> float:
-    if contract_price_cents <= 0 or contract_price_cents >= 100:
-        return 0.0
-    b = (100 - contract_price_cents) / float(contract_price_cents)
-    full_kelly = max(0.0, (b * win_prob - (1.0 - win_prob)) / b)
-    kelly_bet = full_kelly * PROFILE["kelly_frac"] * balance
-    return round(min(kelly_bet, TRADE_SIZE_DOLLARS, balance * MAX_BET_FRACTION), 2)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# GUARDS
-# ─────────────────────────────────────────────────────────────────────────────
-
-def cooldown_passed() -> bool:
-    elapsed = time.time() - last_trade_ts
-    cd = PROFILE["cooldown"]
-    if elapsed < cd:
-        log.info("Cooldown │ %.0fs remaining", cd - elapsed)
+def balance_floor_check(balance: float) -> bool:
+    if balance < MIN_BALANCE_FLOOR:
+        log.warning("BALANCE FLOOR │ $%.2f < $%.2f", balance, MIN_BALANCE_FLOOR)
         return False
     return True
 
@@ -1082,56 +1235,56 @@ def daily_loss_check(balance: float) -> bool:
     pnl = paper_daily_pnl if DEMO_MODE else daily_pnl
     if pnl <= -MAX_DAILY_LOSS:
         _session_halted = True
-        log.warning("DAILY LOSS LIMIT │ $%.2f lost. Session halted permanently.", abs(pnl))
-        telegram_halt(f"Daily loss cap hit. PnL: ${pnl:.2f}", balance)
+        log.warning("DAILY LOSS │ $%.2f — halted.", abs(pnl))
+        telegram_halt(f"Daily loss cap ${abs(pnl):.2f}", balance)
         return False
     if session_stop_threshold > 0 and balance < session_stop_threshold:
         _session_halted = True
-        log.warning("SESSION STOP │ Balance $%.2f < threshold $%.2f. Halted permanently.",
-                    balance, session_stop_threshold)
-        telegram_halt(f"Session stop. Balance ${balance:.2f}.", balance)
+        log.warning("SESSION STOP │ $%.2f < $%.2f — halted.", balance, session_stop_threshold)
+        telegram_halt(f"Session stop at ${balance:.2f}", balance)
         return False
     return True
 
 
-def balance_floor_check(balance: float) -> bool:
-    if balance < MIN_BALANCE_FLOOR:
-        log.warning("BALANCE FLOOR │ $%.2f < floor $%.2f.", balance, MIN_BALANCE_FLOOR)
+def spread_check(bid: int, ask: int) -> bool:
+    if ask - bid <= 0:
+        log.info("Spread │ zero/crossed")
         return False
     return True
 
 
-def spread_check(yes_bid: int, yes_ask: int) -> bool:
-    spread = yes_ask - yes_bid
-    if spread <= 0:
-        log.info("Spread │ %dc — crossed/zero.", spread)
+def expiry_guard(mid: int) -> bool:
+    if mid > 85 or mid < 15:
+        log.info("Expiry │ %dc near-certain", mid)
         return False
     return True
 
 
-def expiry_guard(yes_mid: int) -> bool:
-    if yes_mid > 85 or yes_mid < 15:
-        log.info("Expiry guard │ %dc — near-certain.", yes_mid)
+def cooldown_check() -> bool:
+    cd = 60  # minimum 60s between any trades
+    elapsed = time.time() - last_trade_ts
+    if elapsed < cd:
+        log.info("Cooldown │ %.0fs remaining", cd - elapsed)
         return False
     return True
 
 
-def liquidity_hours_check() -> bool:
-    utc_hour = datetime.now(timezone.utc).hour
-    if LOW_LIQ_START_UTC <= LOW_LIQ_END_UTC:
-        in_window = LOW_LIQ_START_UTC <= utc_hour < LOW_LIQ_END_UTC
-    else:
-        in_window = utc_hour >= LOW_LIQ_START_UTC or utc_hour < LOW_LIQ_END_UTC
-    if in_window:
-        log.info("Liquidity │ UTC hour %d in low-liq window.", utc_hour)
+def session_quality_check() -> bool:
+    score = get_session_score()
+    utc_h = datetime.now(timezone.utc).hour
+    if score < MIN_SESSION_SCORE:
+        log.info("Session quality │ UTC%d score=%d < min=%d", utc_h, score, MIN_SESSION_SCORE)
         return False
     return True
 
 
-def concurrent_position_check() -> bool:
-    if len(open_orders) >= MAX_CONCURRENT_POS:
-        log.info("Concurrent │ %d open ≥ limit %d.", len(open_orders), MAX_CONCURRENT_POS)
-        return False
+def streak_check() -> bool:
+    global consecutive_losses
+    if consecutive_losses >= MAX_CONSEC_LOSSES:
+        if time.time() < streak_pause_until:
+            log.info("Streak pause │ %d consec losses", consecutive_losses)
+            return False
+        consecutive_losses = 0
     return True
 
 
@@ -1139,56 +1292,45 @@ def concurrent_position_check() -> bool:
 # ORDER EXECUTION
 # ─────────────────────────────────────────────────────────────────────────────
 
-def place_limit_order(ticker: str, direction: str, size_dollars: float,
-                      limit_price_cents: int,
-                      ob_pct: float = 0.0, edge_pct: float = 0.0) -> Optional[str]:
-    """
-    v8.6.0 CRITICAL FIX: Kalshi deprecated the `yes_price` integer-cents
-    field on March 12, 2026. v8.3.0 was sending `yes_price` only → every
-    live order returned HTTP 400 and never reached the book. This is the
-    root cause of the reported P&L drift and trade slowdown.
-
-    Fix: send only `yes_price_dollars` (for YES) or `no_price_dollars`
-    (for NO) as string-formatted dollars (e.g. "0.48").
-    """
+def place_order(ticker: str, direction: str, bet_dollars: float,
+                limit_cents: int, win_prob: float, edge: float) -> Optional[str]:
     global last_trade_ts, paper_balance
 
-    if limit_price_cents <= 0:
+    if limit_cents <= 0:
         return None
-    count = int((size_dollars * 100) / limit_price_cents)
+    count = int((bet_dollars * 100) / limit_cents)
     if count < 1:
-        log.info("Kelly size $%.2f @ %dc = 0 contracts.", size_dollars, limit_price_cents)
+        log.info("Order │ 0 contracts at $%.2f @ %dc", bet_dollars, limit_cents)
         return None
-    cost = (limit_price_cents * count) / 100.0
-    client_id = f"j5-{ACTIVE_MODE.value[:4]}-{uuid.uuid4().hex[:8]}"
-    btc_at_entry = list(btc_prices)[-1] if btc_prices else 0
+    cost      = (limit_cents * count) / 100.0
+    client_id = f"j5-{uuid.uuid4().hex[:10]}"
+    btc_entry = list(btc_prices)[-1] if btc_prices else 0
 
     if DEMO_MODE:
         paper_balance -= cost
-        last_trade_ts = time.time()
+        last_trade_ts  = time.time()
         active_tickers.add(ticker)
         session_traded_tickers.add(ticker)
-        record = {
+        rec = {
             "time": datetime.now(timezone.utc).isoformat(),
-            "ticker": ticker, "side": direction, "size": size_dollars,
-            "price": limit_price_cents, "count": count, "cost": cost,
-            "mode": ACTIVE_MODE.value, "order_id": client_id,
-            "result": "pending", "placed_at": time.time(),
-            "btc_entry_price": btc_at_entry,
+            "ticker": ticker, "side": direction,
+            "price": limit_cents, "count": count, "cost": cost,
+            "order_id": client_id, "result": "pending",
+            "placed_at": time.time(), "btc_entry_price": btc_entry,
         }
-        trade_history.append(record)
-        open_orders[client_id] = record
-        log.info("🟡 PAPER │ %s %s │ %d @ %dc │ cost=$%.2f │ bal=$%.2f",
-            direction, ticker[-15:], count, limit_price_cents, cost, paper_balance)
+        trade_history.append(rec)
+        open_orders[client_id] = rec
+        log.info("🟡 PAPER │ %s %s │ %d @ %dc │ $%.2f │ bal=$%.2f",
+                 direction, ticker[-15:], count, limit_cents, cost, paper_balance)
         tg.send_trade_entry_notification(
             ticker=ticker, direction=direction, cost=cost,
-            price_cents=limit_price_cents, balance=paper_balance,
-            ob_pct=ob_pct, edge_pct=edge_pct,
+            price_cents=limit_cents, balance=paper_balance,
+            ob_pct=win_prob * 100, edge_pct=edge * 100,
         )
         return client_id
 
-    # ── Live order body (v8.6.0 API migration) ───────────────────────────────
-    body = {
+    # ── Live order (current Kalshi API: dollars fields) ───────────────────────
+    body: dict = {
         "ticker": ticker,
         "client_order_id": client_id,
         "type": "limit",
@@ -1197,236 +1339,279 @@ def place_limit_order(ticker: str, direction: str, size_dollars: float,
         "count": count,
     }
     if direction.upper() == "YES":
-        body["yes_price_dollars"] = f"{limit_price_cents / 100:.2f}"
+        body["yes_price_dollars"] = f"{limit_cents / 100:.2f}"
     else:
-        # For NO side, the price we post is the NO contract price in dollars
-        body["no_price_dollars"] = f"{limit_price_cents / 100:.2f}"
+        body["no_price_dollars"] = f"{limit_cents / 100:.2f}"
 
     try:
-        resp = _post("/portfolio/orders", body)
+        resp     = _post("/portfolio/orders", body)
         order_id = resp.get("order", {}).get("order_id", client_id)
         last_trade_ts = time.time()
-        record = {
+        rec = {
             "time": datetime.now(timezone.utc).isoformat(),
-            "ticker": ticker, "side": direction, "size": size_dollars,
-            "price": limit_price_cents, "count": count, "cost": cost,
-            "mode": ACTIVE_MODE.value, "order_id": order_id,
-            "result": "pending", "placed_at": time.time(),
-            "btc_entry_price": btc_at_entry,
+            "ticker": ticker, "side": direction,
+            "price": limit_cents, "count": count, "cost": cost,
+            "order_id": order_id, "result": "pending",
+            "placed_at": time.time(), "btc_entry_price": btc_entry,
         }
-        trade_history.append(record)
-        open_orders[order_id] = record
+        trade_history.append(rec)
+        open_orders[order_id] = rec
         active_tickers.add(ticker)
         session_traded_tickers.add(ticker)
-        log.info("✅ ORDER │ %s %s │ %d @ %dc │ $%.2f │ ID:%s",
-            direction, ticker[-15:], count, limit_price_cents, size_dollars, order_id[:12])
+        log.info("✅ ORDER │ %s %s │ %d @ %dc │ $%.2f │ %s",
+                 direction, ticker[-15:], count, limit_cents, bet_dollars, order_id[:12])
         live_bal = get_live_balance()
         tg.send_trade_entry_notification(
             ticker=ticker, direction=direction, cost=cost,
-            price_cents=limit_price_cents, balance=live_bal,
-            ob_pct=ob_pct, edge_pct=edge_pct,
+            price_cents=limit_cents, balance=live_bal,
+            ob_pct=win_prob * 100, edge_pct=edge * 100,
         )
         return order_id
     except requests.HTTPError as e:
         status = e.response.status_code if e.response is not None else "???"
-        text = e.response.text[:300] if e.response is not None else str(e)
-        log.error("Order failed │ HTTP %s │ body=%s │ resp=%s", status, body, text)
+        body_t = e.response.text[:300] if e.response is not None else str(e)
+        log.error("Order failed │ HTTP %s │ %s", status, body_t)
         return None
     except Exception as e:
-        log.error("Order failed (unexpected) │ %s │ body=%s", e, body)
+        log.error("Order failed │ %s", e)
         return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TELEGRAM WRAPPERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+def telegram_boot(balance: float) -> None:
+    mode = "📋 PAPER" if DEMO_MODE else "🔴 LIVE"
+    sess = session_state.value
+    tg.send_telegram_message(
+        f"🤖 Johnny5 {BOT_VERSION} STARTED\n"
+        f"{mode} │ State: {sess}\n"
+        f"Balance: ${balance:.2f}\n"
+        f"DailyLoss≤${MAX_DAILY_LOSS:.0f} | Floor=${MIN_BALANCE_FLOOR:.0f}\n"
+        f"MinConf={MIN_CONFIDENCE} | MinWinP={MIN_WIN_PROB:.0f}% | R²≥{R2_TREND_THRESHOLD}\n"
+        f"OBDepth≥${MIN_OB_DEPTH:.0f} | OBImb≥{OB_IMBALANCE_THRESH*100:.0f}%\n"
+        f"SessionScore≥{MIN_SESSION_SCORE} | Kelly={KELLY_FRACTION}"
+    )
+
+
+def telegram_halt(reason: str, balance: float) -> None:
+    tg.send_telegram_message(
+        f"⛔ HALTED (PERMANENT)\nReason: {reason}\nBalance: ${balance:.2f}"
+    )
+
+
+def telegram_daily_summary(balance: float, pnl: float, wins: int, losses: int) -> None:
+    total = wins + losses
+    wr    = wins / total * 100 if total > 0 else 0.0
+    emoji = "📈" if pnl >= 0 else "📉"
+    ci_str = ""
+    if total >= 10:
+        wlb = wilson_lower_bound(wins, total)
+        ci_str = f" LB={wlb*100:.0f}%"
+    tg.send_telegram_message(
+        f"{emoji} Daily Summary\n"
+        f"P&L: ${pnl:+.2f} │ Balance: ${balance:.2f}\n"
+        f"WR: {wr:.0f}%{ci_str} ({wins}W/{losses}L)"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAIN DECISION ENGINE
 # ─────────────────────────────────────────────────────────────────────────────
 
-def run_decision(market: dict, current_balance: float) -> None:
-    global consecutive_losses, last_signal_desc, streak_pause_until
+def run_decision(market: dict, balance: float) -> None:
+    global last_signal_desc
 
-    ticker = market["ticker"]
+    ticker  = market["ticker"]
     yes_bid = market.get("yes_bid", 0)
     yes_ask = market.get("yes_ask", 0)
     if yes_bid <= 0 or yes_ask <= 0 or yes_bid >= yes_ask:
         return
     yes_mid = (yes_bid + yes_ask) // 2
 
-    if not balance_floor_check(current_balance):
+    # ── Layer 1: Hard guards ─────────────────────────────────────────────────
+    if not balance_floor_check(balance):
         return
     if not expiry_guard(yes_mid):
         return
     if not spread_check(yes_bid, yes_ask):
         return
     if ticker in active_tickers:
-        log.info("Position guard │ Already in %s.", ticker[-15:])
+        log.info("Position guard │ %s", ticker[-15:])
         return
-
     if ticker in session_traded_tickers:
-        log.info("Session ticker guard │ Already traded %s this session. Skipping.",
-                 ticker[-15:])
-        last_signal_desc = f"session re-entry blocked ({ticker[-10:]})"
+        log.info("Session guard │ already traded %s", ticker[-15:])
+        last_signal_desc = f"session re-entry ({ticker[-10:]})"
+        return
+    if not cooldown_check():
+        return
+    if not daily_loss_check(balance):
         return
 
-    if not cooldown_passed():
-        return
-    if not daily_loss_check(current_balance):
+    # ── Layer 2: Streak / streak pause ──────────────────────────────────────
+    if not streak_check():
+        last_signal_desc = f"streak pause ({consecutive_losses}L)"
         return
 
-    STREAK_THRESHOLD = int(os.environ.get("MAX_CONSEC_LOSSES", "2"))
-    STREAK_PAUSE_SEC = int(os.environ.get("STREAK_PAUSE_SECS", "1800"))
-    if consecutive_losses >= STREAK_THRESHOLD:
-        now = time.time()
-        if now < streak_pause_until:
-            log.info("Streak pause │ %d losses.", consecutive_losses)
-            last_signal_desc = f"streak pause ({consecutive_losses} losses)"
-            return
-        consecutive_losses = 0
-
+    # ── Layer 3: Statistical performance guard ───────────────────────────────
     if not performance_guard():
-        last_signal_desc = "performance guard"
+        last_signal_desc = "perf guard (Wilson LB < 50%)"
         return
 
-    utc_hour = datetime.now(timezone.utc).hour
-    if utc_hour in LOW_LIQ_HOURS_UTC:
-        log.info("Low-liq │ UTC hour %d.", utc_hour)
-        last_signal_desc = f"low-liq hour UTC:{utc_hour}"
+    # ── Layer 4: Session quality ─────────────────────────────────────────────
+    if not session_quality_check():
+        last_signal_desc = f"session quality UTC{datetime.now(timezone.utc).hour}"
         return
 
-    mins_remaining = minutes_to_expiry(market)
-    if mins_remaining < MIN_MINUTES_TO_EXPIRY:
-        log.info("Expiry imminent │ %.1f min < %.1f min minimum.", mins_remaining, MIN_MINUTES_TO_EXPIRY)
+    # ── Layer 5: Concurrent position ─────────────────────────────────────────
+    if len(open_orders) >= MAX_CONCURRENT_POS:
+        log.info("Concurrent │ %d open", len(open_orders))
+        return
+
+    # ── Layer 6: Time to expiry ──────────────────────────────────────────────
+    mins = minutes_to_expiry(market)
+    if mins < MIN_MINUTES_TO_EXPIRY:
+        log.info("Expiry imminent │ %.1f min", mins)
         last_signal_desc = "expiry imminent"
         return
 
-    regime, r_squared = compute_btc_regime()
-    if regime in ("HIGH_VOL", "UNKNOWN", "RANGING"):
-        log.info("Regime filter │ %s (R²=%.2f).", regime, r_squared)
-        last_signal_desc = f"regime={regime}"
+    # ── Layer 7: Vol circuit breaker ─────────────────────────────────────────
+    if check_vol_circuit():
+        last_signal_desc = "vol circuit open"
         return
 
-    ob_data = get_order_book(ticker)
-    ob_quality = calc_ob_quality(ob_data, yes_mid)
-    ob_dir = ob_quality["direction"]
-
-    if ob_dir == "NONE":
-        log.info("OB │ No signal — imb=%.0f%%", ob_quality["imbalance"] * 100)
-        last_signal_desc = f"OB flat ({ob_quality['imbalance']*100:.0f}%)"
+    # ── Layer 8: Regime ──────────────────────────────────────────────────────
+    regime, r_squared, realized_vol = compute_regime()
+    if regime in (Regime.UNKNOWN, Regime.RANGING, Regime.HIGH_VOL):
+        log.info("Regime │ %s — no trade", regime.value)
+        last_signal_desc = f"regime={regime.value}"
         return
 
-    if not ob_trend_check(ticker, ob_quality["imbalance"], ob_dir):
-        last_signal_desc = "OB trend fading"
+    # ── Layer 9: Order book analysis ─────────────────────────────────────────
+    try:
+        ob_raw = get_order_book(ticker)
+    except Exception as e:
+        log.warning("OB fetch failed: %s", e)
         return
 
-    yes_levels = ob_quality.get("level_count_yes", 0)
-    no_levels  = ob_quality.get("level_count_no", 0)
-    if ob_dir == "YES" and no_levels == 0:
-        log.info("Ghost OB │ YES signal but NO side has zero levels — no counterparty. Skipping.")
-        last_signal_desc = "ghost OB (YES, zero NO levels)"
-        return
-    if ob_dir == "NO" and yes_levels == 0:
-        log.info("Ghost OB │ NO signal but YES side has zero levels — no counterparty. Skipping.")
-        last_signal_desc = "ghost OB (NO, zero YES levels)"
+    ob = analyze_order_book(ob_raw, yes_mid)
+    if ob is None:
+        last_signal_desc = "OB no signal"
         return
 
-    momentum_verdict, momentum_boost = btc_momentum_signal(ob_dir)
-    near_money_depth = ob_quality.get("near_money_depth", 0.0)
+    # OB direction must agree with regime direction
+    ob_dir = ob["direction"]
+    if regime == Regime.TRENDING_UP and ob_dir != "YES":
+        log.info("Direction mismatch │ regime=UP but OB=%s", ob_dir)
+        last_signal_desc = f"regime/OB mismatch (UP vs {ob_dir})"
+        return
+    if regime == Regime.TRENDING_DOWN and ob_dir != "NO":
+        log.info("Direction mismatch │ regime=DOWN but OB=%s", ob_dir)
+        last_signal_desc = f"regime/OB mismatch (DOWN vs {ob_dir})"
+        return
 
+    # OB trend: fading signal = no trade
+    if not check_ob_trend(ticker, ob_dir, ob["imbalance"]):
+        last_signal_desc = "OB fading"
+        return
+
+    # ── Layer 10: Momentum ───────────────────────────────────────────────────
+    momentum_verdict, momentum_adj = compute_momentum(ob_dir)
     if momentum_verdict == "CONFLICT":
-        log.info("Momentum CONFLICT │ OB=%s vs BTC.", ob_dir)
-        last_signal_desc = f"CONFLICT: OB={ob_dir}"
+        log.info("Momentum CONFLICT │ OB=%s", ob_dir)
+        last_signal_desc = f"CONFLICT OB={ob_dir}"
         return
 
-    if momentum_verdict == "NEUTRAL":
-        if REQUIRE_AGREE_MOMENTUM:
-            bypass = False
-            bypass_reason = ""
-            if ALLOW_NEUTRAL_IN_TRENDING and r_squared >= NEUTRAL_R2_FLOOR:
-                bypass = True
-                bypass_reason = f"ALLOW_NEUTRAL flag + R²={r_squared:.2f}"
-            elif near_money_depth >= NEUTRAL_OB_DEPTH_FLOOR:
-                bypass = True
-                bypass_reason = f"deep OB=${near_money_depth:.0f} >= floor ${NEUTRAL_OB_DEPTH_FLOOR:.0f}"
-
-            if bypass:
-                log.info("Momentum NEUTRAL │ Bypassed: %s.", bypass_reason)
-            else:
-                log.info("Momentum filter │ NEUTRAL blocked (OB=$%.0f < floor $%.0f, AGREE required).",
-                         near_money_depth, NEUTRAL_OB_DEPTH_FLOOR)
-                last_signal_desc = "momentum=NEUTRAL (depth too thin for bypass)"
-                return
-
-    confidence = compute_confidence_score(
-        ob_quality=ob_quality, regime=regime, r_squared=r_squared,
-        momentum_verdict=momentum_verdict, momentum_boost=momentum_boost,
-        mins_remaining=mins_remaining,
-    )
-
-    if confidence < MINIMUM_CONFIDENCE:
-        log.info("Confidence │ %.0f < minimum %d.", confidence, MINIMUM_CONFIDENCE)
-        last_signal_desc = f"confidence {confidence:.0f}/{MINIMUM_CONFIDENCE}"
+    # In recovery mode, require AGREE momentum — no NEUTRAL trades
+    if session_state == SessionState.RECOVERY and momentum_verdict != "AGREE":
+        log.info("Recovery mode │ requires AGREE momentum, got %s", momentum_verdict)
+        last_signal_desc = "recovery: AGREE required"
         return
 
-    win_prob = min(0.92, ob_quality["imbalance"] + momentum_boost)
+    # ── Layer 11: Probability model ──────────────────────────────────────────
+    win_prob = bayesian_win_prob(ob, momentum_verdict, momentum_adj, regime, r_squared, realized_vol)
 
-    log.info("📡 %s │ Regime:%s(R²=%.2f) │ OB:%s %.0f%% │ BTC:%s │ WinProb:%.0f%% │ Conf:%.0f",
-        ticker[-15:], regime, r_squared, ob_dir, ob_quality["imbalance"]*100,
-        momentum_verdict, win_prob*100, confidence)
+    if win_prob < MIN_WIN_PROB:
+        log.info("WinProb │ %.3f < min %.3f", win_prob, MIN_WIN_PROB)
+        last_signal_desc = f"win_prob {win_prob:.2f} < {MIN_WIN_PROB:.2f}"
+        return
 
+    # ── Layer 12: Confidence score ───────────────────────────────────────────
+    session_score = get_session_score()
+    conf = compute_confidence(ob, regime, r_squared, momentum_verdict,
+                               win_prob, mins, session_score)
+    if conf < MIN_CONFIDENCE:
+        log.info("Confidence │ %.0f < %d", conf, MIN_CONFIDENCE)
+        last_signal_desc = f"conf {conf:.0f} < {MIN_CONFIDENCE}"
+        return
+
+    # ── Layer 13: Contract price / direction ─────────────────────────────────
     if ob_dir == "YES":
         if yes_mid > YES_BREAKEVEN_PRICE:
-            log.info("Price guard │ YES at %dc > breakeven.", yes_mid)
+            log.info("Price guard │ YES %dc > breakeven", yes_mid)
             return
-        trade_direction = "YES"
+        direction = "YES"
         contract_price = yes_mid
     else:
         no_price = 100 - yes_mid
         if no_price > YES_BREAKEVEN_PRICE:
-            log.info("Price guard │ NO at %dc > breakeven.", no_price)
+            log.info("Price guard │ NO %dc > breakeven", no_price)
             return
-        trade_direction = "NO"
+        direction = "NO"
         contract_price = no_price
 
-    if not (PROFILE["min_price"] <= contract_price <= PROFILE["max_price"]):
-        log.info("Bias filter │ %dc outside range.", contract_price)
+    if not (25 <= contract_price <= 75):
+        log.info("Bias filter │ %dc outside 25-75", contract_price)
         return
 
+    # ── Layer 14: Edge ───────────────────────────────────────────────────────
     edge = calc_edge(win_prob, contract_price)
-    if edge < PROFILE["min_edge"]:
-        log.info("Edge │ %.3f < min %.3f.", edge, PROFILE["min_edge"])
+    if edge < MIN_EDGE_PCT:
+        log.info("Edge │ %.3f < min %.3f", edge, MIN_EDGE_PCT)
+        last_signal_desc = f"edge {edge:.3f} < {MIN_EDGE_PCT:.3f}"
         return
 
-    bet = kelly_bet_size(win_prob, contract_price, current_balance)
+    # ── Layer 15: Kelly sizing ───────────────────────────────────────────────
+    bet = kelly_bet(win_prob, contract_price, balance)
     if bet < 0.25:
-        log.info("Kelly │ $%.2f too small.", bet)
+        log.info("Kelly │ $%.2f too small", bet)
+        return
+    if balance < bet:
+        log.warning("Insufficient balance")
         return
 
-    if current_balance < bet:
-        log.warning("Insufficient balance.")
-        return
-
-    if trade_direction == "YES":
+    # ── Limit price (maker) ──────────────────────────────────────────────────
+    if direction == "YES":
         limit_price = max(1, min(yes_bid + 1, yes_ask - 1))
     else:
-        no_best = 100 - yes_ask
+        no_best     = 100 - yes_ask
         limit_price = max(1, min(no_best + 1, 100 - yes_bid - 1))
     limit_price = max(1, min(99, limit_price))
 
     if abs(limit_price - contract_price) > 8:
-        log.info("Limit drift │ %dc too far.", limit_price)
+        log.info("Limit drift │ %dc too far", limit_price)
         return
 
-    wlb_str = f"WilsonLB={wilson_lower_bound(live_wins, live_wins + live_losses)*100:.1f}%" \
-              if (live_wins + live_losses) >= 10 else "WilsonLB=n/a"
-    log.info("📋 EDGE JUSTIFICATION │ %s %s @ %d¢ │ OB=%.0f%% depth=$%.0f │ "
-             "Edge=%.1f%% │ Bet=$%.2f │ %.1fmin remain │ %s",
-        trade_direction, ticker[-15:], contract_price,
-        ob_quality['imbalance']*100, ob_quality['near_money_depth'],
-        edge*100, bet, mins_remaining, wlb_str)
+    wlb_str = ""
+    total = live_wins + live_losses
+    if total >= 10:
+        wlb = wilson_lower_bound(live_wins, total)
+        wlb_str = f" WLB={wlb*100:.1f}%"
 
-    last_signal_desc = f"SIGNAL {trade_direction} conf={confidence:.0f}"
+    log.info(
+        "📋 EDGE JUSTIFICATION │ %s %s @ %dc │ regime=%s(R²=%.2f) │ "
+        "OB=%.1f%% $%.0f │ BTC=%s │ WinP=%.1f%% Edge=%.1f%% Conf=%.0f │ "
+        "Bet=$%.2f │ %.1fmin%s",
+        direction, ticker[-15:], contract_price,
+        regime.value, r_squared,
+        ob["imbalance"] * 100, ob["total_depth"],
+        momentum_verdict, win_prob * 100, edge * 100, conf,
+        bet, mins, wlb_str
+    )
 
-    place_limit_order(ticker, trade_direction, bet, limit_price,
-                      ob_pct=win_prob * 100, edge_pct=edge * 100)
+    last_signal_desc = f"SIGNAL {direction} conf={conf:.0f} p={win_prob:.2f}"
+    place_order(ticker, direction, bet, limit_price, win_prob, edge)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1434,33 +1619,31 @@ def run_decision(market: dict, current_balance: float) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    global session_start_balance, session_stop_threshold, daily_pnl, active_tickers
+    global session_start_balance, session_stop_threshold, daily_pnl
     global paper_balance, paper_daily_pnl, last_trade_ts, last_daily_summary_ts
     global consecutive_losses, last_signal_desc, last_heartbeat_ts, running_pnl
     global live_wins, live_losses, streak_pause_until
     global _last_known_balance, _shutdown_requested, _session_start_ts
-    global _session_halted, session_traded_tickers
+    global _session_halted, session_traded_tickers, session_state, recovery_trades
 
     init_base_url()
 
     paper_balance = float(os.environ.get("PAPER_BALANCE", "25.0"))
     _session_start_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-    _session_halted = False
+    _session_halted   = False
+    session_state     = SessionState.ACTIVE
+    recovery_trades   = 0
     session_traded_tickers = set()
 
     log.info("━" * 70)
-    log.info("  JOHNNY5 %s │ %s │ %s", BOT_VERSION,
-             "PAPER 🟡" if DEMO_MODE else "LIVE 🔴", ACTIVE_MODE.value.upper())
-    log.info("  Session start: %s", _session_start_ts)
-    log.info("  MOMENTUM: AGREE required=%s | NeutralOBFloor=$%.0f",
-             REQUIRE_AGREE_MOMENTUM, NEUTRAL_OB_DEPTH_FLOOR)
-    log.info("  MIN CONFIDENCE: %d | R²≥%.2f | DEPTH≥$%.0f | MINS≥%.0f",
-             MINIMUM_CONFIDENCE, R_SQUARED_THRESHOLD,
-             MIN_OB_DEPTH_DOLLARS, MIN_MINUTES_TO_EXPIRY)
-    log.info("  LOW LIQ: UTC 0-%d | MAX CONCURRENT: %d",
-             LOW_LIQ_END_UTC, MAX_CONCURRENT_POS)
-    log.info("  v8.6.0: API migration (yes_price_dollars + realized_pnl_dollars)")
+    log.info("  JOHNNY5 %s │ %s", BOT_VERSION, "PAPER 🟡" if DEMO_MODE else "LIVE 🔴")
+    log.info("  Start: %s", _session_start_ts)
+    log.info("  Regime R²≥%.2f | VolCap=%.3f%% | Circuit=%.2f%%",
+             R2_TREND_THRESHOLD, VOLATILITY_CAP_PCT, VOL_CIRCUIT_BREAKER)
+    log.info("  OB depth≥$%.0f imb≥%.0f%% | WinP≥%.0f%% Edge≥%.0f%%",
+             MIN_OB_DEPTH, OB_IMBALANCE_THRESH * 100, MIN_WIN_PROB * 100, MIN_EDGE_PCT * 100)
+    log.info("  Kelly=%.2f cap=%.0f%% | Session score≥%d",
+             KELLY_FRACTION, MAX_BET_FRACTION * 100, MIN_SESSION_SCORE)
     log.info("━" * 70)
 
     tg.validate_telegram_connection()
@@ -1470,30 +1653,28 @@ def main() -> None:
     streak_pause_until = 0.0
 
     if DEMO_MODE:
-        running_pnl = 0.0
-        session_start_balance = paper_balance
-        session_stop_threshold = paper_balance * 0.50
+        running_pnl            = 0.0
+        session_start_balance  = paper_balance
+        session_stop_threshold = paper_balance * SESSION_STOP_FRACTION
         telegram_boot(paper_balance)
     else:
-        # v8.6.0: hard-fail boot if balance fetch fails — do NOT anchor
-        # session_stop_threshold to $0 silently.
         try:
             bal = get_live_balance(allow_cached_zero=False)
         except Exception as e:
-            log.error("Cannot fetch starting balance — aborting boot: %s", e)
-            tg.send_telegram_message(f"🛑 Johnny5 {BOT_VERSION} boot failed: balance fetch error")
+            log.error("Cannot fetch starting balance — aborting: %s", e)
+            tg.send_telegram_message(f"🛑 Johnny5 {BOT_VERSION} boot failed: balance error")
             return
         if bal <= 0.0:
-            log.error("Starting balance is $0.00 — aborting boot")
-            tg.send_telegram_message(f"🛑 Johnny5 {BOT_VERSION} boot failed: balance = $0.00")
+            log.error("Starting balance $0 — aborting")
+            tg.send_telegram_message(f"🛑 Johnny5 {BOT_VERSION} boot failed: balance=$0")
             return
-        _last_known_balance = bal
-        session_start_balance = bal
-        session_stop_threshold = bal * 0.50
+        _last_known_balance    = bal
+        session_start_balance  = bal
+        session_stop_threshold = bal * SESSION_STOP_FRACTION
         open_orders.clear()
         active_tickers.clear()
         consecutive_losses = 0
-        running_pnl = 0.0
+        running_pnl        = 0.0
         telegram_boot(bal)
 
     resolve_cycle = 0
@@ -1501,62 +1682,76 @@ def main() -> None:
     while not _shutdown_requested:
         try:
             if _session_halted:
-                log.info("Session permanently halted. Sleeping 1hr. Restart Railway to reset.")
+                log.info("Permanently halted — sleeping 1hr.")
                 time.sleep(3600)
                 continue
 
+            # ── Heartbeat ────────────────────────────────────────────────────
             if time.time() - last_heartbeat_ts >= 900:
                 last_heartbeat_ts = time.time()
-                hb_bal = paper_balance if DEMO_MODE else get_live_balance()
-                hb_pnl = paper_daily_pnl if DEMO_MODE else (hb_bal - session_start_balance)
+                hb_bal  = paper_balance if DEMO_MODE else get_live_balance()
+                hb_pnl  = paper_daily_pnl if DEMO_MODE else (hb_bal - session_start_balance)
                 hb_open = len(open_orders)
-                hb_trades = len([t for t in trade_history if t.get("result") in ("win", "loss", "pending")])
+                hb_tr   = len([t for t in trade_history
+                                if t.get("result") in ("win", "loss", "pending")])
                 tg.send_heartbeat(
                     balance=hb_bal, session_pnl=hb_pnl, open_count=hb_open,
-                    trades_today=hb_trades, last_signal=last_signal_desc,
+                    trades_today=hb_tr, last_signal=last_signal_desc,
                 )
 
-            market = get_active_btc_market()
+            # ── BTC price ─────────────────────────────────────────────────────
+            ingest_btc_price()
+
+            # ── Market ───────────────────────────────────────────────────────
+            market = get_active_market()
             if not market:
-                log.info("No active BTC market. Waiting %ds...", POLL_INTERVAL)
+                log.info("No active market — waiting %ds", POLL_INTERVAL)
                 last_signal_desc = "no market"
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            update_btc_price(market)
-
+            # ── Expire stale position locks ───────────────────────────────────
             current_ticker = market.get("ticker", "")
             tickers_with_orders = {t.get("ticker", "") for t in open_orders.values()}
             expired = {t for t in active_tickers
                        if t != current_ticker and t not in tickers_with_orders}
             if expired:
-                log.info("Clearing expired position locks: %s", expired)
                 active_tickers -= expired
+                log.info("Expired locks: %s", expired)
 
+            # ── Balance ───────────────────────────────────────────────────────
             current_balance = paper_balance if DEMO_MODE else get_live_balance()
+
+            # ── Session state machine ─────────────────────────────────────────
+            update_session_state(current_balance)
+
+            # ── Decision ─────────────────────────────────────────────────────
             run_decision(market, current_balance)
 
+            # ── Resolution ───────────────────────────────────────────────────
             resolve_cycle += 1
             if resolve_cycle % 3 == 0:
                 resolve_open_orders()
                 cancel_stale_orders()
 
                 if DEMO_MODE:
-                    resolved = [t for t in trade_history if t.get("result") in ("win","loss")]
-                    wins = sum(1 for t in resolved if t["result"] == "win")
+                    resolved = [t for t in trade_history if t.get("result") in ("win", "loss")]
+                    wins  = sum(1 for t in resolved if t["result"] == "win")
                     total = len(resolved)
-                    wr = wins / total if total > 0 else 0.0
-                    log.info("📋 PAPER │ Balance: $%.2f │ PnL: $%+.2f │ WR: %.1f%% │ Session tickers: %d",
-                             paper_balance, paper_daily_pnl, wr * 100, len(session_traded_tickers))
+                    wr    = wins / total if total > 0 else 0.0
+                    log.info("📋 PAPER │ $%.2f │ PnL=$%+.2f │ WR=%.1f%% │ Prior=%.3f │ State=%s",
+                             paper_balance, paper_daily_pnl, wr * 100,
+                             _live_prior, session_state.value)
                 else:
-                    live_bal = get_live_balance()
-                    daily_pnl = live_bal - session_start_balance
-                    log.info("Portfolio │ Balance: $%.2f │ PnL: $%+.2f │ Open: %d │ WR: %d/%d │ Session tickers: %d",
-                             live_bal, daily_pnl, len(open_orders),
-                             live_wins, live_wins + live_losses, len(session_traded_tickers))
+                    live_bal   = get_live_balance()
+                    daily_pnl  = live_bal - session_start_balance
+                    wlb        = wilson_lower_bound(live_wins, live_wins + live_losses)
+                    log.info("Portfolio │ $%.2f │ PnL=$%+.2f │ WR=%d/%d LB=%.1f%% │ Prior=%.3f │ State=%s",
+                             live_bal, daily_pnl, live_wins, live_wins + live_losses,
+                             wlb * 100, _live_prior, session_state.value)
 
-                    now_utc_hour = datetime.now(timezone.utc).hour
-                    if now_utc_hour == 0 and time.time() - last_daily_summary_ts > 3600:
+                    if datetime.now(timezone.utc).hour == 0 and \
+                       time.time() - last_daily_summary_ts > 3600:
                         last_daily_summary_ts = time.time()
                         telegram_daily_summary(live_bal, daily_pnl, live_wins, live_losses)
 
@@ -1565,12 +1760,12 @@ def main() -> None:
         except KeyboardInterrupt:
             break
         except Exception as e:
-            log.error("Unexpected error: %s", e, exc_info=True)
+            log.error("Unexpected: %s", e, exc_info=True)
             time.sleep(POLL_INTERVAL)
 
     final = paper_balance if DEMO_MODE else get_live_balance()
-    log.info("Shutting down. Final balance: $%.2f", final)
-    tg.send_telegram_message(f"🛑 Johnny5 stopped. Final balance: ${final:.2f}")
+    log.info("Shutdown. Final balance: $%.2f", final)
+    tg.send_telegram_message(f"🛑 Johnny5 {BOT_VERSION} stopped. Final: ${final:.2f}")
 
 
 if __name__ == "__main__":
