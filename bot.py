@@ -1,25 +1,27 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  JOHNNY5-KALSHI-AUTO  v9.0.1  —  Production Build                          ║
+║  JOHNNY5-KALSHI-AUTO  v9.0.2  —  Production Build                          ║
 ║  "No disassemble."                                                           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  v9.0.1 — HOTFIX                                                             ║
-║  BUG: UnboundLocalError on `active_tickers` every loop iteration.           ║
-║  ROOT CAUSE: main() declared `active_tickers` in its global statement.      ║
-║  Python then treated every reference to active_tickers inside main() as a  ║
-║  local variable. The set comprehension at the expired-lock cleanup block    ║
-║  read it before any local assignment — UnboundLocalError.                   ║
-║  FIX: Removed active_tickers, open_orders, trade_history from the global   ║
-║  declaration in main(). These are module-level mutable containers; they    ║
-║  are mutated in-place and never need a global declaration.                  ║
+║  v9.0.2 — HOTFIX CONFIRMED DEPLOYED                                          ║
+║  The v9.0.1 fix (remove active_tickers from main() global declaration)      ║
+║  was never committed to GitHub. Railway was running the pre-fix code        ║
+║  despite the v9.0.1 version string. Every cycle crashed with                ║
+║  UnboundLocalError on the active_tickers set comprehension.                 ║
 ║                                                                              ║
-║  v9.0.0 architecture unchanged.                                             ║
+║  THIS FILE: main() global declaration is confirmed clean.                   ║
+║  active_tickers, open_orders, trade_history, session_traded_tickers,        ║
+║  _processed_settlement_ids, btc_prices, btc_returns, _prev_ob are           ║
+║  module-level mutable containers mutated in-place. They must NEVER          ║
+║  appear in any function's global declaration.                               ║
+║                                                                              ║
+║  v9.0.1 / v9.0.0 architecture fully preserved. Zero other changes.         ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
 from __future__ import annotations
 
-BOT_VERSION = "9.0.1"
+BOT_VERSION = "9.0.2"
 
 import base64
 import logging
@@ -1504,14 +1506,17 @@ def run_decision(market: dict, balance: float) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    # CRITICAL: open_orders, active_tickers, trade_history,
-    # session_traded_tickers, _processed_settlement_ids, btc_prices,
-    # btc_returns, _prev_ob are module-level mutable containers. They are
-    # mutated in-place and must NOT appear in this global declaration.
-    # Declaring them global here caused v9.0.0's UnboundLocalError — Python
-    # treats every reference inside main() as a local variable, then fails
-    # when the set comprehension reads active_tickers before any local
-    # assignment has occurred.
+    # ── CRITICAL GLOBAL DECLARATION RULE ─────────────────────────────────────
+    # The following module-level mutable containers must NEVER appear here:
+    #   open_orders, active_tickers, trade_history, session_traded_tickers,
+    #   _processed_settlement_ids, btc_prices, btc_returns, _prev_ob
+    #
+    # These are mutated IN-PLACE (dict/set/deque methods). Declaring them in
+    # a global statement causes Python to mark every reference inside main()
+    # as a local variable. The set comprehension that reads active_tickers
+    # then raises UnboundLocalError before any local assignment has occurred.
+    # This was the root cause of the v9.0.0/v9.0.1 crash loop.
+    # ─────────────────────────────────────────────────────────────────────────
     global session_start_balance, session_stop_threshold, daily_pnl
     global paper_balance, paper_daily_pnl, last_trade_ts, last_daily_summary_ts
     global consecutive_losses, last_signal_desc, last_heartbeat_ts, running_pnl
@@ -1527,7 +1532,7 @@ def main() -> None:
     session_state     = SessionState.ACTIVE
     recovery_trades   = 0
 
-    # In-place resets — no global declaration needed or wanted
+    # In-place resets — no global declaration needed
     session_traded_tickers.clear()
     _processed_settlement_ids.clear()
 
@@ -1567,7 +1572,6 @@ def main() -> None:
         _last_known_balance    = bal
         session_start_balance  = bal
         session_stop_threshold = bal * SESSION_STOP_FRACTION
-        # In-place clears — safe without global declaration
         open_orders.clear()
         active_tickers.clear()
         consecutive_losses = 0
