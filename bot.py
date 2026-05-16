@@ -1,27 +1,31 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  JOHNNY5-KALSHI-AUTO  v9.0.2  —  Production Build                          ║
+║  JOHNNY5-KALSHI-AUTO  v9.0.3  —  Production Build                          ║
 ║  "No disassemble."                                                           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  v9.0.2 — HOTFIX CONFIRMED DEPLOYED                                          ║
-║  The v9.0.1 fix (remove active_tickers from main() global declaration)      ║
-║  was never committed to GitHub. Railway was running the pre-fix code        ║
-║  despite the v9.0.1 version string. Every cycle crashed with                ║
-║  UnboundLocalError on the active_tickers set comprehension.                 ║
+║  v9.0.3 — ROOT CAUSE FIX for persistent UnboundLocalError crash loop        ║
 ║                                                                              ║
-║  THIS FILE: main() global declaration is confirmed clean.                   ║
-║  active_tickers, open_orders, trade_history, session_traded_tickers,        ║
-║  _processed_settlement_ids, btc_prices, btc_returns, _prev_ob are           ║
-║  module-level mutable containers mutated in-place. They must NEVER          ║
-║  appear in any function's global declaration.                               ║
+║  v9.0.2 removed active_tickers from main()'s global declaration, which      ║
+║  was correct, but left `active_tickers -= expired` at line 1617.            ║
+║  Python's augmented assignment (-=) compiles to a local rebinding,          ║
+║  making the entire main() function treat active_tickers as local.           ║
+║  The set comprehension at line 1614 then reads it before any local          ║
+║  assignment occurs → UnboundLocalError every cycle.                         ║
 ║                                                                              ║
-║  v9.0.1 / v9.0.0 architecture fully preserved. Zero other changes.         ║
+║  FIX: replaced `active_tickers -= expired` with                             ║
+║       `active_tickers.difference_update(expired)` — pure in-place           ║
+║  mutation, no rebinding, Python never marks it local.                       ║
+║                                                                              ║
+║  RULE (reinforced): module-level mutable containers must NEVER be           ║
+║  targets of augmented assignment (+=, -=, |=, &=, etc.) inside any         ║
+║  function. Use in-place methods (.add, .discard, .update,                   ║
+║  .difference_update, .clear) exclusively.                                   ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
 from __future__ import annotations
 
-BOT_VERSION = "9.0.2"
+BOT_VERSION = "9.0.3"
 
 import base64
 import logging
@@ -1506,16 +1510,17 @@ def run_decision(market: dict, balance: float) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    # ── CRITICAL GLOBAL DECLARATION RULE ─────────────────────────────────────
-    # The following module-level mutable containers must NEVER appear here:
-    #   open_orders, active_tickers, trade_history, session_traded_tickers,
-    #   _processed_settlement_ids, btc_prices, btc_returns, _prev_ob
+    # ── CRITICAL GLOBAL MUTATION RULE ────────────────────────────────────────
+    # Module-level mutable containers (open_orders, active_tickers,
+    # trade_history, session_traded_tickers, _processed_settlement_ids,
+    # btc_prices, btc_returns, _prev_ob) must NEVER:
+    #   1. Appear in a global declaration inside any function, AND
+    #   2. Be targets of augmented assignment (+=, -=, |=, &=, etc.)
     #
-    # These are mutated IN-PLACE (dict/set/deque methods). Declaring them in
-    # a global statement causes Python to mark every reference inside main()
-    # as a local variable. The set comprehension that reads active_tickers
-    # then raises UnboundLocalError before any local assignment has occurred.
-    # This was the root cause of the v9.0.0/v9.0.1 crash loop.
+    # Both cause Python to mark the name as local throughout the function.
+    # Any read before that local assignment fires raises UnboundLocalError.
+    # Always use in-place methods: .add(), .discard(), .update(),
+    # .difference_update(), .clear(), etc.
     # ─────────────────────────────────────────────────────────────────────────
     global session_start_balance, session_stop_threshold, daily_pnl
     global paper_balance, paper_daily_pnl, last_trade_ts, last_daily_summary_ts
@@ -1614,7 +1619,7 @@ def main() -> None:
             expired = {t for t in active_tickers
                        if t != current_ticker and t not in tickers_with_orders}
             if expired:
-                active_tickers -= expired
+                active_tickers.difference_update(expired)
                 log.info("Expired locks: %s", expired)
 
             current_balance = paper_balance if DEMO_MODE else get_live_balance()
