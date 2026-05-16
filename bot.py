@@ -1,26 +1,31 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  JOHNNY5-KALSHI-AUTO  v9.0.3  —  Production Build                          ║
+║  JOHNNY5-KALSHI-AUTO  v9.0.4  —  Production Build                          ║
 ║  "No disassemble."                                                           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  v9.0.3 — DIRECTION MISMATCH FILTER REMOVED                                 ║
-║  Removed hard filter that required TRENDING_UP→OB=YES, TRENDING_DOWN→OB=NO ║
+║  v9.0.4 — LIVE MODE BOOT CRASH FIXED                                         ║
+║  BUG: UnboundLocalError on active_tickers.clear() at line 1566 in live mode ║
 ║                                                                              ║
-║  Evidence from logs: filter blocked 2/4 TRENDING cycles including an        ║
-║  $18,666-depth 67.8% NO signal during TRENDING_UP (R²=0.869). These are     ║
-║  the highest-conviction divergence setups — institutional money front-       ║
-║  running a BTC reversal. OB is the primary edge; regime ensures structured  ║
-║  market conditions. Requiring directional agreement double-filters and       ║
-║  eliminates valid trades.                                                    ║
+║  ROOT CAUSE: active_tickers -= expired (augmented assignment) in the main   ║
+║  loop caused Python's compiler to mark active_tickers as a LOCAL variable   ║
+║  throughout the entire main() function scope. Any reference to              ║
+║  active_tickers before the augmented assignment (including .clear() during  ║
+║  live-mode boot initialization) then raised UnboundLocalError.              ║
 ║                                                                              ║
-║  v9.0.2 fixes preserved: active_tickers removed from main() global          ║
-║  declaration (UnboundLocalError crash loop resolved).                        ║
+║  This did not affect paper mode because the live branch containing          ║
+║  active_tickers.clear() is never executed when DEMO_MODE=true.              ║
+║                                                                              ║
+║  FIX: active_tickers -= expired → active_tickers.difference_update(expired) ║
+║  Method calls do not trigger Python's local-variable scoping rule.          ║
+║                                                                              ║
+║  v9.0.3 changes preserved: direction mismatch filter removed.               ║
+║  v9.0.2 changes preserved: active_tickers removed from global declaration.  ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
 from __future__ import annotations
 
-BOT_VERSION = "9.0.3"
+BOT_VERSION = "9.0.4"
 
 import base64
 import logging
@@ -1604,7 +1609,7 @@ def main() -> None:
             expired = {t for t in active_tickers
                        if t != current_ticker and t not in tickers_with_orders}
             if expired:
-                active_tickers -= expired
+                active_tickers.difference_update(expired)
                 log.info("Expired locks: %s", expired)
 
             current_balance = paper_balance if DEMO_MODE else get_live_balance()
