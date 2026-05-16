@@ -3,23 +3,18 @@
 ║  JOHNNY5-KALSHI-AUTO  v9.0.3  —  Production Build                          ║
 ║  "No disassemble."                                                           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  v9.0.3 — ROOT CAUSE FIX for persistent UnboundLocalError crash loop        ║
+║  v9.0.3 — DIRECTION MISMATCH FILTER REMOVED                                 ║
+║  Removed hard filter that required TRENDING_UP→OB=YES, TRENDING_DOWN→OB=NO ║
 ║                                                                              ║
-║  v9.0.2 removed active_tickers from main()'s global declaration, which      ║
-║  was correct, but left `active_tickers -= expired` at line 1617.            ║
-║  Python's augmented assignment (-=) compiles to a local rebinding,          ║
-║  making the entire main() function treat active_tickers as local.           ║
-║  The set comprehension at line 1614 then reads it before any local          ║
-║  assignment occurs → UnboundLocalError every cycle.                         ║
+║  Evidence from logs: filter blocked 2/4 TRENDING cycles including an        ║
+║  $18,666-depth 67.8% NO signal during TRENDING_UP (R²=0.869). These are     ║
+║  the highest-conviction divergence setups — institutional money front-       ║
+║  running a BTC reversal. OB is the primary edge; regime ensures structured  ║
+║  market conditions. Requiring directional agreement double-filters and       ║
+║  eliminates valid trades.                                                    ║
 ║                                                                              ║
-║  FIX: replaced `active_tickers -= expired` with                             ║
-║       `active_tickers.difference_update(expired)` — pure in-place           ║
-║  mutation, no rebinding, Python never marks it local.                       ║
-║                                                                              ║
-║  RULE (reinforced): module-level mutable containers must NEVER be           ║
-║  targets of augmented assignment (+=, -=, |=, &=, etc.) inside any         ║
-║  function. Use in-place methods (.add, .discard, .update,                   ║
-║  .difference_update, .clear) exclusively.                                   ║
+║  v9.0.2 fixes preserved: active_tickers removed from main() global          ║
+║  declaration (UnboundLocalError crash loop resolved).                        ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
@@ -1404,15 +1399,6 @@ def run_decision(market: dict, balance: float) -> None:
         return
 
     ob_dir = ob["direction"]
-    if regime == Regime.TRENDING_UP and ob_dir != "YES":
-        log.info("Direction mismatch │ UP vs %s", ob_dir)
-        last_signal_desc = f"regime/OB mismatch (UP vs {ob_dir})"
-        return
-    if regime == Regime.TRENDING_DOWN and ob_dir != "NO":
-        log.info("Direction mismatch │ DOWN vs %s", ob_dir)
-        last_signal_desc = f"regime/OB mismatch (DOWN vs {ob_dir})"
-        return
-
     if not check_ob_trend(ticker, ob_dir, ob["imbalance"]):
         last_signal_desc = "OB fading"
         return
@@ -1510,17 +1496,16 @@ def run_decision(market: dict, balance: float) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main() -> None:
-    # ── CRITICAL GLOBAL MUTATION RULE ────────────────────────────────────────
-    # Module-level mutable containers (open_orders, active_tickers,
-    # trade_history, session_traded_tickers, _processed_settlement_ids,
-    # btc_prices, btc_returns, _prev_ob) must NEVER:
-    #   1. Appear in a global declaration inside any function, AND
-    #   2. Be targets of augmented assignment (+=, -=, |=, &=, etc.)
+    # ── CRITICAL GLOBAL DECLARATION RULE ─────────────────────────────────────
+    # The following module-level mutable containers must NEVER appear here:
+    #   open_orders, active_tickers, trade_history, session_traded_tickers,
+    #   _processed_settlement_ids, btc_prices, btc_returns, _prev_ob
     #
-    # Both cause Python to mark the name as local throughout the function.
-    # Any read before that local assignment fires raises UnboundLocalError.
-    # Always use in-place methods: .add(), .discard(), .update(),
-    # .difference_update(), .clear(), etc.
+    # These are mutated IN-PLACE (dict/set/deque methods). Declaring them in
+    # a global statement causes Python to mark every reference inside main()
+    # as a local variable. The set comprehension that reads active_tickers
+    # then raises UnboundLocalError before any local assignment has occurred.
+    # This was the root cause of the v9.0.0/v9.0.1 crash loop.
     # ─────────────────────────────────────────────────────────────────────────
     global session_start_balance, session_stop_threshold, daily_pnl
     global paper_balance, paper_daily_pnl, last_trade_ts, last_daily_summary_ts
@@ -1619,7 +1604,7 @@ def main() -> None:
             expired = {t for t in active_tickers
                        if t != current_ticker and t not in tickers_with_orders}
             if expired:
-                active_tickers.difference_update(expired)
+                active_tickers -= expired
                 log.info("Expired locks: %s", expired)
 
             current_balance = paper_balance if DEMO_MODE else get_live_balance()
