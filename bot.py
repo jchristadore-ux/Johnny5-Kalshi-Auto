@@ -1,31 +1,44 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  JOHNNY5-KALSHI-AUTO  v9.0.4  —  Production Build                          ║
+║  JOHNNY5-KALSHI-AUTO  v9.0.5  —  Production Build                          ║
 ║  "No disassemble."                                                           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  v9.0.4 — LIVE MODE BOOT CRASH FIXED                                         ║
-║  BUG: UnboundLocalError on active_tickers.clear() at line 1566 in live mode ║
+║  v9.0.5 — RECOVERY DEADLOCK FIXED                                            ║
 ║                                                                              ║
-║  ROOT CAUSE: active_tickers -= expired (augmented assignment) in the main   ║
-║  loop caused Python's compiler to mark active_tickers as a LOCAL variable   ║
-║  throughout the entire main() function scope. Any reference to              ║
-║  active_tickers before the augmented assignment (including .clear() during  ║
-║  live-mode boot initialization) then raised UnboundLocalError.              ║
+║  BUG 1: Pre-restart settlements not counted toward live W/L counters        ║
+║  When Railway restarts the bot mid-session, open_orders.clear() is called   ║
+║  at boot. Settlements from trades placed before the restart arrived in       ║
+║  _fetch_settled_records() but the ticker_to_oid lookup found no match       ║
+║  (empty dict). Those records were marked in _processed_settlement_ids and   ║
+║  discarded without incrementing live_wins or live_losses. The balance drop  ║
+║  from those trades was real; the counters were not updated.                  ║
 ║                                                                              ║
-║  This did not affect paper mode because the live branch containing          ║
-║  active_tickers.clear() is never executed when DEMO_MODE=true.              ║
+║  FIX: When a settlement has no matched open_orders entry, extract its PnL   ║
+║  and increment live_wins/live_losses accordingly.                            ║
 ║                                                                              ║
-║  FIX: active_tickers -= expired → active_tickers.difference_update(expired) ║
-║  Method calls do not trigger Python's local-variable scoping rule.          ║
+║  BUG 2: RECOVERY exit counter measured from session start, not from when    ║
+║  RECOVERY was entered.                                                       ║
+║  update_session_state() checked total_rec = live_wins + live_losses >=      ║
+║  RECOVERY_EXIT_TRADES. If RECOVERY was triggered by cross-session losses    ║
+║  (live_wins=0, live_losses=0 at entry), the exit required 5 NEW trades      ║
+║  from a baseline of 0. But the AGREE requirement in RECOVERY blocked 75%    ║
+║  of valid setups (NEUTRAL momentum), making placement near-impossible.       ║
+║  Combined: permanent zero-trade deadlock for the rest of the session.        ║
 ║                                                                              ║
-║  v9.0.3 changes preserved: direction mismatch filter removed.               ║
-║  v9.0.2 changes preserved: active_tickers removed from global declaration.  ║
+║  FIX: Snapshot live_wins/live_losses into recovery_entry_wins/losses when   ║
+║  RECOVERY is triggered. Exit check uses (live_wins+live_losses) -           ║
+║  (recovery_entry_wins+recovery_entry_losses) as the trades-since-entry      ║
+║  counter. Win rate is measured over the same delta window.                   ║
+║                                                                              ║
+║  v9.0.4 changes preserved: active_tickers.difference_update(expired),       ║
+║  active_tickers removed from global declaration, direction mismatch filter  ║
+║  removed.                                                                    ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
 from __future__ import annotations
 
-BOT_VERSION = "9.0.4"
+BOT_VERSION = "9.0.5"
 
 import base64
 import logging
@@ -296,12 +309,14 @@ last_heartbeat_ts:      float = 0.0
 last_daily_summary_ts:  float = 0.0
 last_signal_desc:       str   = "none yet"
 
-session_state:       SessionState = SessionState.ACTIVE
-recovery_trades:     int          = 0
-_session_start_ts:   str          = ""
-_session_halted:     bool         = False
-_shutdown_requested: bool         = False
-_last_known_balance: float        = 0.0
+session_state:         SessionState = SessionState.ACTIVE
+recovery_trades:       int          = 0
+recovery_entry_wins:   int          = 0  # live_wins snapshot when RECOVERY entered
+recovery_entry_losses: int          = 0  # live_losses snapshot when RECOVERY entered
+_session_start_ts:     str          = ""
+_session_halted:       bool         = False
+_shutdown_requested:   bool         = False
+_last_known_balance:   float        = 0.0
 
 _prev_ob: dict = {}
 
@@ -749,7 +764,7 @@ def get_session_score() -> int:
 # ─────────────────────────────────────────────────────────────────────────────
 
 def update_session_state(current_balance: float) -> None:
-    global session_state, recovery_trades
+    global session_state, recovery_trades, recovery_entry_wins, recovery_entry_losses
 
     if session_state == SessionState.HALTED:
         return
@@ -758,22 +773,34 @@ def update_session_state(current_balance: float) -> None:
 
     if session_state == SessionState.ACTIVE:
         if loss_pct > RECOVERY_TRIGGER_PCT:
-            session_state   = SessionState.RECOVERY
-            recovery_trades = 0
-            log.warning("SESSION RECOVERY │ loss %.1f%%", loss_pct * 100)
+            session_state         = SessionState.RECOVERY
+            recovery_trades       = 0
+            recovery_entry_wins   = live_wins    # snapshot counters at entry
+            recovery_entry_losses = live_losses  # snapshot counters at entry
+            log.warning("SESSION RECOVERY │ loss %.1f%% │ entry snapshot W=%d L=%d",
+                        loss_pct * 100, recovery_entry_wins, recovery_entry_losses)
             tg.send_telegram_message(
                 f"⚠️ SESSION RECOVERY MODE\n"
                 f"Loss: {loss_pct*100:.1f}% — sizing halved."
             )
 
     elif session_state == SessionState.RECOVERY:
-        total_rec = live_wins + live_losses
-        if total_rec >= RECOVERY_EXIT_TRADES:
-            wr = live_wins / total_rec if total_rec > 0 else 0.0
+        # Exit check is measured from when RECOVERY was entered, not from session start.
+        # This prevents the deadlock where pre-restart losses trigger RECOVERY but the
+        # session W/L counters start at 0 and can never reach the exit threshold.
+        trades_since_entry = (
+            (live_wins + live_losses) - (recovery_entry_wins + recovery_entry_losses)
+        )
+        if trades_since_entry >= RECOVERY_EXIT_TRADES:
+            wins_since = live_wins - recovery_entry_wins
+            wr = wins_since / trades_since_entry if trades_since_entry > 0 else 0.0
             if wr >= RECOVERY_WIN_RATE_MIN:
                 session_state = SessionState.ACTIVE
-                log.info("RECOVERY EXITED │ WR=%.1f%%", wr * 100)
-                tg.send_telegram_message(f"✅ Recovery exited — WR {wr*100:.0f}%")
+                log.info("RECOVERY EXITED │ WR=%.1f%% (%d/%d since entry)",
+                         wr * 100, wins_since, trades_since_entry)
+                tg.send_telegram_message(
+                    f"✅ Recovery exited — WR {wr*100:.0f}% ({wins_since}/{trades_since_entry})"
+                )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -856,7 +883,10 @@ def resolve_open_orders() -> None:
     global paper_balance, paper_daily_pnl, consecutive_losses
     global running_pnl, live_wins, live_losses, streak_pause_until
 
-    if not open_orders:
+    if not open_orders and not DEMO_MODE:
+        # In live mode we still want to process unmatched settlements (pre-restart trades)
+        pass
+    elif not open_orders and DEMO_MODE:
         return
 
     if DEMO_MODE:
@@ -959,7 +989,26 @@ def resolve_open_orders() -> None:
                         break
 
             _processed_settlement_ids.add(rec_id)
+
             if not matched_oid:
+                # Pre-restart trade: no open_orders entry, but we must still count
+                # this settlement toward live W/L so RECOVERY can track progress
+                # and eventually exit. Without this, RECOVERY triggered by cross-
+                # session losses is permanently unexitable (W/L stays 0/0 forever).
+                pnl_d = _extract_realized_dollars(rec)
+                if pnl_d is not None and pnl_d != 0.0:
+                    if pnl_d > 0:
+                        live_wins += 1
+                        log.info("UNMATCHED WIN │ %s │ $%.2f (pre-restart)",
+                                 rec_ticker[-15:], pnl_d)
+                    else:
+                        live_losses += 1
+                        consecutive_losses += 1
+                        if consecutive_losses >= MAX_CONSEC_LOSSES:
+                            streak_pause_until = time.time() + STREAK_PAUSE_SECS
+                        log.info("UNMATCHED LOSS │ %s │ $%.2f (pre-restart)",
+                                 rec_ticker[-15:], pnl_d)
+                    update_live_prior()
                 continue
 
             trade = open_orders.pop(matched_oid)
@@ -1518,14 +1567,17 @@ def main() -> None:
     global live_wins, live_losses, streak_pause_until
     global _last_known_balance, _shutdown_requested, _session_start_ts
     global _session_halted, session_state, recovery_trades
+    global recovery_entry_wins, recovery_entry_losses
 
     init_base_url()
 
-    paper_balance     = float(os.environ.get("PAPER_BALANCE", "25.0"))
-    _session_start_ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    _session_halted   = False
-    session_state     = SessionState.ACTIVE
-    recovery_trades   = 0
+    paper_balance         = float(os.environ.get("PAPER_BALANCE", "25.0"))
+    _session_start_ts     = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _session_halted       = False
+    session_state         = SessionState.ACTIVE
+    recovery_trades       = 0
+    recovery_entry_wins   = 0
+    recovery_entry_losses = 0
 
     # In-place resets — no global declaration needed
     session_traded_tickers.clear()
@@ -1634,10 +1686,13 @@ def main() -> None:
                     live_bal  = get_live_balance()
                     daily_pnl = live_bal - session_start_balance
                     wlb       = wilson_lower_bound(live_wins, live_wins + live_losses)
+                    trades_since = (live_wins + live_losses) - (recovery_entry_wins + recovery_entry_losses)
                     log.info(
-                        "Portfolio │ $%.2f │ PnL=$%+.2f │ WR=%d/%d LB=%.1f%% │ Prior=%.3f │ %s",
+                        "Portfolio │ $%.2f │ PnL=$%+.2f │ WR=%d/%d LB=%.1f%% │ Prior=%.3f │ %s"
+                        "%s",
                         live_bal, daily_pnl, live_wins, live_wins + live_losses,
-                        wlb * 100, _live_prior, session_state.value
+                        wlb * 100, _live_prior, session_state.value,
+                        f" (rec+{trades_since})" if session_state == SessionState.RECOVERY else "",
                     )
                     if (datetime.now(timezone.utc).hour == 0
                             and time.time() - last_daily_summary_ts > 3600):
