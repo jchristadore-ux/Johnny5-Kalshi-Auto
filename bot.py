@@ -1,36 +1,37 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  JOHNNY5-KALSHI-AUTO  v9.0.5  —  Production Build                          ║
+║  JOHNNY5-KALSHI-AUTO  v9.0.6  —  Production Build                            ║
 ║  "No disassemble."                                                           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  v9.0.5 — RECOVERY DEADLOCK FIXED                                            ║
+║  v9.0.6 — UNMATCHED-SETTLEMENT TIME GATE                                     ║
 ║                                                                              ║
-║  BUG 1: Pre-restart settlements not counted toward live W/L counters        ║
-║  When Railway restarts the bot mid-session, open_orders.clear() is called   ║
-║  at boot. Settlements from trades placed before the restart arrived in       ║
-║  _fetch_settled_records() but the ticker_to_oid lookup found no match       ║
-║  (empty dict). Those records were marked in _processed_settlement_ids and   ║
-║  discarded without incrementing live_wins or live_losses. The balance drop  ║
-║  from those trades was real; the counters were not updated.                  ║
+║  BUG: /portfolio/settlements returns account-wide settlement history         ║
+║  (last 100 records). The since_ts argument passed to                         ║
+║  _fetch_settled_records() was never sent to this endpoint — only the         ║
+║  /portfolio/positions fallback honored created_since. v9.0.5's              ║
+║  unmatched-settlement counting therefore bulk-ingested historical            ║
+║  settlements on every boot: _processed_settlement_ids is cleared at start    ║
+║  and open_orders is empty, so up to 100 prior-session records were counted   ║
+║  as fresh wins/losses ~90s after launch. Effects: live_wins/live_losses      ║
+║  corrupted before the session's first trade, _live_prior dragged toward      ║
+║  stale history, the Wilson performance guard evaluated on data this          ║
+║  session never produced, and historical losses could trip a false            ║
+║  30-minute streak pause at boot.                                             ║
 ║                                                                              ║
-║  FIX: When a settlement has no matched open_orders entry, extract its PnL   ║
-║  and increment live_wins/live_losses accordingly.                            ║
+║  FIX: _is_post_boot() gates the unmatched branch — a settlement with no      ║
+║  open_orders match is counted only if its record timestamp is >= this        ║
+║  process's boot time (_session_start_ts). In-flight pre-restart trades       ║
+║  still count (their settlements are created AFTER boot), preserving the      ║
+║  v9.0.5 BUG-1 recovery fix. Records with missing/unparseable timestamps      ║
+║  are skipped (conservative). Trades placed AND settled entirely before a     ║
+║  restart are no longer back-counted — unavoidable without persistent         ║
+║  state, and strictly safer than ingesting account history.                   ║
+║  Also: unmatched WINs now reset consecutive_losses (parity with the          ║
+║  matched-settlement path).                                                   ║
 ║                                                                              ║
-║  BUG 2: RECOVERY exit counter measured from session start, not from when    ║
-║  RECOVERY was entered.                                                       ║
-║  update_session_state() checked total_rec = live_wins + live_losses >=      ║
-║  RECOVERY_EXIT_TRADES. If RECOVERY was triggered by cross-session losses    ║
-║  (live_wins=0, live_losses=0 at entry), the exit required 5 NEW trades      ║
-║  from a baseline of 0. But the AGREE requirement in RECOVERY blocked 75%    ║
-║  of valid setups (NEUTRAL momentum), making placement near-impossible.       ║
-║  Combined: permanent zero-trade deadlock for the rest of the session.        ║
-║                                                                              ║
-║  FIX: Snapshot live_wins/live_losses into recovery_entry_wins/losses when   ║
-║  RECOVERY is triggered. Exit check uses (live_wins+live_losses) -           ║
-║  (recovery_entry_wins+recovery_entry_losses) as the trades-since-entry      ║
-║  counter. Win rate is measured over the same delta window.                   ║
-║                                                                              ║
-║  v9.0.4 changes preserved: active_tickers.difference_update(expired),       ║
+║  v9.0.5 preserved: unmatched in-flight settlement counting, RECOVERY exit    ║
+║  measured from entry snapshot (recovery_entry_wins/losses).                  ║
+║  v9.0.4 preserved: active_tickers.difference_update(expired),                ║
 ║  active_tickers removed from global declaration, direction mismatch filter  ║
 ║  removed.                                                                    ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
@@ -38,7 +39,7 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "9.0.5"
+BOT_VERSION = "9.0.6"
 
 import base64
 import logging
@@ -855,6 +856,26 @@ def _extract_ticker(rec: dict) -> str:
     return ""
 
 
+def _is_post_boot(rec_time: str) -> bool:
+    """True iff an ISO-8601 record timestamp is at/after this process's boot
+    time (_session_start_ts). Missing or unparseable timestamps return False —
+    conservative: an unmatched settlement we cannot date is never counted.
+
+    v9.0.6: /portfolio/settlements has no server-side time filter and returns
+    account-wide history, so this gate is what keeps boot from bulk-ingesting
+    up to 100 historical settlements into live_wins/live_losses."""
+    if not rec_time or not _session_start_ts:
+        return False
+    try:
+        rec_dt = datetime.fromisoformat(str(rec_time).replace("Z", "+00:00"))
+        if rec_dt.tzinfo is None:
+            rec_dt = rec_dt.replace(tzinfo=timezone.utc)
+        boot_dt = datetime.fromisoformat(_session_start_ts.replace("Z", "+00:00"))
+        return rec_dt >= boot_dt
+    except Exception:
+        return False
+
+
 def _fetch_settled_records(since_ts: str) -> list:
     try:
         data = _get("/portfolio/settlements", {"limit": 100})
@@ -993,12 +1014,24 @@ def resolve_open_orders() -> None:
             if not matched_oid:
                 # Pre-restart trade: no open_orders entry, but we must still count
                 # this settlement toward live W/L so RECOVERY can track progress
-                # and eventually exit. Without this, RECOVERY triggered by cross-
-                # session losses is permanently unexitable (W/L stays 0/0 forever).
+                # and eventually exit (v9.0.5 BUG-1 fix).
+                #
+                # v9.0.6 GATE: /portfolio/settlements returns account-wide history
+                # with no server-side time filter, so an unmatched record is counted
+                # ONLY if it was created at/after this process's boot time. Without
+                # this gate, every boot bulk-ingests up to 100 historical settlements
+                # into live_wins/live_losses, corrupting the Wilson guard, the live
+                # prior, and the streak counter. In-flight pre-restart trades settle
+                # AFTER boot, so they still pass this gate and are still counted.
+                if not _is_post_boot(rec_created):
+                    log.debug("UNMATCHED SKIP │ %s │ pre-session record (%s)",
+                              rec_ticker[-15:], rec_created)
+                    continue
                 pnl_d = _extract_realized_dollars(rec)
                 if pnl_d is not None and pnl_d != 0.0:
                     if pnl_d > 0:
                         live_wins += 1
+                        consecutive_losses = 0
                         log.info("UNMATCHED WIN │ %s │ $%.2f (pre-restart)",
                                  rec_ticker[-15:], pnl_d)
                     else:
