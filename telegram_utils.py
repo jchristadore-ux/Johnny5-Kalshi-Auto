@@ -106,6 +106,7 @@ def send_trade_entry_notification(ticker: str, direction: str, cost: float,
 
 def send_win_notification(profit: float, balance: float, daily_pnl: float,
                            ticker: str, direction: str,
+                           wins: int = 0, losses: int = 0,
                            timestamp: Optional[datetime] = None) -> None:
     """Send a WIN alert on every settled winning trade."""
     if not _telegram_enabled:
@@ -116,17 +117,20 @@ def send_win_notification(profit: float, balance: float, daily_pnl: float,
     ts       = (timestamp or datetime.now(timezone.utc)).strftime("%H:%M UTC")
     pos      = "YES" if direction.upper() == "YES" else "NO"
     pnl_sign = "+" if daily_pnl >= 0 else ""
+    tally    = f"{wins}W / {losses}L" if (wins + losses) > 0 else "—"
     msg = (
-        f"✅ WIN — {ts}\n"
-        f"💰 +${profit:.2f}  │  {pos}  │  {ticker[-15:]}\n"
-        f"📅 Daily PnL: {pnl_sign}${daily_pnl:.2f}\n"
+        f"✅ TRADE SETTLED — WIN  {ts}\n"
+        f"📍 {pos}  │  {ticker[-15:]}\n"
+        f"💰 Profit: +${profit:.2f}\n"
+        f"📊 Today's Tally: {tally}  │  PnL: {pnl_sign}${daily_pnl:.2f}\n"
         f"🏦 Balance: ${balance:,.2f}"
     )
     send_telegram_message(msg)
 
 
 def send_loss_notification(loss: float, balance: float, daily_pnl: float,
-                            ticker: str, direction: str, streak: int) -> None:
+                            ticker: str, direction: str, streak: int,
+                            wins: int = 0, losses: int = 0) -> None:
     """Send a LOSS alert on every settled losing trade."""
     if not _telegram_enabled:
         return
@@ -134,10 +138,12 @@ def send_loss_notification(loss: float, balance: float, daily_pnl: float,
     pos        = "YES" if direction.upper() == "YES" else "NO"
     pnl_sign   = "+" if daily_pnl >= 0 else ""
     streak_str = f"  │  Streak: {streak}" if streak > 1 else ""
+    tally      = f"{wins}W / {losses}L" if (wins + losses) > 0 else "—"
     msg = (
-        f"❌ LOSS — {ts}\n"
-        f"💸 -${loss:.2f}  │  {pos}  │  {ticker[-15:]}{streak_str}\n"
-        f"📅 Daily PnL: {pnl_sign}${daily_pnl:.2f}\n"
+        f"❌ TRADE SETTLED — LOSS  {ts}\n"
+        f"📍 {pos}  │  {ticker[-15:]}{streak_str}\n"
+        f"💸 Loss: -${loss:.2f}\n"
+        f"📊 Today's Tally: {tally}  │  PnL: {pnl_sign}${daily_pnl:.2f}\n"
         f"🏦 Balance: ${balance:,.2f}"
     )
     send_telegram_message(msg)
