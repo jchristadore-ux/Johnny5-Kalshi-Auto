@@ -1008,6 +1008,7 @@ def resolve_open_orders() -> None:
                     profit=trade_pnl, balance=paper_balance,
                     daily_pnl=paper_daily_pnl,
                     ticker=ticker, direction=trade.get("side", "?"),
+                    wins=live_wins, losses=live_losses,
                 )
             else:
                 consecutive_losses += 1
@@ -1019,6 +1020,7 @@ def resolve_open_orders() -> None:
                     daily_pnl=paper_daily_pnl,
                     ticker=ticker, direction=trade.get("side", "?"),
                     streak=consecutive_losses,
+                    wins=live_wins, losses=live_losses,
                 )
 
             log.info("📋 PAPER SETTLED │ %s │ %s │ %s │ sim=%s │ bal=$%.2f",
@@ -1134,12 +1136,14 @@ def resolve_open_orders() -> None:
                 tg.send_win_notification(
                     profit=pnl, balance=balance, daily_pnl=live_daily_pnl,
                     ticker=rec_ticker, direction=trade.get("side", "?"),
+                    wins=live_wins, losses=live_losses,
                 )
             else:
                 tg.send_loss_notification(
                     loss=abs(pnl), balance=balance, daily_pnl=live_daily_pnl,
                     ticker=rec_ticker, direction=trade.get("side", "?"),
                     streak=consecutive_losses,
+                    wins=live_wins, losses=live_losses,
                 )
 
         update_live_prior()
