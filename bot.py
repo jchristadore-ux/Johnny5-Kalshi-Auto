@@ -1,8 +1,32 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  JOHNNY5-KALSHI-AUTO  v9.0.7  —  Production Build                          ║
+║  JOHNNY5-KALSHI-AUTO  v9.0.8  —  Production Build                          ║
 ║  "No disassemble."                                                           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
+║  v9.0.8 — PERF-GUARD DEADLOCK FIX (boot-time settlement gate)                ║
+║                                                                              ║
+║  DIAGNOSIS (2026-06-11→12 LIVE session, v9.0.7, ~561 scans, ZERO trades):   ║
+║  - PERF GUARD fired 1307×: Wilson LB 30.9% < 50% on every scan.             ║
+║  - Portfolio froze at WR=28/70, 42 consecutive losses, balance flat $9.19.  ║
+║  - The 28W/70L were NOT this session's trades — they were account history.  ║
+║                                                                              ║
+║  Root cause: /portfolio/settlements ignores created_since and returns the   ║
+║  account-wide last 100 settlements. resolve_open_orders()'s unmatched       ║
+║  branch counted ALL of them toward live_wins/live_losses with no time gate  ║
+║  (tickers like -26JUN09… are days old). v9.0.7's _extract_realized_dollars  ║
+║  rewrite made those records yield non-zero PnL (pre-9.0.7 they returned 0   ║
+║  and were dropped), so the leak became active and seeded a sub-50% Wilson   ║
+║  LB the bot could never escape — it can't trade, so it can't recover. The   ║
+║  stale losses also tripped a permanent streak pause.                        ║
+║                                                                              ║
+║  FIX: _is_post_boot(rec) gates the unmatched-settlement branch. A record    ║
+║  counts only if its timestamp >= _session_start_ts. In-flight pre-restart   ║
+║  trades settle AFTER boot and are preserved; account history settled before ║
+║  boot is skipped. Missing/unparseable timestamps are treated as NOT         ║
+║  post-boot (conservative). The 9.0.6 changelog described this gate but it   ║
+║  was never present in the code.                                             ║
+║                                                                              ║
+║  ─────────────────────────────────────────────────────────────────────     ║
 ║  v9.0.7 — SETTLEMENT SCHEMA CORRECTED (the critical fix)                     ║
 ║                                                                              ║
 ║  DIAGNOSIS (2026-06-08 LIVE session, v9.0.5, 1071 scans, 8 trades):         ║
@@ -46,7 +70,7 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "9.0.7"
+BOT_VERSION = "9.0.8"
 
 import base64
 import logging
@@ -929,6 +953,38 @@ def _extract_ticker(rec: dict) -> str:
     return ""
 
 
+def _is_post_boot(rec: dict) -> bool:
+    """
+    True if a settlement record was created at/after this process's boot time.
+
+    v9.0.8: the /portfolio/settlements endpoint ignores created_since and always
+    returns the account-wide last 100 settlements. The unmatched-settlement
+    branch in resolve_open_orders() counts these toward live_wins/live_losses so
+    RECOVERY can exit on pre-restart trades — but with no time gate it ingests
+    days of account history on every boot. In the 2026-06-11 LIVE session this
+    seeded WR=28/70 (Wilson LB 30.9%), permanently failing performance_guard()'s
+    50% floor and freezing the bot: 1307 PERF GUARD warnings, zero trades.
+
+    Gate: only count a settlement whose timestamp is >= _session_start_ts. A
+    pre-restart trade still in flight settles AFTER boot, so it is preserved;
+    trades settled entirely before this boot (account history) are excluded.
+    Records with a missing/unparseable timestamp are treated as NOT post-boot
+    (conservative — never back-count ambiguous history).
+    """
+    if not _session_start_ts:
+        return False
+    rec_ts = (rec.get("settled_time") or rec.get("created_time")
+              or rec.get("timestamp") or "")
+    if not rec_ts:
+        return False
+    try:
+        rec_ts = str(rec_ts).replace("Z", "+00:00")
+        boot_ts = _session_start_ts.replace("Z", "+00:00")
+        return datetime.fromisoformat(rec_ts) >= datetime.fromisoformat(boot_ts)
+    except Exception:
+        return False
+
+
 def _fetch_settled_records(since_ts: str) -> list:
     try:
         data = _get("/portfolio/settlements", {"limit": 100})
@@ -1066,7 +1122,14 @@ def resolve_open_orders() -> None:
             _processed_settlement_ids.add(rec_id)
 
             if not matched_oid:
-                # Pre-restart trade: count toward W/L so RECOVERY can exit
+                # Pre-restart trade: count toward W/L so RECOVERY can exit.
+                # v9.0.8: ONLY if settled at/after boot. The settlements endpoint
+                # returns account-wide history (created_since is ignored), so an
+                # ungated count here ingests days of stale W/L and deadlocks the
+                # Wilson performance guard. In-flight pre-restart trades settle
+                # after boot and are still counted; account history is skipped.
+                if not _is_post_boot(rec):
+                    continue
                 pnl_d = _extract_realized_dollars(rec)
                 if pnl_d is not None and pnl_d != 0.0:
                     if pnl_d > 0:

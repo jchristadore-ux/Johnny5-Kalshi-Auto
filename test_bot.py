@@ -36,6 +36,37 @@ import bot
 from bot import Regime, SessionState
 
 
+class TestPostBootSettlementGate:
+    """v9.0.8: the unmatched-settlement branch must only count records settled
+    at/after boot. /portfolio/settlements ignores created_since and returns
+    account-wide history; counting it all deadlocked the Wilson perf guard."""
+
+    def setup_method(self):
+        bot._session_start_ts = "2026-06-11T23:00:00Z"
+
+    def teardown_method(self):
+        bot._session_start_ts = ""
+
+    def test_account_history_before_boot_excluded(self):
+        assert bot._is_post_boot({"settled_time": "2026-06-09T15:15:00Z"}) is False
+
+    def test_in_flight_settled_after_boot_counted(self):
+        assert bot._is_post_boot({"settled_time": "2026-06-11T23:45:00Z"}) is True
+
+    def test_created_time_fallback(self):
+        assert bot._is_post_boot({"created_time": "2026-06-11T23:45:00Z"}) is True
+
+    def test_missing_timestamp_excluded(self):
+        assert bot._is_post_boot({}) is False
+
+    def test_unparseable_timestamp_excluded(self):
+        assert bot._is_post_boot({"settled_time": "garbage"}) is False
+
+    def test_no_boot_ts_excluded(self):
+        bot._session_start_ts = ""
+        assert bot._is_post_boot({"settled_time": "2026-06-11T23:45:00Z"}) is False
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 # P0: RISK CONTROLS
 # ═════════════════════════════════════════════════════════════════════════════
