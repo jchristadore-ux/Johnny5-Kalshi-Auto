@@ -44,9 +44,10 @@
 ║      yes_count_fp, yes_total_cost_dollars                                    ║
 ║                                                                              ║
 ║  FIX: _extract_realized_dollars() rewritten against the REAL schema:        ║
-║    pnl = revenue - yes_total_cost_dollars - no_total_cost_dollars - fee_cost ║
-║  Verified against the logged balance trajectory (+$2.00 jump on a $0.80     ║
-║  bet @ 27¢ reconstructs to +$1.46 net, matching session P&L).               ║
+║    pnl = (revenue/100) - yes_total_cost_dollars - no_total_cost_dollars      ║
+║          - fee_cost                                                           ║
+║  `revenue` is returned in CENTS by Kalshi (same as the balance endpoint);   ║
+║  the *_dollars cost/fee fields are already in dollars.                       ║
 ║                                                                              ║
 ║  v9.0.6 throughput changes RETAINED (this build supersedes v9.0.6):         ║
 ║  1. R2_TREND_THRESHOLD default 0.70 → 0.62                                  ║
@@ -892,15 +893,12 @@ def _extract_realized_dollars(rec: dict, trade_cost: Optional[float] = None) -> 
         yes_count_fp, yes_total_cost_dollars
 
     Reconstruction:
-        pnl = revenue - yes_total_cost_dollars - no_total_cost_dollars - fee_cost
+        pnl = (revenue / 100) - yes_total_cost_dollars - no_total_cost_dollars - fee_cost
 
-    This works because a position is held on exactly one side, so the unheld
-    side's cost field is 0. `revenue` is the settlement payout (count × $1 on a
-    win, $0 on a loss). `fee_cost` is subtracted.
-
-    Verified against logged balance trajectory: a $0.80 bet @ 27¢ (2 contracts,
-    cost $0.54) producing a +$2.00 balance jump reconstructs to
-    pnl = 2.00 - 0.54 - 0 - fee ≈ +$1.46, matching observed session P&L.
+    `revenue` is returned in CENTS by the Kalshi settlements endpoint (same unit
+    as the balance endpoint which requires /100). The *_dollars cost fields and
+    fee_cost are returned in dollars. Dividing revenue by 100 before subtracting
+    the dollar-denominated costs prevents the ~100× profit inflation bug.
 
     Direct PnL fields are still tried first in case Kalshi adds them later.
     """
@@ -916,8 +914,11 @@ def _extract_realized_dollars(rec: dict, trade_cost: Optional[float] = None) -> 
             return v / 100.0 if k.endswith("_cents") else v
 
     # 2) Real KXBTC15M reconstruction: revenue - total cost - fees
+    # Kalshi settlement API returns revenue in cents (same as balance endpoint);
+    # cost/fee fields named *_dollars are already in dollars.
     revenue = _coerce_float(rec.get("revenue"))
     if revenue is not None:
+        revenue /= 100.0
         yes_cost = _coerce_float(rec.get("yes_total_cost_dollars")) or 0.0
         no_cost  = _coerce_float(rec.get("no_total_cost_dollars"))  or 0.0
         fee      = _coerce_float(rec.get("fee_cost")) or 0.0
