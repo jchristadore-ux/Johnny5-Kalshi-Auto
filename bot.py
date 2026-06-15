@@ -1,9 +1,40 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  JOHNNY5-KALSHI-AUTO  v9.0.8  —  Production Build                          ║
+║  JOHNNY5-KALSHI-AUTO  v9.0.9  —  Production Build                          ║
 ║  "No disassemble."                                                           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  v9.0.8 — PERF-GUARD DEADLOCK FIX (boot-time settlement gate)                ║
+║  v9.0.9 — RECOVERY DEADLOCK FIX (balance-based recovery exit)                ║
+║                                                                              ║
+║  DIAGNOSIS (2026-06-15 LIVE session, v9.0.8, ~3h slice, ZERO trades):       ║
+║  - Portfolio status byte-identical all window:                              ║
+║      $16.30 │ PnL=$-1.43 │ WR=2/4 │ RECOVERY (rec+2)                         ║
+║  - 20 strong directional OB signals generated (up to 99.8% imbalance,       ║
+║    $33k-$149k near-money depth). 18 killed by "Recovery │ AGREE required,    ║
+║    got NEUTRAL", 2 by OB-fade. 0 trades, 0 settlements.                      ║
+║                                                                              ║
+║  Root cause: a self-referential lock. RECOVERY forces momentum==AGREE for   ║
+║  every trade. In a calm market BTC momentum is NEUTRAL on essentially every  ║
+║  scan, so the AGREE gate rejects 100% of signals. update_session_state()'s   ║
+║  ONLY recovery exit was the trade-count path (>=5 trades since entry, WR>=   ║
+║  60%) — but the AGREE gate is what prevents those trades from accumulating.  ║
+║  Recovery needs trades to exit; recovery's own gate blocks the trades. The   ║
+║  counter froze at rec+2 and could never reach 5. Current drawdown had even   ║
+║  healed to ~8% (below the 10% RECOVERY_TRIGGER_PCT) yet stayed locked        ║
+║  because recovery had no balance-based exit.                                 ║
+║                                                                              ║
+║  FIX: update_session_state() now exits RECOVERY when loss_pct recovers to    ║
+║  at/below RECOVERY_TRIGGER_PCT — the exact mirror of the entry condition.    ║
+║  The drawdown that triggered recovery healing is sufficient to return to     ║
+║  ACTIVE regardless of trade count. The trade-count exit is RETAINED as a     ║
+║  faster path when AGREE trades do settle. No edge/Kelly/loss-cap parameter   ║
+║  is loosened — this only fixes an unreachable state-machine exit.            ║
+║                                                                              ║
+║  NOTE: this exits the instant loss_pct is at/below the trigger (symmetric    ║
+║  with entry). If observed to flap on a balance oscillating around the        ║
+║  trigger, tighten the exit to RECOVERY_TRIGGER_PCT * 0.5 for hysteresis.     ║
+║                                                                              ║
+║  ─────────────────────────────────────────────────────────────────────     ║
+║  v9.0.8 — PERF-GUARD DEADLOCK FIX (boot-time settlement gate)               ║
 ║                                                                              ║
 ║  DIAGNOSIS (2026-06-11→12 LIVE session, v9.0.7, ~561 scans, ZERO trades):   ║
 ║  - PERF GUARD fired 1307×: Wilson LB 30.9% < 50% on every scan.             ║
@@ -23,7 +54,7 @@
 ║  counts only if its timestamp >= _session_start_ts. In-flight pre-restart   ║
 ║  trades settle AFTER boot and are preserved; account history settled before ║
 ║  boot is skipped. Missing/unparseable timestamps are treated as NOT         ║
-║  post-boot (conservative). The 9.0.6 changelog described this gate but it   ║
+║  post-boot (conservative). The 9.0.6 changelog described this gate but it    ║
 ║  was never present in the code.                                             ║
 ║                                                                              ║
 ║  ─────────────────────────────────────────────────────────────────────     ║
@@ -55,12 +86,8 @@
 ║  3. NEUTRAL_ACCURACY_DRAG default 0.02 → 0.0                               ║
 ║  4. OB_IMBALANCE_THRESH default → 0.64                                      ║
 ║                                                                              ║
-║  NOTE: the v9.0.6 throughput numbers (288 scans, R²=0.70) came from a       ║
-║  DIFFERENT earlier log slice. This 1071-scan session already shows          ║
-║  R²=0.62-era throughput is healthy: 86 OB reached, 40 passed, 8 traded.     ║
-║                                                                              ║
 ║  RAILWAY ENV VAR CHANGES REQUIRED (if not already applied):                  ║
-║  - OB_IMBALANCE_THRESH: set to 0.64                                         ║
+║  - OB_IMBALANCE_THRESH: set to 0.64  (logs still show 0.68 — NOT applied)   ║
 ║  - R2_TREND_THRESHOLD:  delete or set to 0.62                               ║
 ║  - NEUTRAL_ACCURACY_DRAG: delete or set to 0.0                              ║
 ║                                                                              ║
@@ -71,7 +98,7 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "9.0.8"
+BOT_VERSION = "9.0.9"
 
 import base64
 import logging
@@ -831,6 +858,25 @@ def update_session_state(current_balance: float) -> None:
             )
 
     elif session_state == SessionState.RECOVERY:
+        # v9.0.9: BALANCE-BASED EXIT (primary).
+        # Recovery entry is gated on loss_pct > RECOVERY_TRIGGER_PCT; the exit
+        # must be reachable the same way. The trade-count exit below deadlocks
+        # in calm markets — RECOVERY forces momentum==AGREE, BTC momentum is
+        # NEUTRAL on most scans, so trades never accumulate and recovery never
+        # clears (2026-06-15 session: 18 strong OB signals rejected, counter
+        # frozen at rec+2, 0 trades for hours). If the drawdown that triggered
+        # recovery has healed back to at/below the trigger, return to ACTIVE
+        # regardless of trade count. No edge/Kelly/loss-cap parameter loosened.
+        if loss_pct <= RECOVERY_TRIGGER_PCT:
+            session_state = SessionState.ACTIVE
+            log.info("RECOVERY EXITED │ drawdown healed (loss %.1f%% ≤ trigger %.1f%%)",
+                     loss_pct * 100, RECOVERY_TRIGGER_PCT * 100)
+            tg.send_telegram_message(
+                f"✅ Recovery exited — drawdown healed ({loss_pct*100:.1f}%)"
+            )
+            return
+
+        # Trade-count exit (faster path when AGREE trades do settle).
         trades_since_entry = (
             (live_wins + live_losses) - (recovery_entry_wins + recovery_entry_losses)
         )
