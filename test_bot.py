@@ -34,6 +34,58 @@ os.environ["KALSHI_PRIVATE_KEY_PEM"] = _test_pem
 import pytest
 import bot
 from bot import Regime, SessionState
+from ladder import StakeLadder, LadderConfig
+
+
+class _FakeClock:
+    def __init__(self, t=1_700_000_000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+    def advance(self, secs):
+        self.t += secs
+
+
+class TestLadderIntegration:
+    """The laddering overlay scales the Kelly stake but never breaks the bot's
+    existing caps. It is opt-in: bot.stake_ladder is None unless LADDER_ENABLED."""
+
+    def teardown_method(self):
+        bot.stake_ladder = None
+
+    def test_disabled_by_default_leaves_kelly_unchanged(self):
+        bot.stake_ladder = None
+        bet = bot.kelly_bet(0.65, 50, 100.0)
+        assert bet > 0  # plain Kelly path, no overlay
+
+    def test_overlay_scales_up_on_hot_record(self):
+        clk = _FakeClock()
+        lad = StakeLadder(cfg=LadderConfig(persist=False, min_trades=10,
+                                           cooldown_secs=0), clock=clk)
+        for _ in range(12):
+            lad.on_trade_result(True, 2.0)
+            clk.advance(60)
+        bot.stake_ladder = None
+        plain = bot.kelly_bet(0.65, 50, 1000.0)
+        bot.stake_ladder = lad
+        laddered = bot.kelly_bet(0.65, 50, 1000.0)
+        # 2x tier sizes up vs the un-laddered Kelly stake (subject to caps).
+        assert laddered >= plain
+
+    def test_overlay_never_exceeds_2x_cap(self):
+        clk = _FakeClock()
+        lad = StakeLadder(cfg=LadderConfig(persist=False, min_trades=10,
+                                           max_multiplier=2.0, cooldown_secs=0),
+                          clock=clk)
+        for _ in range(12):
+            lad.on_trade_result(True, 2.0)
+            clk.advance(60)
+        bot.stake_ladder = lad
+        # Large balance so the balance-fraction cap is not the binding limit.
+        bet = bot.kelly_bet(0.65, 50, 100_000.0)
+        assert bet <= 2.0 * bot.TRADE_SIZE_CAP + 1e-9
 
 
 class TestPostBootSettlementGate:
