@@ -118,6 +118,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
 import telegram_utils as tg
+from ladder import StakeLadder
 
 # ─────────────────────────────────────────────────────────────────────────────
 # LOGGING
@@ -190,6 +191,12 @@ TRADE_SIZE_CAP      = _env_float("TRADE_SIZE_DOLLARS", 5.0)
 MAX_BET_FRACTION    = _env_float("MAX_BET_FRACTION", 0.08)
 KELLY_FRACTION      = _env_float("KELLY_FRACTION", 0.30)
 KELLY_RECOVERY_MULT = _env_float("KELLY_RECOVERY_MULT", 0.50)
+
+# ── Laddering stake overlay (opt-in) ──────────────────────────────────────────
+# Scales the Kelly stake by a performance-driven multiplier (0.5x–2x). Disabled
+# by default so live sizing is unchanged until explicitly switched on with
+# LADDER_ENABLED=true. See ladder.py and LADDER_STRATEGY.md.
+LADDER_ENABLED = _env_bool("LADDER_ENABLED", False)
 
 # ── Risk controls ─────────────────────────────────────────────────────────────
 MIN_BALANCE_FLOOR     = _env_float("MIN_BALANCE_FLOOR", 5.0)
@@ -392,6 +399,10 @@ _vol_circuit_open:  bool  = False
 _vol_circuit_until: float = 0.0
 
 _live_prior: float = OB_BASE_ACCURACY
+
+# Laddering stake overlay — only instantiated when LADDER_ENABLED. Sized as a
+# multiplier on top of the Kelly stake; respects every existing cap.
+stake_ladder: Optional[StakeLadder] = StakeLadder() if LADDER_ENABLED else None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -765,6 +776,15 @@ def calc_edge(win_prob: float, contract_price_cents: int) -> float:
     return (win_prob * net) - ((1.0 - win_prob) * stake)
 
 
+def ladder_record(won: bool, pnl: float) -> None:
+    """Feed a settled trade outcome to the laddering overlay (no-op if off)."""
+    if stake_ladder is not None:
+        try:
+            stake_ladder.on_trade_result(won, pnl)
+        except Exception as e:
+            log.warning("Ladder record error: %s", e)
+
+
 def kelly_bet(win_prob: float, contract_price_cents: int, balance: float) -> float:
     if contract_price_cents <= 0 or contract_price_cents >= 100:
         return 0.0
@@ -773,7 +793,18 @@ def kelly_bet(win_prob: float, contract_price_cents: int, balance: float) -> flo
     kf         = KELLY_FRACTION
     if session_state == SessionState.RECOVERY:
         kf *= KELLY_RECOVERY_MULT
-    return round(min(full_kelly * kf * balance, TRADE_SIZE_CAP, balance * MAX_BET_FRACTION), 2)
+    base_bet = round(min(full_kelly * kf * balance, TRADE_SIZE_CAP,
+                         balance * MAX_BET_FRACTION), 2)
+
+    # Laddering overlay (opt-in). Scales the Kelly stake by a performance
+    # multiplier, but never past 2× the trade-size cap or the balance fraction.
+    if stake_ladder is not None:
+        ceiling  = min(stake_ladder.cfg.max_multiplier * TRADE_SIZE_CAP,
+                       balance * MAX_BET_FRACTION)
+        decision = stake_ladder.get_stake(base_bet, max_stake=ceiling)
+        return decision.stake
+
+    return base_bet
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1126,6 +1157,8 @@ def resolve_open_orders() -> None:
                     wins=live_wins, losses=live_losses,
                 )
 
+            ladder_record(won, trade_pnl)
+
             log.info("📋 PAPER SETTLED │ %s │ %s │ %s │ sim=%s │ bal=$%.2f",
                      ticker[-15:], side, result.upper(), sim, paper_balance)
 
@@ -1190,6 +1223,7 @@ def resolve_open_orders() -> None:
                             streak_pause_until = time.time() + STREAK_PAUSE_SECS
                         log.info("UNMATCHED LOSS │ %s │ $%.2f (pre-restart)",
                                  rec_ticker[-15:], pnl_d)
+                    ladder_record(pnl_d > 0, pnl_d)
                     update_live_prior()
                 continue
 
@@ -1236,6 +1270,8 @@ def resolve_open_orders() -> None:
                 live_losses += 1
                 if consecutive_losses >= MAX_CONSEC_LOSSES:
                     streak_pause_until = time.time() + STREAK_PAUSE_SECS
+
+            ladder_record(won, pnl)
 
             wlb = wilson_lower_bound(live_wins, live_wins + live_losses)
             log.info("✅ SETTLED │ %s │ %s │ $%.2f │ WR=%d/%d │ LB=%.1f%%",

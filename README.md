@@ -36,6 +36,9 @@ Posts limit orders one cent inside the best bid/ask. Kalshi makers pay zero fee.
 
 **v5.3.0: Stale order cancellation** — unfilled maker orders are automatically canceled after 5 minutes (configurable) to free capital for better opportunities.
 
+### Sizing — Laddering Stake Overlay *(opt-in)*
+A performance-driven overlay on the Kelly stake that scales trade size by a multiplier (0.5×–2×) based on the win rate over a rolling window of recent trades. Sizes up when the edge is paying off, demotes/pauses on losing streaks and daily drawdown, and enforces an anti-chase cooldown after every loss. **Adapts stake size only — never the strategy or signals.** Disabled by default; set `LADDER_ENABLED=true` to activate. See [`LADDER_STRATEGY.md`](LADDER_STRATEGY.md) and [`ladder.py`](ladder.py).
+
 ---
 
 ## Risk Controls
