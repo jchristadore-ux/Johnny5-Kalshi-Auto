@@ -1,86 +1,73 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  JOHNNY5-KALSHI-AUTO  v9.0.9  —  Production Build                          ║
+║  JOHNNY5-KALSHI-AUTO  v9.0.10  —  Production Build                         ║
 ║  "No disassemble."                                                           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  v9.0.9 — RECOVERY DEADLOCK FIX (balance-based recovery exit)                ║
+║  v9.0.10 — PERF-GUARD DEADLOCK FIX (session-scoped Wilson sample)            ║
 ║                                                                              ║
-║  DIAGNOSIS (2026-06-15 LIVE session, v9.0.8, ~3h slice, ZERO trades):       ║
-║  - Portfolio status byte-identical all window:                              ║
-║      $16.30 │ PnL=$-1.43 │ WR=2/4 │ RECOVERY (rec+2)                         ║
-║  - 20 strong directional OB signals generated (up to 99.8% imbalance,       ║
-║    $33k-$149k near-money depth). 18 killed by "Recovery │ AGREE required,    ║
-║    got NEUTRAL", 2 by OB-fade. 0 trades, 0 settlements.                      ║
+║  DIAGNOSIS (2026-06-18 LIVE session, v9.0.9, ~4h slice, ZERO trades):       ║
+║  - Portfolio status byte-identical the whole window:                        ║
+║      $48.14 │ PnL=$+20.36 │ WR=11/20 │ LB=37.2% │ ACTIVE                     ║
+║  - 322 market scans. 64 killed by expiry guard, 258 killed by PERF GUARD    ║
+║    (Wilson LB 37.2% < 50%). 0 scans reached regime/OB/momentum. 0 orders,   ║
+║    0 in-window settlements. RESOLVE frozen at "100 settled, 0 open".        ║
+║                                                                              ║
+║  Root cause: an absorbing-state lock, same shape as the v9.0.9 RECOVERY     ║
+║  deadlock. performance_guard() keyed on live_wins/live_losses, which the    ║
+║  v9.0.5 unmatched branch seeds with PRE-RESTART / account-history           ║
+║  settlements (correct for RECOVERY exit + Bayesian prior, but wrong as the  ║
+║  Layer-3 statistical gate's sample). On this boot, ~20 in-flight-at-restart ║
+║  trades settled post-boot → live counters inherited 11/20 → Wilson LB       ║
+║  37.2% < 50% → guard blocks all trades → no trade can settle → the 11/20    ║
+║  sample can never move → guard blocks forever. The +$20.36 is real; the     ║
+║  edge is paying. The bot was locked out of a profitable session by a guard  ║
+║  evaluating inherited history it cannot influence.                          ║
+║                                                                              ║
+║  FIX: split the perf-guard sample from the lifetime counters.               ║
+║  - session_wins / session_losses: incremented ONLY for trades THIS session  ║
+║    placed (matched-settlement branch, paper + live). performance_guard()    ║
+║    now evaluates these.                                                      ║
+║  - live_wins / live_losses: unchanged — still count matched AND unmatched    ║
+║    pre-restart settlements. RECOVERY exit, Bayesian prior, and all displays  ║
+║    keep full-history behavior (no regression).                              ║
+║  On boot session counters reset to 0/0, so the guard extends benefit-of-    ║
+║  the-doubt until 20 trades THIS session settle (doctrine Layer 3 intent),   ║
+║  rather than booting straight into a locked inherited sub-50% LB. Mirrors    ║
+║  the v9.0.8 post-boot gate, applied to the perf-guard counters. No edge,    ║
+║  Kelly, loss-cap, or the 50% Wilson floor is loosened.                      ║
+║                                                                              ║
+║  NOTE: clearing the perf guard exposes the next gate (R²≥0.62, OB depth     ║
+║  ≥$75, momentum AGREE). Those had ZERO data this session because no scan     ║
+║  reached them. Do not expect immediate fills — watch the first session.     ║
+║                                                                              ║
+║  ─────────────────────────────────────────────────────────────────────     ║
+║  v9.0.9 — RECOVERY DEADLOCK FIX (balance-based recovery exit)               ║
 ║                                                                              ║
 ║  Root cause: a self-referential lock. RECOVERY forces momentum==AGREE for   ║
 ║  every trade. In a calm market BTC momentum is NEUTRAL on essentially every  ║
 ║  scan, so the AGREE gate rejects 100% of signals. update_session_state()'s   ║
 ║  ONLY recovery exit was the trade-count path (>=5 trades since entry, WR>=   ║
 ║  60%) — but the AGREE gate is what prevents those trades from accumulating.  ║
-║  Recovery needs trades to exit; recovery's own gate blocks the trades. The   ║
-║  counter froze at rec+2 and could never reach 5. Current drawdown had even   ║
-║  healed to ~8% (below the 10% RECOVERY_TRIGGER_PCT) yet stayed locked        ║
-║  because recovery had no balance-based exit.                                 ║
-║                                                                              ║
 ║  FIX: update_session_state() now exits RECOVERY when loss_pct recovers to    ║
 ║  at/below RECOVERY_TRIGGER_PCT — the exact mirror of the entry condition.    ║
-║  The drawdown that triggered recovery healing is sufficient to return to     ║
-║  ACTIVE regardless of trade count. The trade-count exit is RETAINED as a     ║
-║  faster path when AGREE trades do settle. No edge/Kelly/loss-cap parameter   ║
-║  is loosened — this only fixes an unreachable state-machine exit.            ║
-║                                                                              ║
-║  NOTE: this exits the instant loss_pct is at/below the trigger (symmetric    ║
-║  with entry). If observed to flap on a balance oscillating around the        ║
-║  trigger, tighten the exit to RECOVERY_TRIGGER_PCT * 0.5 for hysteresis.     ║
 ║                                                                              ║
 ║  ─────────────────────────────────────────────────────────────────────     ║
 ║  v9.0.8 — PERF-GUARD DEADLOCK FIX (boot-time settlement gate)               ║
 ║                                                                              ║
-║  DIAGNOSIS (2026-06-11→12 LIVE session, v9.0.7, ~561 scans, ZERO trades):   ║
-║  - PERF GUARD fired 1307×: Wilson LB 30.9% < 50% on every scan.             ║
-║  - Portfolio froze at WR=28/70, 42 consecutive losses, balance flat $9.19.  ║
-║  - The 28W/70L were NOT this session's trades — they were account history.  ║
-║                                                                              ║
-║  Root cause: /portfolio/settlements ignores created_since and returns the   ║
-║  account-wide last 100 settlements. resolve_open_orders()'s unmatched       ║
-║  branch counted ALL of them toward live_wins/live_losses with no time gate  ║
-║  (tickers like -26JUN09… are days old). v9.0.7's _extract_realized_dollars  ║
-║  rewrite made those records yield non-zero PnL (pre-9.0.7 they returned 0   ║
-║  and were dropped), so the leak became active and seeded a sub-50% Wilson   ║
-║  LB the bot could never escape — it can't trade, so it can't recover. The   ║
-║  stale losses also tripped a permanent streak pause.                        ║
-║                                                                              ║
 ║  FIX: _is_post_boot(rec) gates the unmatched-settlement branch. A record    ║
 ║  counts only if its timestamp >= _session_start_ts. In-flight pre-restart   ║
 ║  trades settle AFTER boot and are preserved; account history settled before ║
-║  boot is skipped. Missing/unparseable timestamps are treated as NOT         ║
-║  post-boot (conservative). The 9.0.6 changelog described this gate but it    ║
-║  was never present in the code.                                             ║
+║  boot is skipped. Missing/unparseable timestamps treated as NOT post-boot.  ║
 ║                                                                              ║
 ║  ─────────────────────────────────────────────────────────────────────     ║
 ║  v9.0.7 — SETTLEMENT SCHEMA CORRECTED (the critical fix)                     ║
 ║                                                                              ║
-║  DIAGNOSIS (2026-06-08 LIVE session, v9.0.5, 1071 scans, 8 trades):         ║
-║  - 8 trades fired, balance $9.46 → $11.60 (+$2.14, ~+23% session).          ║
-║    THE EDGE IS REAL AND PROFITABLE.                                          ║
-║  - But every settlement was DROPPED: WR=0/0, WLB=n/a for the full 11hr      ║
-║    session. The Wilson gate, prior update, and RECOVERY tracking are all    ║
-║    fed by counters that never moved. Profit was invisible to every risk     ║
-║    and sizing system.                                                        ║
-║  - Root cause: the real KXBTC15M settlement record has NO realized_pnl or   ║
-║    profit field. v9.0.6's guessed field names (revenue_dollars, profit)     ║
-║    did not match. Logged record keys are:                                   ║
-║      event_ticker, fee_cost, market_result, no_count_fp,                    ║
-║      no_total_cost_dollars, revenue, settled_time, ticker, value,           ║
-║      yes_count_fp, yes_total_cost_dollars                                    ║
-║                                                                              ║
-║  FIX: _extract_realized_dollars() rewritten against the REAL schema:        ║
+║  _extract_realized_dollars() rewritten against the REAL schema:             ║
 ║    pnl = (revenue/100) - yes_total_cost_dollars - no_total_cost_dollars      ║
 ║          - fee_cost                                                           ║
-║  `revenue` is returned in CENTS by Kalshi (same as the balance endpoint);   ║
-║  the *_dollars cost/fee fields are already in dollars.                       ║
+║  `revenue` is returned in CENTS by Kalshi; *_dollars cost/fee already $.     ║
 ║                                                                              ║
-║  v9.0.6 throughput changes RETAINED (this build supersedes v9.0.6):         ║
+║  v9.0.6 throughput changes RETAINED:                                         ║
 ║  1. R2_TREND_THRESHOLD default 0.70 → 0.62                                  ║
 ║  2. compute_confidence(): NEUTRAL momentum 2.0 → 8.0 pts                    ║
 ║  3. NEUTRAL_ACCURACY_DRAG default 0.02 → 0.0                               ║
@@ -90,15 +77,12 @@
 ║  - OB_IMBALANCE_THRESH: set to 0.64  (logs still show 0.68 — NOT applied)   ║
 ║  - R2_TREND_THRESHOLD:  delete or set to 0.62                               ║
 ║  - NEUTRAL_ACCURACY_DRAG: delete or set to 0.0                              ║
-║                                                                              ║
-║  v9.0.5 changes preserved: pre-restart settlement W/L counting,             ║
-║  recovery entry snapshot, difference_update, active_tickers global fix.     ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 """
 
 from __future__ import annotations
 
-BOT_VERSION = "9.0.9"
+BOT_VERSION = "9.0.10"
 
 import base64
 import logging
@@ -375,6 +359,12 @@ session_start_balance:  float = 0.0
 session_stop_threshold: float = 0.0
 live_wins:              int   = 0
 live_losses:            int   = 0
+# v9.0.10: perf-guard sample — ONLY trades placed by THIS session. Reset to 0/0
+# on boot. live_wins/live_losses still carry full history (matched + pre-restart
+# unmatched) for RECOVERY exit, the Bayesian prior, and displays; these two
+# carry only this session's settled trades and feed performance_guard().
+session_wins:           int   = 0
+session_losses:         int   = 0
 consecutive_losses:     int   = 0
 streak_pause_until:     float = 0.0
 running_pnl:            float = 0.0
@@ -845,12 +835,26 @@ def update_live_prior() -> None:
 
 
 def performance_guard() -> bool:
-    total = live_wins + live_losses
+    # v9.0.10: gate on THIS SESSION's settled trades only (session_wins/
+    # session_losses), NOT the full live_wins/live_losses counters. The full
+    # counters include pre-restart / account-history settlements ingested via
+    # the v9.0.5 unmatched branch (correct for RECOVERY exit + Bayesian prior).
+    # Feeding those into the Layer-3 statistical gate let a restart boot
+    # straight into a locked sub-50% Wilson LB on inherited history — and
+    # because the guard blocks trading, and only trading produces the
+    # settlements that would move the WR, the lock was permanent
+    # (2026-06-18 session: WR frozen 11/20, LB 37.2%, 258 PERF GUARD blocks,
+    # 0 trades despite +$20.36 realized). Session counters reset to 0/0 on boot
+    # so the guard extends benefit-of-the-doubt until MIN_SAMPLE_TRADES settle
+    # this session, then evaluates the strategy as it is actually trading. The
+    # 50% Wilson floor and MIN_SAMPLE_TRADES are unchanged.
+    total = session_wins + session_losses
     if total < MIN_SAMPLE_TRADES:
         return True
-    wlb = wilson_lower_bound(live_wins, total)
+    wlb = wilson_lower_bound(session_wins, total)
     if wlb < 0.50:
-        log.warning("PERF GUARD │ Wilson LB %.1f%% < 50%%", wlb * 100)
+        log.warning("PERF GUARD │ session Wilson LB %.1f%% < 50%% (n=%d, %dW/%dL)",
+                    wlb * 100, total, session_wins, session_losses)
         return False
     return True
 
@@ -894,10 +898,8 @@ def update_session_state(current_balance: float) -> None:
         # must be reachable the same way. The trade-count exit below deadlocks
         # in calm markets — RECOVERY forces momentum==AGREE, BTC momentum is
         # NEUTRAL on most scans, so trades never accumulate and recovery never
-        # clears (2026-06-15 session: 18 strong OB signals rejected, counter
-        # frozen at rec+2, 0 trades for hours). If the drawdown that triggered
-        # recovery has healed back to at/below the trigger, return to ACTIVE
-        # regardless of trade count. No edge/Kelly/loss-cap parameter loosened.
+        # clears. If the drawdown that triggered recovery has healed back to
+        # at/below the trigger, return to ACTIVE regardless of trade count.
         if loss_pct <= RECOVERY_TRIGGER_PCT:
             session_state = SessionState.ACTIVE
             log.info("RECOVERY EXITED │ drawdown healed (loss %.1f%% ≤ trigger %.1f%%)",
@@ -908,6 +910,8 @@ def update_session_state(current_balance: float) -> None:
             return
 
         # Trade-count exit (faster path when AGREE trades do settle).
+        # Uses full live counters intentionally — RECOVERY tracks all settled
+        # trades since entry, including pre-restart ones (v9.0.5/9.0.8 design).
         trades_since_entry = (
             (live_wins + live_losses) - (recovery_entry_wins + recovery_entry_losses)
         )
@@ -1039,15 +1043,11 @@ def _is_post_boot(rec: dict) -> bool:
     returns the account-wide last 100 settlements. The unmatched-settlement
     branch in resolve_open_orders() counts these toward live_wins/live_losses so
     RECOVERY can exit on pre-restart trades — but with no time gate it ingests
-    days of account history on every boot. In the 2026-06-11 LIVE session this
-    seeded WR=28/70 (Wilson LB 30.9%), permanently failing performance_guard()'s
-    50% floor and freezing the bot: 1307 PERF GUARD warnings, zero trades.
-
-    Gate: only count a settlement whose timestamp is >= _session_start_ts. A
-    pre-restart trade still in flight settles AFTER boot, so it is preserved;
-    trades settled entirely before this boot (account history) are excluded.
-    Records with a missing/unparseable timestamp are treated as NOT post-boot
-    (conservative — never back-count ambiguous history).
+    days of account history on every boot. Gate: only count a settlement whose
+    timestamp is >= _session_start_ts. A pre-restart trade still in flight
+    settles AFTER boot, so it is preserved; trades settled entirely before this
+    boot (account history) are excluded. Records with a missing/unparseable
+    timestamp are treated as NOT post-boot (conservative).
     """
     if not _session_start_ts:
         return False
@@ -1090,6 +1090,7 @@ def _fetch_settled_records(since_ts: str) -> list:
 def resolve_open_orders() -> None:
     global paper_balance, paper_daily_pnl, consecutive_losses
     global running_pnl, live_wins, live_losses, streak_pause_until
+    global session_wins, session_losses
 
     if not open_orders and not DEMO_MODE:
         pass
@@ -1138,6 +1139,7 @@ def resolve_open_orders() -> None:
             if won:
                 consecutive_losses = 0
                 live_wins += 1
+                session_wins += 1      # v9.0.10: this-session matched trade
                 tg.send_win_notification(
                     profit=trade_pnl, balance=paper_balance,
                     daily_pnl=paper_daily_pnl,
@@ -1147,6 +1149,7 @@ def resolve_open_orders() -> None:
             else:
                 consecutive_losses += 1
                 live_losses += 1
+                session_losses += 1    # v9.0.10: this-session matched trade
                 if consecutive_losses >= MAX_CONSEC_LOSSES:
                     streak_pause_until = time.time() + STREAK_PAUSE_SECS
                 tg.send_loss_notification(
@@ -1202,12 +1205,10 @@ def resolve_open_orders() -> None:
             _processed_settlement_ids.add(rec_id)
 
             if not matched_oid:
-                # Pre-restart trade: count toward W/L so RECOVERY can exit.
-                # v9.0.8: ONLY if settled at/after boot. The settlements endpoint
-                # returns account-wide history (created_since is ignored), so an
-                # ungated count here ingests days of stale W/L and deadlocks the
-                # Wilson performance guard. In-flight pre-restart trades settle
-                # after boot and are still counted; account history is skipped.
+                # Pre-restart trade: count toward full W/L so RECOVERY can exit.
+                # v9.0.8: ONLY if settled at/after boot. v9.0.10: these do NOT
+                # feed session_wins/session_losses — the perf guard must not be
+                # seeded by inherited (even if recent) account settlements.
                 if not _is_post_boot(rec):
                     continue
                 pnl_d = _extract_realized_dollars(rec)
@@ -1265,18 +1266,20 @@ def resolve_open_orders() -> None:
             if won:
                 consecutive_losses = 0
                 live_wins += 1
+                session_wins += 1      # v9.0.10: this-session matched trade
             else:
                 consecutive_losses += 1
                 live_losses += 1
+                session_losses += 1    # v9.0.10: this-session matched trade
                 if consecutive_losses >= MAX_CONSEC_LOSSES:
                     streak_pause_until = time.time() + STREAK_PAUSE_SECS
 
             ladder_record(won, pnl)
 
-            wlb = wilson_lower_bound(live_wins, live_wins + live_losses)
-            log.info("✅ SETTLED │ %s │ %s │ $%.2f │ WR=%d/%d │ LB=%.1f%%",
+            wlb = wilson_lower_bound(session_wins, session_wins + session_losses)
+            log.info("✅ SETTLED │ %s │ %s │ $%.2f │ sess=%d/%d │ LB=%.1f%%",
                      rec_ticker[-15:], result.upper(), pnl,
-                     live_wins, live_wins + live_losses, wlb * 100)
+                     session_wins, session_wins + session_losses, wlb * 100)
 
             if won:
                 tg.send_win_notification(
@@ -1579,7 +1582,8 @@ def telegram_boot(balance: float) -> None:
         f"DailyLoss≤${MAX_DAILY_LOSS:.0f} | Floor=${MIN_BALANCE_FLOOR:.0f}\n"
         f"MinConf={MIN_CONFIDENCE} | MinWinP={MIN_WIN_PROB*100:.0f}% | R²≥{R2_TREND_THRESHOLD}\n"
         f"OBDepth≥${MIN_OB_DEPTH:.0f} | OBImb≥{OB_IMBALANCE_THRESH*100:.0f}%\n"
-        f"SessionScore≥{MIN_SESSION_SCORE} | Kelly={KELLY_FRACTION}"
+        f"SessionScore≥{MIN_SESSION_SCORE} | Kelly={KELLY_FRACTION}\n"
+        f"PerfGuard sample: session-scoped (0/0 at boot)"
     )
 
 
@@ -1639,7 +1643,7 @@ def run_decision(market: dict, balance: float) -> None:
         last_signal_desc = f"streak pause ({consecutive_losses}L)"
         return
     if not performance_guard():
-        last_signal_desc = "perf guard (Wilson LB < 50%)"
+        last_signal_desc = "perf guard (session Wilson LB < 50%)"
         return
     if not session_quality_check():
         last_signal_desc = f"session quality UTC{datetime.now(timezone.utc).hour}"
@@ -1749,9 +1753,9 @@ def run_decision(market: dict, balance: float) -> None:
         log.info("Limit drift │ %dc too far", limit_price)
         return
 
-    total   = live_wins + live_losses
-    wlb_str = (f" WLB={wilson_lower_bound(live_wins, total)*100:.1f}%"
-               if total >= 10 else " WLB=n/a")
+    sess_total = session_wins + session_losses
+    wlb_str = (f" sWLB={wilson_lower_bound(session_wins, sess_total)*100:.1f}%"
+               if sess_total >= 10 else " sWLB=n/a")
 
     log.info(
         "📋 EDGE JUSTIFICATION │ %s %s @ %dc │ regime=%s(R²=%.2f) │ "
@@ -1786,7 +1790,7 @@ def main() -> None:
     global session_start_balance, session_stop_threshold, daily_pnl
     global paper_balance, paper_daily_pnl, last_trade_ts, last_daily_summary_ts
     global consecutive_losses, last_signal_desc, last_heartbeat_ts, running_pnl
-    global live_wins, live_losses, streak_pause_until
+    global live_wins, live_losses, session_wins, session_losses, streak_pause_until
     global _last_known_balance, _shutdown_requested, _session_start_ts
     global _session_halted, session_state, recovery_trades
     global recovery_entry_wins, recovery_entry_losses
@@ -1812,7 +1816,7 @@ def main() -> None:
              R2_TREND_THRESHOLD, VOLATILITY_CAP_PCT, VOL_CIRCUIT_BREAKER)
     log.info("  OB depth≥$%.0f imb≥%.0f%% | WinP≥%.0f%% Edge≥%.0f%%",
              MIN_OB_DEPTH, OB_IMBALANCE_THRESH * 100, MIN_WIN_PROB * 100, MIN_EDGE_PCT * 100)
-    log.info("  Kelly=%.2f cap=%.0f%% | SessionScore≥%d",
+    log.info("  Kelly=%.2f cap=%.0f%% | SessionScore≥%d | PerfGuard=session-scoped",
              KELLY_FRACTION, MAX_BET_FRACTION * 100, MIN_SESSION_SCORE)
     log.info("━" * 70)
 
@@ -1820,6 +1824,8 @@ def main() -> None:
 
     live_wins          = 0
     live_losses        = 0
+    session_wins       = 0      # v9.0.10: perf-guard sample resets each boot
+    session_losses     = 0
     streak_pause_until = 0.0
 
     if DEMO_MODE:
@@ -1907,12 +1913,14 @@ def main() -> None:
                     live_bal  = get_live_balance()
                     daily_pnl = live_bal - session_start_balance
                     wlb       = wilson_lower_bound(live_wins, live_wins + live_losses)
+                    sess_total   = session_wins + session_losses
                     trades_since = (live_wins + live_losses) - (recovery_entry_wins + recovery_entry_losses)
                     log.info(
-                        "Portfolio │ $%.2f │ PnL=$%+.2f │ WR=%d/%d LB=%.1f%% │ Prior=%.3f │ %s"
-                        "%s",
+                        "Portfolio │ $%.2f │ PnL=$%+.2f │ WR=%d/%d LB=%.1f%% │ "
+                        "sess=%d/%d │ Prior=%.3f │ %s%s",
                         live_bal, daily_pnl, live_wins, live_wins + live_losses,
-                        wlb * 100, _live_prior, session_state.value,
+                        wlb * 100, session_wins, sess_total,
+                        _live_prior, session_state.value,
                         f" (rec+{trades_since})" if session_state == SessionState.RECOVERY else "",
                     )
                     if (datetime.now(timezone.utc).hour == 0
