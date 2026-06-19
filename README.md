@@ -45,13 +45,14 @@ A performance-driven overlay on the Kelly stake that scales trade size by a mult
 
 | Control | Behavior |
 |---|---|
-| Balance floor | Halts if balance < MIN_BALANCE_FLOOR ($5 default) |
+| Balance floor | Halts (permanently) if balance < MIN_BALANCE_FLOOR ($5 default) |
 | Session stop | Halts if balance drops below 50% of session-start balance |
-| Daily loss cap | Halts if session P&L ≤ -MAX_DAILY_LOSS_DOLLARS |
+| Daily loss cap | Halts if session P&L ≤ the **tighter** of `MAX_DAILY_LOSS_DOLLARS` and `MAX_DAILY_LOSS_FRACTION` × session-start balance (default 15%) |
+| Consecutive-loss halt *(v9.0.11)* | Halts after `MAX_CONSEC_LOSSES` consecutive losses (default 3); counter clears only on a win or a new-day resume |
+| Auto-restart *(v9.0.11)* | A daily-loss / drawdown / streak halt auto-resumes at the next UTC trading-day rollover with daily counters reset (set `AUTO_RESTART=false` to keep halts permanent) |
 | Position guard | One entry per market ticker, no re-entry until expiry |
 | Expiry guard | Skips contracts priced >85c or <15c (near-certain outcome, zero EV) |
 | Spread guard | Skips zero/crossed spreads (broken book) |
-| Streak filter | After 3 consecutive losses, skips one window then resets counter |
 | **Liquidity filter** *(v5.3.0)* | Skips low-liquidity UTC hours (default 4-8 UTC / midnight-4am ET) |
 | **Concurrent limit** *(v5.3.0)* | Max simultaneous open positions (default 2) |
 | **Stale cancel** *(v5.3.0)* | Auto-cancels unfilled orders after timeout (default 300s) |
@@ -136,8 +137,11 @@ Upload all files to a new GitHub repo. Commit to `main`.
 | `DEMO_MODE` | `true` | Set `false` for live trading |
 | `TRADER_MODE` | `quant` | Only `quant` is recommended for live |
 | `TRADE_SIZE_DOLLARS` | `5` | Max dollars per trade |
-| `MAX_DAILY_LOSS_DOLLARS` | `20` | Hard stop loss per session |
-| `MIN_BALANCE_FLOOR` | `5` | Halt if balance drops below this |
+| `MAX_DAILY_LOSS_DOLLARS` | `15` | Dollar stop loss per day |
+| `MAX_DAILY_LOSS_FRACTION` | `0.15` | Daily loss cap as a fraction of session-start balance; effective cap is the tighter of this and the dollar cap (0 disables) |
+| `AUTO_RESTART` | `true` | Auto-resume daily halts at the next UTC day rollover |
+| `HALT_RECHECK_SECS` | `900` | How often a halted bot re-checks for the day rollover |
+| `MIN_BALANCE_FLOOR` | `5` | Permanent halt if balance drops below this |
 | `YES_BREAKEVEN_PRICE` | `67` | Skip contracts above this price (cents) |
 | `KELLY_FRACTION` | `0.35` | Grid-search optimal — do not raise without backtesting |
 | `MAX_CONSEC_LOSSES` | `3` | Streak filter threshold |

@@ -1,8 +1,34 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  JOHNNY5-KALSHI-AUTO  v9.0.10  —  Production Build                         ║
+║  JOHNNY5-KALSHI-AUTO  v9.0.11  —  Production Build                         ║
 ║  "No disassemble."                                                           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
+║  v9.0.11 — DRAWDOWN CONTROL + AUTO-RESTART                                   ║
+║                                                                              ║
+║  DIAGNOSIS (2026-06-18 LIVE session, v9.0.10):                              ║
+║  - Account $48.14 → $33.03. Five orders, FIVE straight losers, -$15.11      ║
+║    (31% of bankroll) before the daily-loss cap finally halted at 19:30.      ║
+║  - After halting the bot logged "Permanently halted — sleeping 1hr" on an    ║
+║    infinite loop and never traded again (18h of dead air in the logs).       ║
+║                                                                              ║
+║  Root causes:                                                               ║
+║  1. Daily-loss cap was a flat $15 — 31% of a $48 account. Far too loose for ║
+║     a small bankroll; let five losers through before stopping.              ║
+║  2. The consecutive-loss breaker only PAUSED 30 min then reset the counter. ║
+║     30 min ≈ the 15-min market settle cadence, so the streak never built up  ║
+║     to block a trade. It was effectively a no-op.                           ║
+║  3. A halt was terminal — sleep(3600) forever, no recovery on a new day.    ║
+║                                                                              ║
+║  FIX:                                                                       ║
+║  - Daily-loss cap is now the TIGHTER of $MAX_DAILY_LOSS_DOLLARS and         ║
+║    MAX_DAILY_LOSS_FRACTION × session-start balance (default 15%).           ║
+║  - MAX_CONSEC_LOSSES (default 3) now HALTS the session instead of a         ║
+║    self-resetting pause; the counter only clears on a win or a new day.     ║
+║  - AUTO_RESTART (default on): a daily-loss / drawdown / streak halt          ║
+║    auto-resumes at the next UTC trading-day rollover with daily counters    ║
+║    reset. Balance-floor halts stay permanent.                              ║
+║                                                                              ║
+║  ─────────────────────────────────────────────────────────────────────     ║
 ║  v9.0.10 — PERF-GUARD DEADLOCK FIX (session-scoped Wilson sample)            ║
 ║                                                                              ║
 ║  DIAGNOSIS (2026-06-18 LIVE session, v9.0.9, ~4h slice, ZERO trades):       ║
@@ -82,7 +108,7 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "9.0.10"
+BOT_VERSION = "9.0.11"
 
 import base64
 import logging
@@ -185,12 +211,29 @@ LADDER_ENABLED = _env_bool("LADDER_ENABLED", False)
 # ── Risk controls ─────────────────────────────────────────────────────────────
 MIN_BALANCE_FLOOR     = _env_float("MIN_BALANCE_FLOOR", 5.0)
 MAX_DAILY_LOSS        = _env_float("MAX_DAILY_LOSS_DOLLARS", 15.0)
+# v9.0.11: also cap the daily loss as a fraction of the session's STARTING
+# balance. The effective cap is the *tighter* of the dollar and fractional
+# limits, so a small account can't bleed a third of its bankroll before the
+# halt fires (2026-06-18: a flat $15 cap = 31% of a $48 account). Set to 0 to
+# disable the fractional cap and use the dollar cap alone.
+MAX_DAILY_LOSS_FRACTION = _env_float("MAX_DAILY_LOSS_FRACTION", 0.15)
 SESSION_STOP_FRACTION = _env_float("SESSION_STOP_FRACTION", 0.40)
-MAX_CONSEC_LOSSES     = _env_int("MAX_CONSEC_LOSSES", 2)
+# v9.0.11: default 2 → 3. This is now a HARD halt (see _trigger_halt), not a
+# self-resetting 30-min pause — the old pause was shorter than the market
+# settle cadence and never actually blocked a trade.
+MAX_CONSEC_LOSSES     = _env_int("MAX_CONSEC_LOSSES", 3)
 STREAK_PAUSE_SECS     = _env_int("STREAK_PAUSE_SECS", 1800)
 STALE_ORDER_TIMEOUT   = _env_int("STALE_ORDER_TIMEOUT", 300)
 MAX_CONCURRENT_POS    = _env_int("MAX_CONCURRENT_POS", 1)
 MIN_SAMPLE_TRADES     = _env_int("MIN_SAMPLE_TRADES", 20)
+
+# v9.0.11: auto-restart after a halt. A daily-loss / drawdown / consecutive-loss
+# halt is a *daily* stop — it auto-resumes at the next UTC trading-day rollover
+# with the daily counters reset, instead of sleeping forever. Balance-floor
+# halts (account effectively empty) stay permanent. Disable with
+# AUTO_RESTART=false to restore the old permanent-halt behavior.
+AUTO_RESTART          = _env_bool("AUTO_RESTART", True)
+HALT_RECHECK_SECS     = _env_int("HALT_RECHECK_SECS", 900)
 
 # ── Regime detection ──────────────────────────────────────────────────────────
 # v9.0.6: default lowered from 0.70 → 0.62.
@@ -380,6 +423,9 @@ recovery_entry_wins:   int          = 0
 recovery_entry_losses: int          = 0
 _session_start_ts:     str          = ""
 _session_halted:       bool         = False
+_halt_reason:          str          = ""    # human-readable cause of the halt
+_halt_day:             str          = ""    # UTC date (YYYY-MM-DD) the halt began
+_halt_permanent:       bool         = False # True = never auto-resume (e.g. floor)
 _shutdown_requested:   bool         = False
 _last_known_balance:   float        = 0.0
 
@@ -1151,7 +1197,8 @@ def resolve_open_orders() -> None:
                 live_losses += 1
                 session_losses += 1    # v9.0.10: this-session matched trade
                 if consecutive_losses >= MAX_CONSEC_LOSSES:
-                    streak_pause_until = time.time() + STREAK_PAUSE_SECS
+                    _trigger_halt(
+                        f"{consecutive_losses} consecutive losses", paper_balance)
                 tg.send_loss_notification(
                     loss=abs(trade_pnl), balance=paper_balance,
                     daily_pnl=paper_daily_pnl,
@@ -1219,9 +1266,9 @@ def resolve_open_orders() -> None:
                                  rec_ticker[-15:], pnl_d)
                     else:
                         live_losses += 1
-                        consecutive_losses += 1
-                        if consecutive_losses >= MAX_CONSEC_LOSSES:
-                            streak_pause_until = time.time() + STREAK_PAUSE_SECS
+                        # v9.0.11: pre-restart settlements are inherited history;
+                        # they update the lifetime counters but must NOT halt the
+                        # fresh session via the consecutive-loss breaker.
                         log.info("UNMATCHED LOSS │ %s │ $%.2f (pre-restart)",
                                  rec_ticker[-15:], pnl_d)
                     ladder_record(pnl_d > 0, pnl_d)
@@ -1272,7 +1319,8 @@ def resolve_open_orders() -> None:
                 live_losses += 1
                 session_losses += 1    # v9.0.10: this-session matched trade
                 if consecutive_losses >= MAX_CONSEC_LOSSES:
-                    streak_pause_until = time.time() + STREAK_PAUSE_SECS
+                    _trigger_halt(
+                        f"{consecutive_losses} consecutive losses", balance)
 
             ladder_record(won, pnl)
 
@@ -1422,20 +1470,78 @@ def balance_floor_check(balance: float) -> bool:
     return True
 
 
+def _utc_day() -> str:
+    """UTC calendar date as YYYY-MM-DD — the trading-day key for halt resets."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def effective_daily_loss_cap() -> float:
+    """Tighter of the dollar cap and the fraction-of-starting-balance cap.
+
+    v9.0.11: a flat dollar cap is dangerous on a small account ($15 was 31% of
+    the $48 account on 2026-06-18). The fractional cap scales the stop with the
+    bankroll; whichever bites first wins.
+    """
+    cap = MAX_DAILY_LOSS
+    if MAX_DAILY_LOSS_FRACTION > 0 and session_start_balance > 0:
+        cap = min(cap, MAX_DAILY_LOSS_FRACTION * session_start_balance)
+    return cap
+
+
+def _trigger_halt(reason: str, balance: float, permanent: bool = False) -> None:
+    """Halt trading. Daily halts auto-resume next UTC day unless permanent."""
+    global _session_halted, _halt_reason, _halt_day, _halt_permanent, session_state
+    if _session_halted:
+        return
+    _session_halted = True
+    _halt_reason    = reason
+    _halt_day       = _utc_day()
+    _halt_permanent = permanent or not AUTO_RESTART
+    session_state   = SessionState.HALTED
+    mode = "PERMANENT" if _halt_permanent else "auto-resume next UTC day"
+    log.warning("HALT │ %s — %s", reason, mode)
+    telegram_halt(reason, balance, permanent=_halt_permanent)
+
+
+def halt_can_resume() -> bool:
+    """A non-permanent daily halt may resume once the UTC day has rolled over."""
+    return (_session_halted and not _halt_permanent and AUTO_RESTART
+            and _utc_day() != _halt_day)
+
+
+def resume_from_halt(balance: float) -> None:
+    """Clear a daily halt and reset the daily risk counters for the new day."""
+    global _session_halted, _halt_reason, _halt_day, session_state
+    global consecutive_losses, paper_daily_pnl, daily_pnl
+    global session_start_balance, session_stop_threshold, _session_start_ts
+    _session_halted    = False
+    _halt_reason       = ""
+    _halt_day          = ""
+    session_state      = SessionState.ACTIVE
+    consecutive_losses = 0
+    paper_daily_pnl    = 0.0
+    daily_pnl          = 0.0
+    # Re-baseline the session so the daily-loss and drawdown stops measure the
+    # NEW day, not cumulative damage from before the halt.
+    session_start_balance  = balance
+    session_stop_threshold = balance * SESSION_STOP_FRACTION
+    _session_start_ts      = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    log.info("RESUMED │ new UTC day — daily counters reset │ bal=$%.2f", balance)
+    telegram_resume(balance)
+
+
 def daily_loss_check(balance: float) -> bool:
-    global _session_halted
     if _session_halted:
         return False
     pnl = paper_daily_pnl if DEMO_MODE else daily_pnl
-    if pnl <= -MAX_DAILY_LOSS:
-        _session_halted = True
-        log.warning("DAILY LOSS │ $%.2f — halted.", abs(pnl))
-        telegram_halt(f"Daily loss cap ${abs(pnl):.2f}", balance)
+    cap = effective_daily_loss_cap()
+    if pnl <= -cap:
+        log.warning("DAILY LOSS │ $%.2f ≥ cap $%.2f — halted.", abs(pnl), cap)
+        _trigger_halt(f"Daily loss cap ${abs(pnl):.2f}", balance)
         return False
     if session_stop_threshold > 0 and balance < session_stop_threshold:
-        _session_halted = True
         log.warning("SESSION STOP │ $%.2f < $%.2f — halted.", balance, session_stop_threshold)
-        telegram_halt(f"Session stop at ${balance:.2f}", balance)
+        _trigger_halt(f"Session stop at ${balance:.2f}", balance)
         return False
     return True
 
@@ -1472,12 +1578,16 @@ def session_quality_check() -> bool:
 
 
 def streak_check() -> bool:
-    global consecutive_losses
+    # v9.0.11: a consecutive-loss streak now HALTS the session (see
+    # resolve_open_orders → _trigger_halt) rather than a brief pause that reset
+    # the counter on expiry. The old 30-min pause was shorter than the ~15-min
+    # market settle cadence, so the streak never accumulated enough to block a
+    # trade — it let five straight losers through on 2026-06-18. The counter
+    # only clears on a win or a new-day auto-resume. This stays as a defensive
+    # gate for any path that bumped the counter without halting.
     if consecutive_losses >= MAX_CONSEC_LOSSES:
-        if time.time() < streak_pause_until:
-            log.info("Streak pause │ %d consec losses", consecutive_losses)
-            return False
-        consecutive_losses = 0
+        log.info("Streak halt │ %d consec losses", consecutive_losses)
+        return False
     return True
 
 
@@ -1587,9 +1697,16 @@ def telegram_boot(balance: float) -> None:
     )
 
 
-def telegram_halt(reason: str, balance: float) -> None:
+def telegram_halt(reason: str, balance: float, permanent: bool = False) -> None:
+    tag = "PERMANENT" if permanent else "auto-resume next UTC day"
     tg.send_telegram_message(
-        f"⛔ HALTED (PERMANENT)\nReason: {reason}\nBalance: ${balance:.2f}"
+        f"⛔ HALTED ({tag})\nReason: {reason}\nBalance: ${balance:.2f}"
+    )
+
+
+def telegram_resume(balance: float) -> None:
+    tg.send_telegram_message(
+        f"🟢 RESUMED — new trading day\nDaily counters reset\nBalance: ${balance:.2f}"
     )
 
 
@@ -1818,6 +1935,9 @@ def main() -> None:
              MIN_OB_DEPTH, OB_IMBALANCE_THRESH * 100, MIN_WIN_PROB * 100, MIN_EDGE_PCT * 100)
     log.info("  Kelly=%.2f cap=%.0f%% | SessionScore≥%d | PerfGuard=session-scoped",
              KELLY_FRACTION, MAX_BET_FRACTION * 100, MIN_SESSION_SCORE)
+    log.info("  DailyLoss≤$%.0f/%.0f%% | MaxConsecLoss=%d | AutoRestart=%s",
+             MAX_DAILY_LOSS, MAX_DAILY_LOSS_FRACTION * 100, MAX_CONSEC_LOSSES,
+             "on" if AUTO_RESTART else "off")
     log.info("━" * 70)
 
     tg.validate_telegram_connection()
@@ -1858,9 +1978,20 @@ def main() -> None:
     while not _shutdown_requested:
         try:
             if _session_halted:
-                log.info("Permanently halted — sleeping 1hr.")
-                time.sleep(3600)
-                continue
+                if halt_can_resume():
+                    resume_bal = paper_balance if DEMO_MODE else get_live_balance()
+                    resume_from_halt(resume_bal)
+                    # fall through into the normal cycle on the new day
+                elif _halt_permanent:
+                    log.info("Permanently halted (%s) — sleeping %dm.",
+                             _halt_reason or "?", HALT_RECHECK_SECS // 60)
+                    time.sleep(HALT_RECHECK_SECS)
+                    continue
+                else:
+                    log.info("Halted (%s) — auto-resume next UTC day. Recheck in %dm.",
+                             _halt_reason or "?", HALT_RECHECK_SECS // 60)
+                    time.sleep(HALT_RECHECK_SECS)
+                    continue
 
             if time.time() - last_heartbeat_ts >= 900:
                 last_heartbeat_ts = time.time()
