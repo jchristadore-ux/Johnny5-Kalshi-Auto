@@ -144,6 +144,11 @@ class TestBalanceFloorCheck:
 class TestDailyLossCheck:
     def setup_method(self):
         bot._session_halted = False
+        bot._halt_permanent = False
+        bot._halt_day       = ""
+        # Disable the v9.0.11 fractional cap for these dollar-cap tests so a
+        # leaked session_start_balance can't change the effective cap.
+        bot.session_start_balance = 0.0
 
     def test_within_limit(self, monkeypatch):
         monkeypatch.setattr(bot, "DEMO_MODE", True)
@@ -194,6 +199,83 @@ class TestDailyLossCheck:
         # Even with high balance, stays halted
         result2 = bot.daily_loss_check(50.0)
         assert result2 is False
+
+
+class TestDrawdownAndAutoRestart:
+    """v9.0.11: fractional daily-loss cap, consecutive-loss halt, auto-restart."""
+
+    def setup_method(self):
+        bot._session_halted  = False
+        bot._halt_permanent  = False
+        bot._halt_day        = ""
+        bot._halt_reason     = ""
+
+    def test_fractional_cap_is_tighter(self, monkeypatch):
+        monkeypatch.setattr(bot, "MAX_DAILY_LOSS", 15.0)
+        monkeypatch.setattr(bot, "MAX_DAILY_LOSS_FRACTION", 0.15)
+        monkeypatch.setattr(bot, "session_start_balance", 48.0)
+        # 15% of $48 = $7.20 < $15 flat cap
+        assert bot.effective_daily_loss_cap() == 48.0 * 0.15
+
+    def test_dollar_cap_when_no_start_balance(self, monkeypatch):
+        monkeypatch.setattr(bot, "MAX_DAILY_LOSS", 15.0)
+        monkeypatch.setattr(bot, "MAX_DAILY_LOSS_FRACTION", 0.15)
+        monkeypatch.setattr(bot, "session_start_balance", 0.0)
+        assert bot.effective_daily_loss_cap() == 15.0
+
+    def test_fractional_cap_halts_early(self, monkeypatch):
+        monkeypatch.setattr(bot, "DEMO_MODE", True)
+        monkeypatch.setattr(bot, "MAX_DAILY_LOSS", 15.0)
+        monkeypatch.setattr(bot, "MAX_DAILY_LOSS_FRACTION", 0.15)
+        monkeypatch.setattr(bot, "session_start_balance", 48.0)
+        monkeypatch.setattr(bot, "session_stop_threshold", 0.0)
+        # -$8 exceeds the $7.20 fractional cap even though it's under the $15 flat
+        monkeypatch.setattr(bot, "paper_daily_pnl", -8.0)
+        assert bot.daily_loss_check(40.0) is False
+        assert bot._session_halted is True
+
+    def test_trigger_halt_sets_fields(self, monkeypatch):
+        monkeypatch.setattr(bot, "AUTO_RESTART", True)
+        bot._trigger_halt("test reason", 40.0)
+        assert bot._session_halted is True
+        assert bot._halt_permanent is False
+        assert bot._halt_reason == "test reason"
+        assert bot._halt_day == bot._utc_day()
+
+    def test_trigger_halt_permanent_when_autorestart_off(self, monkeypatch):
+        monkeypatch.setattr(bot, "AUTO_RESTART", False)
+        bot._trigger_halt("floor", 1.0)
+        assert bot._halt_permanent is True
+
+    def test_halt_can_resume_only_on_new_day(self, monkeypatch):
+        monkeypatch.setattr(bot, "AUTO_RESTART", True)
+        bot._session_halted = True
+        bot._halt_permanent = False
+        bot._halt_day = bot._utc_day()
+        assert bot.halt_can_resume() is False
+        bot._halt_day = "2000-01-01"
+        assert bot.halt_can_resume() is True
+
+    def test_halt_permanent_never_resumes(self, monkeypatch):
+        monkeypatch.setattr(bot, "AUTO_RESTART", True)
+        bot._session_halted = True
+        bot._halt_permanent = True
+        bot._halt_day = "2000-01-01"
+        assert bot.halt_can_resume() is False
+
+    def test_resume_resets_daily_counters(self, monkeypatch):
+        monkeypatch.setattr(bot, "SESSION_STOP_FRACTION", 0.40)
+        bot._session_halted    = True
+        bot.consecutive_losses = 5
+        bot.paper_daily_pnl    = -10.0
+        bot.daily_pnl          = -10.0
+        bot.resume_from_halt(50.0)
+        assert bot._session_halted is False
+        assert bot.consecutive_losses == 0
+        assert bot.paper_daily_pnl == 0.0
+        assert bot.daily_pnl == 0.0
+        assert bot.session_start_balance == 50.0
+        assert bot.session_stop_threshold == 50.0 * 0.40
 
 
 class TestSpreadCheck:
@@ -258,19 +340,23 @@ class TestStreakCheck:
         bot.consecutive_losses = 1
         assert bot.streak_check() is True
 
-    def test_at_threshold_in_pause(self, monkeypatch):
+    def test_at_threshold_blocks(self, monkeypatch):
         monkeypatch.setattr(bot, "MAX_CONSEC_LOSSES", 2)
         bot.consecutive_losses = 2
-        bot.streak_pause_until = time.time() + 9999
         assert bot.streak_check() is False
 
-    def test_at_threshold_pause_expired(self, monkeypatch):
+    def test_above_threshold_blocks(self, monkeypatch):
+        monkeypatch.setattr(bot, "MAX_CONSEC_LOSSES", 2)
+        bot.consecutive_losses = 3
+        assert bot.streak_check() is False
+
+    def test_streak_not_reset_by_time(self, monkeypatch):
+        # v9.0.11: the streak no longer self-resets just because time passed —
+        # only a win or a new-day resume clears it.
         monkeypatch.setattr(bot, "MAX_CONSEC_LOSSES", 2)
         bot.consecutive_losses = 2
-        bot.streak_pause_until = time.time() - 1
-        result = bot.streak_check()
-        assert result is True
-        assert bot.consecutive_losses == 0
+        bot.streak_check()
+        assert bot.consecutive_losses == 2
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -676,22 +762,24 @@ class TestCancelStaleOrders:
 # ═════════════════════════════════════════════════════════════════════════════
 
 class TestPerformanceGuard:
+    # v9.0.10: the guard evaluates session_wins/session_losses (this session's
+    # settled trades only), not the lifetime live_wins/live_losses counters.
     def test_below_min_sample_passes(self, monkeypatch):
         monkeypatch.setattr(bot, "MIN_SAMPLE_TRADES", 20)
-        monkeypatch.setattr(bot, "live_wins", 3)
-        monkeypatch.setattr(bot, "live_losses", 5)
+        monkeypatch.setattr(bot, "session_wins", 3)
+        monkeypatch.setattr(bot, "session_losses", 5)
         assert bot.performance_guard() is True
 
     def test_good_win_rate_passes(self, monkeypatch):
         monkeypatch.setattr(bot, "MIN_SAMPLE_TRADES", 20)
-        monkeypatch.setattr(bot, "live_wins", 16)
-        monkeypatch.setattr(bot, "live_losses", 4)
+        monkeypatch.setattr(bot, "session_wins", 16)
+        monkeypatch.setattr(bot, "session_losses", 4)
         assert bot.performance_guard() is True
 
     def test_bad_win_rate_blocks(self, monkeypatch):
         monkeypatch.setattr(bot, "MIN_SAMPLE_TRADES", 20)
-        monkeypatch.setattr(bot, "live_wins", 8)
-        monkeypatch.setattr(bot, "live_losses", 22)
+        monkeypatch.setattr(bot, "session_wins", 8)
+        monkeypatch.setattr(bot, "session_losses", 22)
         assert bot.performance_guard() is False
 
 
