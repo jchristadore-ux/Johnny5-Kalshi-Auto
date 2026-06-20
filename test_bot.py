@@ -758,6 +758,51 @@ class TestCancelStaleOrders:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# P0: CREATE-ORDER V2 BODY (the 2026-06-19 zero-trade regression)
+# ═════════════════════════════════════════════════════════════════════════════
+
+class TestOrderBodyV2:
+    """The legacy POST /portfolio/orders create endpoint was retired by Kalshi
+    and returns HTTP 410. v9.1.0 builds a single-book create-order-v2 body:
+        bid = buy YES @ price ;  ask = sell YES @ price == buy NO @ (1 - price).
+    """
+
+    def test_yes_is_a_bid_at_face_price(self):
+        body = bot.build_order_body_v2("KXBTC-TEST", "YES", 10, 39, "cid-1")
+        assert body["side"] == "bid"
+        assert body["price"] == "0.39"
+        assert body["count"] == "10"
+        assert body["ticker"] == "KXBTC-TEST"
+        assert body["client_order_id"] == "cid-1"
+
+    def test_no_is_a_yes_ask_at_complementary_price(self):
+        # Buying NO at 39c == selling YES at 61c.
+        body = bot.build_order_body_v2("KXBTC-TEST", "NO", 10, 39, "cid-2")
+        assert body["side"] == "ask"
+        assert body["price"] == "0.61"
+
+    def test_price_is_clamped_into_the_book(self):
+        # A pathological 0c/100c limit must never serialize an off-book price.
+        hi = bot.build_order_body_v2("T", "YES", 1, 100, "c")
+        lo = bot.build_order_body_v2("T", "YES", 1, 0, "c")
+        assert hi["price"] == "0.99"
+        assert lo["price"] == "0.01"
+
+    def test_required_v2_fields_present(self):
+        body = bot.build_order_body_v2("T", "YES", 5, 50, "c")
+        for field in ("time_in_force", "self_trade_prevention_type",
+                      "post_only", "side", "price", "count"):
+            assert field in body
+        # side must be the single-book bid/ask, never the retired yes/no.
+        assert body["side"] in ("bid", "ask")
+        assert "yes_price_dollars" not in body
+        assert "no_price_dollars" not in body
+
+    def test_targets_the_v2_events_orders_path(self):
+        assert bot.ORDER_PATH == "/portfolio/events/orders"
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # P3: PERFORMANCE GUARD & BAYESIAN PRIOR
 # ═════════════════════════════════════════════════════════════════════════════
 

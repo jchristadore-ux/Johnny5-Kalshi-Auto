@@ -1,4 +1,4 @@
-# Johnny5-Kalshi-Auto v5.3.0
+# Johnny5-Kalshi-Auto v9.1.0
 
 > Production quant bot for Kalshi 15-minute BTC up/down prediction markets.
 > Near-money order book pressure + BTC momentum confirmation + fractional Kelly sizing.
@@ -150,7 +150,13 @@ Upload all files to a new GitHub repo. Commit to `main`.
 | `TELEGRAM_BOT_TOKEN` | optional | From @BotFather |
 | `TELEGRAM_CHAT_ID` | optional | Your Telegram chat ID |
 | `STALE_ORDER_TIMEOUT` | `300` | *(v5.3.0)* Seconds before canceling unfilled orders |
-| `MAX_CONCURRENT_POS` | `2` | *(v5.3.0)* Max simultaneous open positions |
+| `MAX_CONCURRENT_POS` | `2` | *(v9.1.0)* Max simultaneous open positions (raised from 1) |
+| `COOLDOWN_SECS` | `45` | *(v9.1.0)* Min seconds between entries (was a hardcoded 60) |
+| `TRADE_RANGING` | `false` | *(v9.1.0)* Opt-in: also trade OB pressure in ranging regimes — the biggest frequency lever |
+| `RANGING_CONF_PTS` | `12` | *(v9.1.0)* Confidence credited to ranging setups when `TRADE_RANGING=true` |
+| `ORDER_POST_ONLY` | `false` | *(v9.1.0)* Reject (don't fill) any order that would cross — maker-only |
+| `ORDER_TIME_IN_FORCE` | `good_till_canceled` | *(v9.1.0)* Order time-in-force for create-order-v2 |
+| `SELF_TRADE_PREVENTION` | `taker_at_cross` | *(v9.1.0)* Self-trade prevention mode |
 | `LOW_LIQ_START_UTC` | `4` | *(v5.3.0)* Low-liquidity skip window start (UTC hour) |
 | `LOW_LIQ_END_UTC` | `8` | *(v5.3.0)* Low-liquidity skip window end (UTC hour) |
 
@@ -175,6 +181,7 @@ Upload all files to a new GitHub repo. Commit to `main`.
 
 | Version | Key Changes |
 |---|---|
+| **v9.1.0** | **Create-order V2 migration (fixes HTTP 410 `deprecated_v1_order_endpoint` — the cause of zero trades on 2026-06-19); orders now POST `/portfolio/events/orders` with single-book bid/ask + fixed-point dollar price (YES→bid, NO→ask @ 1-price); throughput: `MIN_MINUTES_TO_EXPIRY` 6→4, `MAX_CONCURRENT_POS` 1→2, configurable `COOLDOWN_SECS` 60→45; opt-in `TRADE_RANGING`** |
 | **v5.3.0** | **Multi-market scanner; stale order cancellation (5 min); adaptive OB threshold (thin/thick books); time-of-day liquidity filter; OB trend detection (building/fading); smarter paper mode (BTC movement, not RNG); Wilson confidence intervals; concurrent position limit; 60+ pytest tests** |
 | v5.2.1 | BOT_VERSION tag; BTC feed timed backoff; global consecutive_losses fix; WIN notification branch fix |
 | v5.2.0 | No Kalshi mid proxy in BTC feed; OB depth floor $5; streak filter deadlock fix; running_pnl |

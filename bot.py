@@ -3,6 +3,31 @@
 ║  JOHNNY5-KALSHI-AUTO  v9.0.11  —  Production Build                         ║
 ║  "No disassemble."                                                           ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
+║  v9.1.0 — CREATE-ORDER V2 MIGRATION + THROUGHPUT                             ║
+║                                                                              ║
+║  DIAGNOSIS (2026-06-19 LIVE session, v9.0.11, ZERO trades):                 ║
+║  - The strategy worked: FIVE fully-qualified signals cleared every gate     ║
+║    (regime, OB, momentum, win-prob, confidence, edge, Kelly).               ║
+║  - All five died at order placement with:                                   ║
+║      HTTP 410 │ deprecated_v1_order_endpoint │ switch to V2 endpoints        ║
+║  - Kalshi retired POST /portfolio/orders (deprecation 2026-05-06, passed).   ║
+║                                                                              ║
+║  FIX (the cause of zero trades):                                            ║
+║  - Order creation now targets POST /portfolio/events/orders (single-book    ║
+║    v2): YES → side=bid @ price, NO → side=ask @ (1 - price). Price is a      ║
+║    fixed-point dollar string; count is a string; TIF/STP supplied.          ║
+║  - build_order_body_v2() isolates the bid/ask + complementary-price mapping  ║
+║    so it is unit-tested without touching the network.                       ║
+║                                                                              ║
+║  THROUGHPUT (more frequent, same edge — every risk control retained):       ║
+║  - MIN_MINUTES_TO_EXPIRY 6.0 → 4.0 (68 scans skipped on 06-19 by the floor).║
+║  - MAX_CONCURRENT_POS 1 → 2; cooldown now COOLDOWN_SECS (60 → 45) so         ║
+║    simultaneous edges (3 fired within 90s on 06-19) are not serialized away. ║
+║  - TRADE_RANGING (opt-in, default off): trade order-book pressure in ranging ║
+║    regimes too, with RANGING_CONF_PTS credited so strong setups still clear  ║
+║    MIN_CONFIDENCE. The single biggest available frequency lever.            ║
+║                                                                              ║
+║  ─────────────────────────────────────────────────────────────────────     ║
 ║  v9.0.11 — DRAWDOWN CONTROL + AUTO-RESTART                                   ║
 ║                                                                              ║
 ║  DIAGNOSIS (2026-06-18 LIVE session, v9.0.10):                              ║
@@ -108,7 +133,7 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "9.0.11"
+BOT_VERSION = "9.1.0"
 
 import base64
 import logging
@@ -224,7 +249,7 @@ SESSION_STOP_FRACTION = _env_float("SESSION_STOP_FRACTION", 0.40)
 MAX_CONSEC_LOSSES     = _env_int("MAX_CONSEC_LOSSES", 3)
 STREAK_PAUSE_SECS     = _env_int("STREAK_PAUSE_SECS", 1800)
 STALE_ORDER_TIMEOUT   = _env_int("STALE_ORDER_TIMEOUT", 300)
-MAX_CONCURRENT_POS    = _env_int("MAX_CONCURRENT_POS", 1)
+MAX_CONCURRENT_POS    = _env_int("MAX_CONCURRENT_POS", 2)
 MIN_SAMPLE_TRADES     = _env_int("MIN_SAMPLE_TRADES", 20)
 
 # v9.0.11: auto-restart after a halt. A daily-loss / drawdown / consecutive-loss
@@ -254,8 +279,28 @@ MOMENTUM_THRESH_PCT   = _env_float("MOMENTUM_THRESH_PCT", 0.15)
 MIN_EDGE_PCT          = _env_float("MIN_EDGE_PCT", 0.06)
 MIN_CONFIDENCE        = _env_int("MIN_CONFIDENCE", 60)
 MIN_WIN_PROB          = _env_float("MIN_WIN_PROB", 0.60)
-MIN_MINUTES_TO_EXPIRY = _env_float("MIN_MINUTES_TO_EXPIRY", 6.0)
+# v9.1.0: 6.0 → 4.0. The 6-min floor locked the bot out of the entire back
+# third of every 15-min market (68 scans skipped on 2026-06-19 alone). A maker
+# order still has ample time to fill with 4 minutes left, and the OB-pressure
+# signal is *more* reliable closer to expiry (less time for a reversal).
+MIN_MINUTES_TO_EXPIRY = _env_float("MIN_MINUTES_TO_EXPIRY", 4.0)
 YES_BREAKEVEN_PRICE   = _env_int("YES_BREAKEVEN_PRICE", 78)
+
+# v9.1.0: clustered signals throttle. The cooldown was a hardcoded 60s and
+# concurrency was 1, so when several markets lit up within ~90s (as on
+# 2026-06-19 at 01:31–01:32) only the first could ever fill. Both are now
+# tunable; defaults loosened to let genuine simultaneous edges through while
+# the daily-loss / streak / Wilson guards still cap total risk.
+COOLDOWN_SECS         = _env_int("COOLDOWN_SECS", 45)
+
+# v9.1.0: opt-in RANGING trading. The bot's primary edge is order-book
+# pressure, which is informative regardless of BTC trend. When enabled,
+# RANGING regimes are tradeable and earn RANGING_CONF_PTS toward confidence so
+# a strong OB setup can still clear MIN_CONFIDENCE. Default off preserves the
+# trend-only behavior that has been live-validated; flip TRADE_RANGING=true to
+# materially increase trade frequency.
+TRADE_RANGING         = _env_bool("TRADE_RANGING", False)
+RANGING_CONF_PTS      = _env_int("RANGING_CONF_PTS", 12)
 
 # ── Time-of-day session quality ───────────────────────────────────────────────
 SESSION_QUALITY: dict = {
@@ -335,6 +380,24 @@ def _auth_headers(method: str, path: str) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 # HTTP
 # ─────────────────────────────────────────────────────────────────────────────
+
+# v9.1.0 — CREATE-ORDER MIGRATION (the fix for the 2026-06-19 zero-trade day).
+# Kalshi retired the legacy POST /portfolio/orders create endpoint (deprecation
+# date 2026-05-06 has passed); it now returns HTTP 410 deprecated_v1_order_endpoint.
+# Five fully-qualified signals were generated that day and ALL FIVE died here.
+# The replacement is the single-book v2 endpoint:
+#
+#   POST /trade-api/v2/portfolio/events/orders
+#
+# It quotes everything from the YES leg via a `side` of bid/ask plus a single
+# `price` in fixed-point dollars:
+#     bid  = buy  YES at `price`
+#     ask  = sell YES at `price`   ==  buy NO at (1 - price)
+# So a NO trade is expressed as a YES ask at the complementary price.
+ORDER_PATH            = "/portfolio/events/orders"
+ORDER_TIME_IN_FORCE   = os.getenv("ORDER_TIME_IN_FORCE", "good_till_canceled")
+ORDER_POST_ONLY       = _env_bool("ORDER_POST_ONLY", False)
+SELF_TRADE_PREVENTION = os.getenv("SELF_TRADE_PREVENTION", "taker_at_cross")
 
 _http    = requests.Session()
 BASE_URL = ""
@@ -768,7 +831,10 @@ def compute_confidence(
     regime_map = {
         Regime.TRENDING_UP:   20.0,
         Regime.TRENDING_DOWN: 20.0,
-        Regime.RANGING:        0.0,
+        # v9.1.0: when RANGING trading is opted in, award partial confidence so
+        # a strong OB-pressure setup can still reach MIN_CONFIDENCE. Without it
+        # the 20pt trend gap silently re-blocks every ranging trade downstream.
+        Regime.RANGING:        float(RANGING_CONF_PTS) if TRADE_RANGING else 0.0,
         Regime.HIGH_VOL:     -20.0,
         Regime.UNKNOWN:        0.0,
     }
@@ -1562,8 +1628,8 @@ def expiry_guard(mid: int) -> bool:
 
 def cooldown_check() -> bool:
     elapsed = time.time() - last_trade_ts
-    if elapsed < 60:
-        log.info("Cooldown │ %.0fs remaining", 60 - elapsed)
+    if elapsed < COOLDOWN_SECS:
+        log.info("Cooldown │ %.0fs remaining", COOLDOWN_SECS - elapsed)
         return False
     return True
 
@@ -1594,6 +1660,39 @@ def streak_check() -> bool:
 # ─────────────────────────────────────────────────────────────────────────────
 # ORDER EXECUTION
 # ─────────────────────────────────────────────────────────────────────────────
+
+def build_order_body_v2(ticker: str, direction: str, count: int,
+                        limit_cents: int, client_id: str) -> dict:
+    """Build a Kalshi create-order-v2 request body.
+
+    The v2 endpoint (POST /portfolio/events/orders) is single-book and quotes
+    everything from the YES leg:
+        bid = buy  YES at `price`
+        ask = sell YES at `price`   ==  buy NO at (1 - price)
+
+    `limit_cents` is the price of the chosen *contract* — the YES price for a
+    YES trade, the NO price for a NO trade. A NO trade therefore becomes a YES
+    ask at the complementary price (100 - limit_cents) cents.
+    """
+    if direction.upper() == "YES":
+        side        = "bid"
+        price_cents = limit_cents
+    else:
+        side        = "ask"
+        price_cents = 100 - limit_cents
+    price_cents = max(1, min(99, price_cents))
+
+    return {
+        "ticker":                     ticker,
+        "client_order_id":            client_id,
+        "side":                       side,
+        "count":                      str(count),
+        "price":                      f"{price_cents / 100:.2f}",
+        "time_in_force":              ORDER_TIME_IN_FORCE,
+        "self_trade_prevention_type": SELF_TRADE_PREVENTION,
+        "post_only":                  ORDER_POST_ONLY,
+    }
+
 
 def place_order(ticker: str, direction: str, bet_dollars: float,
                 limit_cents: int, win_prob: float, edge: float) -> Optional[str]:
@@ -1632,22 +1731,14 @@ def place_order(ticker: str, direction: str, bet_dollars: float,
         )
         return client_id
 
-    body: dict = {
-        "ticker":          ticker,
-        "client_order_id": client_id,
-        "type":            "limit",
-        "action":          "buy",
-        "side":            direction.lower(),
-        "count":           count,
-    }
-    if direction.upper() == "YES":
-        body["yes_price_dollars"] = f"{limit_cents / 100:.2f}"
-    else:
-        body["no_price_dollars"] = f"{limit_cents / 100:.2f}"
+    body = build_order_body_v2(ticker, direction, count, limit_cents, client_id)
 
     try:
-        resp     = _post("/portfolio/orders", body)
-        order_id = resp.get("order", {}).get("order_id", client_id)
+        resp     = _post(ORDER_PATH, body)
+        # v2 returns order_id at the top level; tolerate a legacy {"order": …}
+        # envelope too so we never lose the id on a schema tweak.
+        order    = resp.get("order", resp) if isinstance(resp, dict) else {}
+        order_id = order.get("order_id") or resp.get("order_id") or client_id
         last_trade_ts = time.time()
         rec = {
             "time": datetime.now(timezone.utc).isoformat(),
@@ -1780,7 +1871,10 @@ def run_decision(market: dict, balance: float) -> None:
         return
 
     regime, r_squared, realized_vol = compute_regime()
-    if regime in (Regime.UNKNOWN, Regime.RANGING, Regime.HIGH_VOL):
+    blocked_regimes = {Regime.UNKNOWN, Regime.HIGH_VOL}
+    if not TRADE_RANGING:
+        blocked_regimes.add(Regime.RANGING)
+    if regime in blocked_regimes:
         log.info("Regime │ %s — no trade", regime.value)
         last_signal_desc = f"regime={regime.value}"
         return
