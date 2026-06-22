@@ -1,139 +1,52 @@
 """
-╔══════════════════════════════════════════════════════════════════════════════╗
-║  JOHNNY5-KALSHI-AUTO  v9.0.11  —  Production Build                         ║
-║  "No disassemble."                                                           ║
-╠══════════════════════════════════════════════════════════════════════════════╣
-║  v9.1.0 — CREATE-ORDER V2 MIGRATION + THROUGHPUT                             ║
-║                                                                              ║
-║  DIAGNOSIS (2026-06-19 LIVE session, v9.0.11, ZERO trades):                 ║
-║  - The strategy worked: FIVE fully-qualified signals cleared every gate     ║
-║    (regime, OB, momentum, win-prob, confidence, edge, Kelly).               ║
-║  - All five died at order placement with:                                   ║
-║      HTTP 410 │ deprecated_v1_order_endpoint │ switch to V2 endpoints        ║
-║  - Kalshi retired POST /portfolio/orders (deprecation 2026-05-06, passed).   ║
-║                                                                              ║
-║  FIX (the cause of zero trades):                                            ║
-║  - Order creation now targets POST /portfolio/events/orders (single-book    ║
-║    v2): YES → side=bid @ price, NO → side=ask @ (1 - price). Price is a      ║
-║    fixed-point dollar string; count is a string; TIF/STP supplied.          ║
-║  - build_order_body_v2() isolates the bid/ask + complementary-price mapping  ║
-║    so it is unit-tested without touching the network.                       ║
-║                                                                              ║
-║  THROUGHPUT (more frequent, same edge — every risk control retained):       ║
-║  - MIN_MINUTES_TO_EXPIRY 6.0 → 4.0 (68 scans skipped on 06-19 by the floor).║
-║  - MAX_CONCURRENT_POS 1 → 2; cooldown now COOLDOWN_SECS (60 → 45) so         ║
-║    simultaneous edges (3 fired within 90s on 06-19) are not serialized away. ║
-║  - TRADE_RANGING (opt-in, default off): trade order-book pressure in ranging ║
-║    regimes too, with RANGING_CONF_PTS credited so strong setups still clear  ║
-║    MIN_CONFIDENCE. The single biggest available frequency lever.            ║
-║                                                                              ║
-║  ─────────────────────────────────────────────────────────────────────     ║
-║  v9.0.11 — DRAWDOWN CONTROL + AUTO-RESTART                                   ║
-║                                                                              ║
-║  DIAGNOSIS (2026-06-18 LIVE session, v9.0.10):                              ║
-║  - Account $48.14 → $33.03. Five orders, FIVE straight losers, -$15.11      ║
-║    (31% of bankroll) before the daily-loss cap finally halted at 19:30.      ║
-║  - After halting the bot logged "Permanently halted — sleeping 1hr" on an    ║
-║    infinite loop and never traded again (18h of dead air in the logs).       ║
-║                                                                              ║
-║  Root causes:                                                               ║
-║  1. Daily-loss cap was a flat $15 — 31% of a $48 account. Far too loose for ║
-║     a small bankroll; let five losers through before stopping.              ║
-║  2. The consecutive-loss breaker only PAUSED 30 min then reset the counter. ║
-║     30 min ≈ the 15-min market settle cadence, so the streak never built up  ║
-║     to block a trade. It was effectively a no-op.                           ║
-║  3. A halt was terminal — sleep(3600) forever, no recovery on a new day.    ║
-║                                                                              ║
-║  FIX:                                                                       ║
-║  - Daily-loss cap is now the TIGHTER of $MAX_DAILY_LOSS_DOLLARS and         ║
-║    MAX_DAILY_LOSS_FRACTION × session-start balance (default 15%).           ║
-║  - MAX_CONSEC_LOSSES (default 3) now HALTS the session instead of a         ║
-║    self-resetting pause; the counter only clears on a win or a new day.     ║
-║  - AUTO_RESTART (default on): a daily-loss / drawdown / streak halt          ║
-║    auto-resumes at the next UTC trading-day rollover with daily counters    ║
-║    reset. Balance-floor halts stay permanent.                              ║
-║                                                                              ║
-║  ─────────────────────────────────────────────────────────────────────     ║
-║  v9.0.10 — PERF-GUARD DEADLOCK FIX (session-scoped Wilson sample)            ║
-║                                                                              ║
-║  DIAGNOSIS (2026-06-18 LIVE session, v9.0.9, ~4h slice, ZERO trades):       ║
-║  - Portfolio status byte-identical the whole window:                        ║
-║      $48.14 │ PnL=$+20.36 │ WR=11/20 │ LB=37.2% │ ACTIVE                     ║
-║  - 322 market scans. 64 killed by expiry guard, 258 killed by PERF GUARD    ║
-║    (Wilson LB 37.2% < 50%). 0 scans reached regime/OB/momentum. 0 orders,   ║
-║    0 in-window settlements. RESOLVE frozen at "100 settled, 0 open".        ║
-║                                                                              ║
-║  Root cause: an absorbing-state lock, same shape as the v9.0.9 RECOVERY     ║
-║  deadlock. performance_guard() keyed on live_wins/live_losses, which the    ║
-║  v9.0.5 unmatched branch seeds with PRE-RESTART / account-history           ║
-║  settlements (correct for RECOVERY exit + Bayesian prior, but wrong as the  ║
-║  Layer-3 statistical gate's sample). On this boot, ~20 in-flight-at-restart ║
-║  trades settled post-boot → live counters inherited 11/20 → Wilson LB       ║
-║  37.2% < 50% → guard blocks all trades → no trade can settle → the 11/20    ║
-║  sample can never move → guard blocks forever. The +$20.36 is real; the     ║
-║  edge is paying. The bot was locked out of a profitable session by a guard  ║
-║  evaluating inherited history it cannot influence.                          ║
-║                                                                              ║
-║  FIX: split the perf-guard sample from the lifetime counters.               ║
-║  - session_wins / session_losses: incremented ONLY for trades THIS session  ║
-║    placed (matched-settlement branch, paper + live). performance_guard()    ║
-║    now evaluates these.                                                      ║
-║  - live_wins / live_losses: unchanged — still count matched AND unmatched    ║
-║    pre-restart settlements. RECOVERY exit, Bayesian prior, and all displays  ║
-║    keep full-history behavior (no regression).                              ║
-║  On boot session counters reset to 0/0, so the guard extends benefit-of-    ║
-║  the-doubt until 20 trades THIS session settle (doctrine Layer 3 intent),   ║
-║  rather than booting straight into a locked inherited sub-50% LB. Mirrors    ║
-║  the v9.0.8 post-boot gate, applied to the perf-guard counters. No edge,    ║
-║  Kelly, loss-cap, or the 50% Wilson floor is loosened.                      ║
-║                                                                              ║
-║  NOTE: clearing the perf guard exposes the next gate (R²≥0.62, OB depth     ║
-║  ≥$75, momentum AGREE). Those had ZERO data this session because no scan     ║
-║  reached them. Do not expect immediate fills — watch the first session.     ║
-║                                                                              ║
-║  ─────────────────────────────────────────────────────────────────────     ║
-║  v9.0.9 — RECOVERY DEADLOCK FIX (balance-based recovery exit)               ║
-║                                                                              ║
-║  Root cause: a self-referential lock. RECOVERY forces momentum==AGREE for   ║
-║  every trade. In a calm market BTC momentum is NEUTRAL on essentially every  ║
-║  scan, so the AGREE gate rejects 100% of signals. update_session_state()'s   ║
-║  ONLY recovery exit was the trade-count path (>=5 trades since entry, WR>=   ║
-║  60%) — but the AGREE gate is what prevents those trades from accumulating.  ║
-║  FIX: update_session_state() now exits RECOVERY when loss_pct recovers to    ║
-║  at/below RECOVERY_TRIGGER_PCT — the exact mirror of the entry condition.    ║
-║                                                                              ║
-║  ─────────────────────────────────────────────────────────────────────     ║
-║  v9.0.8 — PERF-GUARD DEADLOCK FIX (boot-time settlement gate)               ║
-║                                                                              ║
-║  FIX: _is_post_boot(rec) gates the unmatched-settlement branch. A record    ║
-║  counts only if its timestamp >= _session_start_ts. In-flight pre-restart   ║
-║  trades settle AFTER boot and are preserved; account history settled before ║
-║  boot is skipped. Missing/unparseable timestamps treated as NOT post-boot.  ║
-║                                                                              ║
-║  ─────────────────────────────────────────────────────────────────────     ║
-║  v9.0.7 — SETTLEMENT SCHEMA CORRECTED (the critical fix)                     ║
-║                                                                              ║
-║  _extract_realized_dollars() rewritten against the REAL schema:             ║
-║    pnl = (revenue/100) - yes_total_cost_dollars - no_total_cost_dollars      ║
-║          - fee_cost                                                           ║
-║  `revenue` is returned in CENTS by Kalshi; *_dollars cost/fee already $.     ║
-║                                                                              ║
-║  v9.0.6 throughput changes RETAINED:                                         ║
-║  1. R2_TREND_THRESHOLD default 0.70 → 0.62                                  ║
-║  2. compute_confidence(): NEUTRAL momentum 2.0 → 8.0 pts                    ║
-║  3. NEUTRAL_ACCURACY_DRAG default 0.02 → 0.0                               ║
-║  4. OB_IMBALANCE_THRESH default → 0.64                                      ║
-║                                                                              ║
-║  RAILWAY ENV VAR CHANGES REQUIRED (if not already applied):                  ║
-║  - OB_IMBALANCE_THRESH: set to 0.64  (logs still show 0.68 — NOT applied)   ║
-║  - R2_TREND_THRESHOLD:  delete or set to 0.62                               ║
-║  - NEUTRAL_ACCURACY_DRAG: delete or set to 0.0                              ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+JOHNNY5-KALSHI-AUTO  v9.3.0  —  Production Build
+"No disassemble."
+
+v9.3.0 — DOCTRINE RESTORE: stop the NEUTRAL-momentum bleed
+
+DIAGNOSIS (2026-06-20->22 LIVE session, v9.2.0, ~2.7 days):
+  6 trades fired, ALL on BTC=NEUTRAL. Three doctrine guards had drifted open
+  (all from the v9.0.6 "throughput" push, retained through v9.2.0). Together
+  they manufactured a fake ~25% edge on a coin flip and bet the per-trade cap.
+
+FIX (restore, do not engineer around — zero-trade calm sessions are CORRECT):
+  1. momentum_gate_ok(): doctrine Layer 7. REQUIRE_AGREE_MOMENTUM (default
+     true) rejects NEUTRAL and CONFLICT in EVERY session state.
+  2. NEUTRAL_ACCURACY_DRAG default 0.0 -> 0.02 (honest win_prob if gate off).
+  3. compute_confidence(): NEUTRAL 8.0 -> 2.0 (Layer 8: momentum only scores
+     when AGREE).
+  4. Restore drifted thresholds to doctrine: OB_IMBALANCE_THRESH 0.64->0.70,
+     R2_TREND_THRESHOLD 0.62->0.65, MIN_CONFIDENCE 60->65,
+     YES_BREAKEVEN_PRICE 78->67.
+
+The recovery deadlock that justified removing the AGREE gate is ALREADY solved
+by update_session_state()'s balance-heal exit and RECOVERY_MAX_SECS wall-clock
+backstop, so re-blocking NEUTRAL cannot relock recovery.
+
+RAILWAY ENV VAR CHANGES REQUIRED (an env override beats these defaults):
+  - REQUIRE_AGREE_MOMENTUM : set true (or leave unset)
+  - NEUTRAL_ACCURACY_DRAG  : set 0.02 (or delete)
+  - OB_IMBALANCE_THRESH    : set 0.70 (or delete)
+  - R2_TREND_THRESHOLD     : set 0.65 (or delete)
+  - MIN_CONFIDENCE         : set 65   (or delete)
+  - YES_BREAKEVEN_PRICE    : set 67   (or delete)
+
+v9.1.0 — RECOVERY DEADLOCK (real fix) + RISK TIGHTENING
+  1. RECOVERY no longer FORCES momentum==AGREE as a recovery-only extra gate
+     (Layer-7 AGREE now applies uniformly via momentum_gate_ok).
+  2. RECOVERY_MAX_SECS hard timeout in update_session_state().
+  3. MAX_BET_FRACTION 0.08 -> 0.04.
+  4. MAX_DAILY_LOSS_PCT (6%) — daily stop halts on the tighter of the fixed
+     dollar cap and a fraction of the session-start balance.
+
+v9.0.8 — PERF-GUARD DEADLOCK FIX (boot-time settlement gate)
+v9.0.7 — SETTLEMENT SCHEMA CORRECTED:
+  pnl = (revenue/100) - yes_total_cost_dollars - no_total_cost_dollars - fee_cost
 """
 
 from __future__ import annotations
 
-BOT_VERSION = "9.1.0"
+BOT_VERSION = "9.3.0"
 
 import base64
 import logging
@@ -155,20 +68,20 @@ from cryptography.hazmat.primitives.asymmetric import padding
 import telegram_utils as tg
 from ladder import StakeLadder
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # LOGGING
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s │ %(levelname)-8s │ %(message)s",
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("Johnny5")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # ENUMERATIONS
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 class Regime(Enum):
     TRENDING_UP   = "TRENDING_UP"
@@ -184,9 +97,9 @@ class SessionState(Enum):
     HALTED    = "HALTED"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # ENVIRONMENT CONFIGURATION
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _require(key: str) -> str:
     val = os.environ.get(key, "").strip()
@@ -221,88 +134,47 @@ _RAW_PEM            = _require("KALSHI_PRIVATE_KEY_PEM")
 DEMO_MODE           = _env_bool("DEMO_MODE", True)
 POLL_INTERVAL       = _env_int("POLL_INTERVAL_SECS", 30)
 
-# ── Capital & sizing ──────────────────────────────────────────────────────────
+# -- Capital & sizing ---------------------------------------------------------
 TRADE_SIZE_CAP      = _env_float("TRADE_SIZE_DOLLARS", 5.0)
-MAX_BET_FRACTION    = _env_float("MAX_BET_FRACTION", 0.08)
+MAX_BET_FRACTION    = _env_float("MAX_BET_FRACTION", 0.04)
 KELLY_FRACTION      = _env_float("KELLY_FRACTION", 0.30)
 KELLY_RECOVERY_MULT = _env_float("KELLY_RECOVERY_MULT", 0.50)
 
-# ── Laddering stake overlay (opt-in) ──────────────────────────────────────────
-# Scales the Kelly stake by a performance-driven multiplier (0.5x–2x). Disabled
-# by default so live sizing is unchanged until explicitly switched on with
-# LADDER_ENABLED=true. See ladder.py and LADDER_STRATEGY.md.
 LADDER_ENABLED = _env_bool("LADDER_ENABLED", False)
 
-# ── Risk controls ─────────────────────────────────────────────────────────────
+# -- Risk controls ------------------------------------------------------------
 MIN_BALANCE_FLOOR     = _env_float("MIN_BALANCE_FLOOR", 5.0)
 MAX_DAILY_LOSS        = _env_float("MAX_DAILY_LOSS_DOLLARS", 15.0)
-# v9.0.11: also cap the daily loss as a fraction of the session's STARTING
-# balance. The effective cap is the *tighter* of the dollar and fractional
-# limits, so a small account can't bleed a third of its bankroll before the
-# halt fires (2026-06-18: a flat $15 cap = 31% of a $48 account). Set to 0 to
-# disable the fractional cap and use the dollar cap alone.
-MAX_DAILY_LOSS_FRACTION = _env_float("MAX_DAILY_LOSS_FRACTION", 0.15)
+MAX_DAILY_LOSS_PCT    = _env_float("MAX_DAILY_LOSS_PCT", 0.06)
 SESSION_STOP_FRACTION = _env_float("SESSION_STOP_FRACTION", 0.40)
-# v9.0.11: default 2 → 3. This is now a HARD halt (see _trigger_halt), not a
-# self-resetting 30-min pause — the old pause was shorter than the market
-# settle cadence and never actually blocked a trade.
-MAX_CONSEC_LOSSES     = _env_int("MAX_CONSEC_LOSSES", 3)
+MAX_CONSEC_LOSSES     = _env_int("MAX_CONSEC_LOSSES", 2)
 STREAK_PAUSE_SECS     = _env_int("STREAK_PAUSE_SECS", 1800)
 STALE_ORDER_TIMEOUT   = _env_int("STALE_ORDER_TIMEOUT", 300)
-MAX_CONCURRENT_POS    = _env_int("MAX_CONCURRENT_POS", 2)
+MAX_CONCURRENT_POS    = _env_int("MAX_CONCURRENT_POS", 1)
 MIN_SAMPLE_TRADES     = _env_int("MIN_SAMPLE_TRADES", 20)
 
-# v9.0.11: auto-restart after a halt. A daily-loss / drawdown / consecutive-loss
-# halt is a *daily* stop — it auto-resumes at the next UTC trading-day rollover
-# with the daily counters reset, instead of sleeping forever. Balance-floor
-# halts (account effectively empty) stay permanent. Disable with
-# AUTO_RESTART=false to restore the old permanent-halt behavior.
-AUTO_RESTART          = _env_bool("AUTO_RESTART", True)
-HALT_RECHECK_SECS     = _env_int("HALT_RECHECK_SECS", 900)
-
-# ── Regime detection ──────────────────────────────────────────────────────────
-# v9.0.6: default lowered from 0.70 → 0.62.
-# At 0.70 only 8.7% of scans qualified; 0.62 targets ~20%.
-# Override via R2_TREND_THRESHOLD env var.
-R2_TREND_THRESHOLD    = _env_float("R2_TREND_THRESHOLD", 0.62)
+# -- Regime detection ---------------------------------------------------------
+R2_TREND_THRESHOLD    = _env_float("R2_TREND_THRESHOLD", 0.65)
 VOLATILITY_CAP_PCT    = _env_float("VOLATILITY_CAP_PCT", 0.18)
 VOL_CIRCUIT_BREAKER   = _env_float("VOL_CIRCUIT_BREAKER", 0.40)
 TREND_LOOKBACK        = _env_int("TREND_LOOKBACK", 12)
 MIN_PRICES_FOR_REGIME = _env_int("MIN_PRICES_FOR_REGIME", 10)
 
-# ── Signal thresholds ─────────────────────────────────────────────────────────
-# v9.0.6: default lowered from 0.62 → 0.64.
-# Note: if OB_IMBALANCE_THRESH is set to 0.68 in Railway, update it to 0.64.
+# -- Signal thresholds --------------------------------------------------------
 MIN_OB_DEPTH          = _env_float("MIN_OB_DEPTH_DOLLARS", 75.0)
-OB_IMBALANCE_THRESH   = _env_float("OB_IMBALANCE_THRESH", 0.64)
+OB_IMBALANCE_THRESH   = _env_float("OB_IMBALANCE_THRESH", 0.70)
 MOMENTUM_THRESH_PCT   = _env_float("MOMENTUM_THRESH_PCT", 0.15)
 MIN_EDGE_PCT          = _env_float("MIN_EDGE_PCT", 0.06)
-MIN_CONFIDENCE        = _env_int("MIN_CONFIDENCE", 60)
+MIN_CONFIDENCE        = _env_int("MIN_CONFIDENCE", 65)
 MIN_WIN_PROB          = _env_float("MIN_WIN_PROB", 0.60)
-# v9.1.0: 6.0 → 4.0. The 6-min floor locked the bot out of the entire back
-# third of every 15-min market (68 scans skipped on 2026-06-19 alone). A maker
-# order still has ample time to fill with 4 minutes left, and the OB-pressure
-# signal is *more* reliable closer to expiry (less time for a reversal).
-MIN_MINUTES_TO_EXPIRY = _env_float("MIN_MINUTES_TO_EXPIRY", 4.0)
-YES_BREAKEVEN_PRICE   = _env_int("YES_BREAKEVEN_PRICE", 78)
+MIN_MINUTES_TO_EXPIRY = _env_float("MIN_MINUTES_TO_EXPIRY", 6.0)
+YES_BREAKEVEN_PRICE   = _env_int("YES_BREAKEVEN_PRICE", 67)
 
-# v9.1.0: clustered signals throttle. The cooldown was a hardcoded 60s and
-# concurrency was 1, so when several markets lit up within ~90s (as on
-# 2026-06-19 at 01:31–01:32) only the first could ever fill. Both are now
-# tunable; defaults loosened to let genuine simultaneous edges through while
-# the daily-loss / streak / Wilson guards still cap total risk.
-COOLDOWN_SECS         = _env_int("COOLDOWN_SECS", 45)
+# v9.3.0: DOCTRINE LAYER 7 — BTC momentum must explicitly AGREE with the OB
+# direction. NEUTRAL (flat BTC) and CONFLICT are both rejections. Default ON.
+REQUIRE_AGREE_MOMENTUM = _env_bool("REQUIRE_AGREE_MOMENTUM", True)
 
-# v9.1.0: opt-in RANGING trading. The bot's primary edge is order-book
-# pressure, which is informative regardless of BTC trend. When enabled,
-# RANGING regimes are tradeable and earn RANGING_CONF_PTS toward confidence so
-# a strong OB setup can still clear MIN_CONFIDENCE. Default off preserves the
-# trend-only behavior that has been live-validated; flip TRADE_RANGING=true to
-# materially increase trade frequency.
-TRADE_RANGING         = _env_bool("TRADE_RANGING", False)
-RANGING_CONF_PTS      = _env_int("RANGING_CONF_PTS", 12)
-
-# ── Time-of-day session quality ───────────────────────────────────────────────
+# -- Time-of-day session quality ----------------------------------------------
 SESSION_QUALITY: dict = {
     0: 20, 1: 10, 2: 10, 3: 10, 4: 15, 5: 30,
     6: 45, 7: 50, 8: 60, 9: 65, 10: 70, 11: 75,
@@ -311,23 +183,21 @@ SESSION_QUALITY: dict = {
 }
 MIN_SESSION_SCORE = _env_int("MIN_SESSION_SCORE", 60)
 
-# ── Bayesian priors ───────────────────────────────────────────────────────────
+# -- Bayesian priors ----------------------------------------------------------
 OB_BASE_ACCURACY       = _env_float("OB_BASE_ACCURACY", 0.635)
 MOMENTUM_ACCURACY_LIFT = _env_float("MOMENTUM_ACCURACY_LIFT", 0.045)
-# v9.0.6: default 0.02 → 0.0. NEUTRAL BTC means no evidence against the OB
-# signal — applying a penalty here was suppressing otherwise-valid setups.
-# Delete NEUTRAL_ACCURACY_DRAG env var or set to 0.0 in Railway.
-NEUTRAL_ACCURACY_DRAG  = _env_float("NEUTRAL_ACCURACY_DRAG", 0.0)
+NEUTRAL_ACCURACY_DRAG  = _env_float("NEUTRAL_ACCURACY_DRAG", 0.02)
 
-# ── Recovery protocol ─────────────────────────────────────────────────────────
+# -- Recovery protocol --------------------------------------------------------
 RECOVERY_TRIGGER_PCT  = _env_float("RECOVERY_TRIGGER_PCT", 0.10)
 RECOVERY_EXIT_TRADES  = _env_int("RECOVERY_EXIT_TRADES", 5)
 RECOVERY_WIN_RATE_MIN = _env_float("RECOVERY_WIN_RATE_MIN", 0.60)
+RECOVERY_MAX_SECS     = _env_int("RECOVERY_MAX_SECS", 3600)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # RSA AUTHENTICATION
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _normalize_pem(raw: str) -> str:
     pem = raw.replace("\\n", "\n").replace("\\r", "").replace("\r", "")
@@ -351,7 +221,7 @@ try:
     _private_key = serialization.load_pem_private_key(
         KALSHI_PRIVATE_KEY_PEM.encode("utf-8"), password=None,
     )
-    log.info("✅ RSA private key loaded.")
+    log.info("RSA private key loaded.")
 except Exception as e:
     raise ValueError(f"Failed to load PEM key: {e}") from e
 
@@ -377,27 +247,9 @@ def _auth_headers(method: str, path: str) -> dict:
     }
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # HTTP
-# ─────────────────────────────────────────────────────────────────────────────
-
-# v9.1.0 — CREATE-ORDER MIGRATION (the fix for the 2026-06-19 zero-trade day).
-# Kalshi retired the legacy POST /portfolio/orders create endpoint (deprecation
-# date 2026-05-06 has passed); it now returns HTTP 410 deprecated_v1_order_endpoint.
-# Five fully-qualified signals were generated that day and ALL FIVE died here.
-# The replacement is the single-book v2 endpoint:
-#
-#   POST /trade-api/v2/portfolio/events/orders
-#
-# It quotes everything from the YES leg via a `side` of bid/ask plus a single
-# `price` in fixed-point dollars:
-#     bid  = buy  YES at `price`
-#     ask  = sell YES at `price`   ==  buy NO at (1 - price)
-# So a NO trade is expressed as a YES ask at the complementary price.
-ORDER_PATH            = "/portfolio/events/orders"
-ORDER_TIME_IN_FORCE   = os.getenv("ORDER_TIME_IN_FORCE", "good_till_canceled")
-ORDER_POST_ONLY       = _env_bool("ORDER_POST_ONLY", False)
-SELF_TRADE_PREVENTION = os.getenv("SELF_TRADE_PREVENTION", "taker_at_cross")
+# -----------------------------------------------------------------------------
 
 _http    = requests.Session()
 BASE_URL = ""
@@ -431,7 +283,7 @@ def init_base_url() -> None:
             r = _http.get(host + "/trade-api/v2/exchange/status", timeout=6)
             if r.status_code == 200:
                 BASE_URL = host + "/trade-api/v2"
-                log.info("✅ API host: %s", host)
+                log.info("API host: %s", host)
                 return
         except Exception:
             continue
@@ -439,16 +291,14 @@ def init_base_url() -> None:
     log.warning("Host probe failed — using default.")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # GLOBAL STATE
 #
 # RULE: open_orders, active_tickers, trade_history, session_traded_tickers,
 # _processed_settlement_ids, btc_prices, btc_returns, _prev_ob are module-level
 # mutable containers. They are mutated IN-PLACE everywhere. They must NEVER
-# appear in any function's `global` declaration — doing so causes Python to
-# treat every reference inside that function as an unbound local variable,
-# producing UnboundLocalError before any in-place mutation occurs.
-# ─────────────────────────────────────────────────────────────────────────────
+# appear in any function's `global` declaration.
+# -----------------------------------------------------------------------------
 
 btc_prices:  deque = deque(maxlen=60)
 btc_returns: deque = deque(maxlen=59)
@@ -465,12 +315,6 @@ session_start_balance:  float = 0.0
 session_stop_threshold: float = 0.0
 live_wins:              int   = 0
 live_losses:            int   = 0
-# v9.0.10: perf-guard sample — ONLY trades placed by THIS session. Reset to 0/0
-# on boot. live_wins/live_losses still carry full history (matched + pre-restart
-# unmatched) for RECOVERY exit, the Bayesian prior, and displays; these two
-# carry only this session's settled trades and feed performance_guard().
-session_wins:           int   = 0
-session_losses:         int   = 0
 consecutive_losses:     int   = 0
 streak_pause_until:     float = 0.0
 running_pnl:            float = 0.0
@@ -484,11 +328,10 @@ session_state:         SessionState = SessionState.ACTIVE
 recovery_trades:       int          = 0
 recovery_entry_wins:   int          = 0
 recovery_entry_losses: int          = 0
+recovery_entered_ts:   float        = 0.0
 _session_start_ts:     str          = ""
+_session_day:          str          = ""
 _session_halted:       bool         = False
-_halt_reason:          str          = ""    # human-readable cause of the halt
-_halt_day:             str          = ""    # UTC date (YYYY-MM-DD) the halt began
-_halt_permanent:       bool         = False # True = never auto-resume (e.g. floor)
 _shutdown_requested:   bool         = False
 _last_known_balance:   float        = 0.0
 
@@ -499,14 +342,12 @@ _vol_circuit_until: float = 0.0
 
 _live_prior: float = OB_BASE_ACCURACY
 
-# Laddering stake overlay — only instantiated when LADDER_ENABLED. Sized as a
-# multiplier on top of the Kelly stake; respects every existing cap.
 stake_ladder: Optional[StakeLadder] = StakeLadder() if LADDER_ENABLED else None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # SIGTERM
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _sigterm_handler(signum, frame):
     global _shutdown_requested
@@ -517,9 +358,9 @@ def _sigterm_handler(signum, frame):
 signal.signal(signal.SIGTERM, _sigterm_handler)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # BTC PRICE FEED
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 _btc_backoff_until: float = 0.0
 
@@ -563,9 +404,9 @@ def ingest_btc_price() -> None:
     btc_prices.append(price)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # REGIME ENGINE
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _linear_regression(ys: list) -> Tuple[float, float, float]:
     n = len(ys)
@@ -595,27 +436,27 @@ def compute_regime() -> Tuple[Regime, float, float]:
     realized_vol = sum(abs(r) for r in returns) / len(returns) if returns else 0.0
 
     if returns and max(abs(r) for r in returns[-3:]) > VOL_CIRCUIT_BREAKER:
-        log.warning("VOL CIRCUIT │ spike %.3f%%", max(abs(r) for r in returns[-3:]))
+        log.warning("VOL CIRCUIT | spike %.3f%%", max(abs(r) for r in returns[-3:]))
         return Regime.HIGH_VOL, 0.0, realized_vol
 
     if realized_vol > VOLATILITY_CAP_PCT:
-        log.info("Regime │ HIGH_VOL (vol=%.4f%%)", realized_vol)
+        log.info("Regime | HIGH_VOL (vol=%.4f%%)", realized_vol)
         return Regime.HIGH_VOL, 0.0, realized_vol
 
     slope, _, r_squared = _linear_regression(prices)
 
     if r_squared >= R2_TREND_THRESHOLD:
         regime = Regime.TRENDING_UP if slope > 0 else Regime.TRENDING_DOWN
-        log.info("Regime │ %s (R²=%.3f)", regime.value, r_squared)
+        log.info("Regime | %s (R2=%.3f)", regime.value, r_squared)
         return regime, r_squared, realized_vol
 
-    log.info("Regime │ RANGING (R²=%.3f)", r_squared)
+    log.info("Regime | RANGING (R2=%.3f)", r_squared)
     return Regime.RANGING, r_squared, realized_vol
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # VOLATILITY CIRCUIT BREAKER
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def check_vol_circuit() -> bool:
     global _vol_circuit_open, _vol_circuit_until
@@ -639,7 +480,7 @@ def check_vol_circuit() -> bool:
         _vol_circuit_until = time.time() + 1800
         log.warning("Vol circuit OPENED — %.3f%%", max_move)
         tg.send_telegram_message(
-            f"⚡ VOL CIRCUIT BREAKER OPENED\n"
+            f"VOL CIRCUIT BREAKER OPENED\n"
             f"Max move: {max_move:.3f}% — trading paused 30 min."
         )
         return True
@@ -647,9 +488,9 @@ def check_vol_circuit() -> bool:
     return False
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # MOMENTUM SIGNAL
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def compute_momentum(ob_direction: str) -> Tuple[str, float]:
     if len(btc_prices) < 5:
@@ -675,9 +516,21 @@ def compute_momentum(ob_direction: str) -> Tuple[str, float]:
     return "CONFLICT", 0.0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+def momentum_gate_ok(momentum_verdict: str) -> bool:
+    """DOCTRINE LAYER 7 — the AGREE-required momentum gate.
+
+    A trade requires BTC spot momentum to EXPLICITLY AGREE with the order-book
+    direction. When REQUIRE_AGREE_MOMENTUM is true (default), both CONFLICT and
+    NEUTRAL are rejections. Applies in EVERY session state, RECOVERY included.
+    """
+    if not REQUIRE_AGREE_MOMENTUM:
+        return True
+    return momentum_verdict == "AGREE"
+
+
+# -----------------------------------------------------------------------------
 # ORDER BOOK ANALYSIS
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def _parse_ob_levels(levels: list, lo: float, hi: float) -> Tuple[float, int]:
     depth = 0.0
@@ -711,11 +564,11 @@ def analyze_order_book(ob_data: dict, yes_mid: int) -> Optional[dict]:
     total = yes_depth + no_depth
 
     if total < MIN_OB_DEPTH:
-        log.info("OB │ depth $%.0f < min $%.0f", total, MIN_OB_DEPTH)
+        log.info("OB | depth $%.0f < min $%.0f", total, MIN_OB_DEPTH)
         return None
 
     if yes_lc == 0 or no_lc == 0:
-        log.info("OB │ ghost book (YES:%d NO:%d levels)", yes_lc, no_lc)
+        log.info("OB | ghost book (YES:%d NO:%d levels)", yes_lc, no_lc)
         return None
 
     yr = yes_depth / total
@@ -737,11 +590,11 @@ def analyze_order_book(ob_data: dict, yes_mid: int) -> Optional[dict]:
         direction = "NO"
         imbalance = nr
     else:
-        log.info("OB │ no dominant side (YES:%.1f%% NO:%.1f%% thresh:%.1f%%)",
+        log.info("OB | no dominant side (YES:%.1f%% NO:%.1f%% thresh:%.1f%%)",
                  yr * 100, nr * 100, eff_thresh * 100)
         return None
 
-    log.info("OB │ %s %.1f%% │ $%.0f │ thresh=%.1f%%",
+    log.info("OB | %s %.1f%% | $%.0f | thresh=%.1f%%",
              direction, imbalance * 100, total, eff_thresh * 100)
 
     return {
@@ -769,16 +622,31 @@ def check_ob_trend(ticker: str, direction: str, imbalance: float) -> bool:
         return True
 
     if direction == prev_dir and imbalance < prev_imb - 0.10:
-        log.info("OB trend │ fading %.1f%%→%.1f%% — blocking",
+        log.info("OB trend | fading %.1f%%->%.1f%% — blocking",
                  prev_imb * 100, imbalance * 100)
         return False
 
     return True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+def regime_direction(regime: Regime) -> Optional[str]:
+    """Map a trend regime to the contract side it favors."""
+    if regime == Regime.TRENDING_UP:
+        return "YES"
+    if regime == Regime.TRENDING_DOWN:
+        return "NO"
+    return None
+
+
+def regime_agrees(regime: Regime, ob_direction: str) -> bool:
+    """The order-book side must point the same way as the measured trend."""
+    favored = regime_direction(regime)
+    return favored is None or favored == ob_direction.upper()
+
+
+# -----------------------------------------------------------------------------
 # BAYESIAN PROBABILITY MODEL
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def bayesian_win_prob(
     ob: dict,
@@ -796,6 +664,9 @@ def bayesian_win_prob(
     else:
         regime_adj = 0.0
 
+    eff_thresh    = ob.get("eff_thresh", OB_IMBALANCE_THRESH)
+    imbalance_adj = min(0.06, max(0.0, ob["imbalance"] - eff_thresh) * 0.30)
+
     depth_adj = 0.0
     if ob["total_depth"] > 500:
         depth_adj = min(0.02, math.log10(ob["total_depth"] / 500) * 0.02)
@@ -803,17 +674,17 @@ def bayesian_win_prob(
     vol_penalty = min(0.04, realized_vol / VOLATILITY_CAP_PCT * 0.04)
 
     win_prob = max(0.50, min(0.92,
-        prior + momentum_adj + regime_adj + depth_adj - vol_penalty
+        prior + momentum_adj + regime_adj + imbalance_adj + depth_adj - vol_penalty
     ))
 
-    log.info("WinProb │ prior=%.3f mom=%.3f regime=%.3f depth=%.3f vol=-%.3f → %.3f",
-             prior, momentum_adj, regime_adj, depth_adj, vol_penalty, win_prob)
+    log.info("WinProb | prior=%.3f mom=%.3f regime=%.3f imb=%.3f depth=%.3f vol=-%.3f -> %.3f",
+             prior, momentum_adj, regime_adj, imbalance_adj, depth_adj, vol_penalty, win_prob)
     return win_prob
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # CONFIDENCE SCORING
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def compute_confidence(
     ob: dict,
@@ -831,10 +702,7 @@ def compute_confidence(
     regime_map = {
         Regime.TRENDING_UP:   20.0,
         Regime.TRENDING_DOWN: 20.0,
-        # v9.1.0: when RANGING trading is opted in, award partial confidence so
-        # a strong OB-pressure setup can still reach MIN_CONFIDENCE. Without it
-        # the 20pt trend gap silently re-blocks every ranging trade downstream.
-        Regime.RANGING:        float(RANGING_CONF_PTS) if TRADE_RANGING else 0.0,
+        Regime.RANGING:        0.0,
         Regime.HIGH_VOL:     -20.0,
         Regime.UNKNOWN:        0.0,
     }
@@ -842,12 +710,9 @@ def compute_confidence(
     if regime in (Regime.TRENDING_UP, Regime.TRENDING_DOWN):
         regime_pts += min(5.0, (r_squared - R2_TREND_THRESHOLD) * 15.0)
 
-    # v9.0.6: NEUTRAL raised from 2.0 → 8.0.
-    # NEUTRAL BTC means no evidence against the OB signal.
-    # A 2pt score (vs AGREE's 15) imposed a ~13pt penalty on setups where BTC
-    # happens to be flat — killing 9/10 signals in the 2026-06-08 session.
-    # AGREE still wins decisively (15 vs 8). CONFLICT unchanged (-20).
-    momentum_map = {"AGREE": 15.0, "NEUTRAL": 8.0, "CONFLICT": -20.0}
+    # v9.3.0: NEUTRAL restored 8.0 -> 2.0 (doctrine Layer 8: momentum only
+    # counts if AGREE).
+    momentum_map = {"AGREE": 15.0, "NEUTRAL": 2.0, "CONFLICT": -20.0}
     momentum_pts = momentum_map.get(momentum_verdict, 0.0)
 
     prob_pts = max(0.0, (win_prob - 0.50) / 0.42 * 15.0)
@@ -861,14 +726,14 @@ def compute_confidence(
         imb_pts + depth_pts + regime_pts + momentum_pts + prob_pts + time_pts
     ))
 
-    log.info("Conf │ imb=%.1f depth=%.1f regime=%.1f mom=%.1f prob=%.1f time=%.1f → %.0f",
+    log.info("Conf | imb=%.1f depth=%.1f regime=%.1f mom=%.1f prob=%.1f time=%.1f -> %.0f",
              imb_pts, depth_pts, regime_pts, momentum_pts, prob_pts, time_pts, total)
     return total
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # EDGE & SIZING
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def calc_edge(win_prob: float, contract_price_cents: int) -> float:
     if contract_price_cents <= 0 or contract_price_cents >= 100:
@@ -898,8 +763,6 @@ def kelly_bet(win_prob: float, contract_price_cents: int, balance: float) -> flo
     base_bet = round(min(full_kelly * kf * balance, TRADE_SIZE_CAP,
                          balance * MAX_BET_FRACTION), 2)
 
-    # Laddering overlay (opt-in). Scales the Kelly stake by a performance
-    # multiplier, but never past 2× the trade-size cap or the balance fraction.
     if stake_ladder is not None:
         ceiling  = min(stake_ladder.cfg.max_multiplier * TRADE_SIZE_CAP,
                        balance * MAX_BET_FRACTION)
@@ -909,9 +772,9 @@ def kelly_bet(win_prob: float, contract_price_cents: int, balance: float) -> flo
     return base_bet
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # STATISTICAL PERFORMANCE GUARD
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def wilson_lower_bound(wins: int, total: int, z: float = 1.645) -> float:
     if total < 10:
@@ -943,48 +806,35 @@ def update_live_prior() -> None:
     empirical   = live_wins / total
     weight      = min(1.0, total / 50.0)
     _live_prior = OB_BASE_ACCURACY * (1.0 - weight) + empirical * weight
-    log.debug("Prior → %.3f (n=%d)", _live_prior, total)
+    log.debug("Prior -> %.3f (n=%d)", _live_prior, total)
 
 
 def performance_guard() -> bool:
-    # v9.0.10: gate on THIS SESSION's settled trades only (session_wins/
-    # session_losses), NOT the full live_wins/live_losses counters. The full
-    # counters include pre-restart / account-history settlements ingested via
-    # the v9.0.5 unmatched branch (correct for RECOVERY exit + Bayesian prior).
-    # Feeding those into the Layer-3 statistical gate let a restart boot
-    # straight into a locked sub-50% Wilson LB on inherited history — and
-    # because the guard blocks trading, and only trading produces the
-    # settlements that would move the WR, the lock was permanent
-    # (2026-06-18 session: WR frozen 11/20, LB 37.2%, 258 PERF GUARD blocks,
-    # 0 trades despite +$20.36 realized). Session counters reset to 0/0 on boot
-    # so the guard extends benefit-of-the-doubt until MIN_SAMPLE_TRADES settle
-    # this session, then evaluates the strategy as it is actually trading. The
-    # 50% Wilson floor and MIN_SAMPLE_TRADES are unchanged.
-    total = session_wins + session_losses
+    total = live_wins + live_losses
     if total < MIN_SAMPLE_TRADES:
         return True
-    wlb = wilson_lower_bound(session_wins, total)
+    wlb = wilson_lower_bound(live_wins, total)
     if wlb < 0.50:
-        log.warning("PERF GUARD │ session Wilson LB %.1f%% < 50%% (n=%d, %dW/%dL)",
-                    wlb * 100, total, session_wins, session_losses)
+        log.warning("PERF GUARD | Wilson LB %.1f%% < 50%%", wlb * 100)
         return False
     return True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # SESSION QUALITY
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def get_session_score() -> int:
     return SESSION_QUALITY.get(datetime.now(timezone.utc).hour, 50)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # RECOVERY PROTOCOL
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def update_session_state(current_balance: float) -> None:
     global session_state, recovery_trades, recovery_entry_wins, recovery_entry_losses
+    global recovery_entered_ts
 
     if session_state == SessionState.HALTED:
         return
@@ -997,33 +847,36 @@ def update_session_state(current_balance: float) -> None:
             recovery_trades       = 0
             recovery_entry_wins   = live_wins
             recovery_entry_losses = live_losses
-            log.warning("SESSION RECOVERY │ loss %.1f%% │ entry snapshot W=%d L=%d",
+            recovery_entered_ts   = time.time()
+            log.warning("SESSION RECOVERY | loss %.1f%% | entry snapshot W=%d L=%d",
                         loss_pct * 100, recovery_entry_wins, recovery_entry_losses)
             tg.send_telegram_message(
-                f"⚠️ SESSION RECOVERY MODE\n"
+                f"SESSION RECOVERY MODE\n"
                 f"Loss: {loss_pct*100:.1f}% — sizing halved."
             )
 
     elif session_state == SessionState.RECOVERY:
-        # v9.0.9: BALANCE-BASED EXIT (primary).
-        # Recovery entry is gated on loss_pct > RECOVERY_TRIGGER_PCT; the exit
-        # must be reachable the same way. The trade-count exit below deadlocks
-        # in calm markets — RECOVERY forces momentum==AGREE, BTC momentum is
-        # NEUTRAL on most scans, so trades never accumulate and recovery never
-        # clears. If the drawdown that triggered recovery has healed back to
-        # at/below the trigger, return to ACTIVE regardless of trade count.
-        if loss_pct <= RECOVERY_TRIGGER_PCT:
+        if recovery_entered_ts <= 0.0:
+            recovery_entered_ts = time.time()
+        elif time.time() - recovery_entered_ts > RECOVERY_MAX_SECS:
             session_state = SessionState.ACTIVE
-            log.info("RECOVERY EXITED │ drawdown healed (loss %.1f%% ≤ trigger %.1f%%)",
-                     loss_pct * 100, RECOVERY_TRIGGER_PCT * 100)
+            log.warning("RECOVERY EXITED | timeout %.0fs elapsed (loss %.1f%%)",
+                        time.time() - recovery_entered_ts, loss_pct * 100)
             tg.send_telegram_message(
-                f"✅ Recovery exited — drawdown healed ({loss_pct*100:.1f}%)"
+                f"Recovery exited — {RECOVERY_MAX_SECS//60}min timeout "
+                f"(loss {loss_pct*100:.1f}%)"
             )
             return
 
-        # Trade-count exit (faster path when AGREE trades do settle).
-        # Uses full live counters intentionally — RECOVERY tracks all settled
-        # trades since entry, including pre-restart ones (v9.0.5/9.0.8 design).
+        if loss_pct <= RECOVERY_TRIGGER_PCT:
+            session_state = SessionState.ACTIVE
+            log.info("RECOVERY EXITED | drawdown healed (loss %.1f%% <= trigger %.1f%%)",
+                     loss_pct * 100, RECOVERY_TRIGGER_PCT * 100)
+            tg.send_telegram_message(
+                f"Recovery exited — drawdown healed ({loss_pct*100:.1f}%)"
+            )
+            return
+
         trades_since_entry = (
             (live_wins + live_losses) - (recovery_entry_wins + recovery_entry_losses)
         )
@@ -1032,16 +885,16 @@ def update_session_state(current_balance: float) -> None:
             wr = wins_since / trades_since_entry if trades_since_entry > 0 else 0.0
             if wr >= RECOVERY_WIN_RATE_MIN:
                 session_state = SessionState.ACTIVE
-                log.info("RECOVERY EXITED │ WR=%.1f%% (%d/%d since entry)",
+                log.info("RECOVERY EXITED | WR=%.1f%% (%d/%d since entry)",
                          wr * 100, wins_since, trades_since_entry)
                 tg.send_telegram_message(
-                    f"✅ Recovery exited — WR {wr*100:.0f}% ({wins_since}/{trades_since_entry})"
+                    f"Recovery exited — WR {wr*100:.0f}% ({wins_since}/{trades_since_entry})"
                 )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # PORTFOLIO / BALANCE
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def get_live_balance(allow_cached_zero: bool = True) -> float:
     global _last_known_balance
@@ -1078,24 +931,11 @@ def _extract_realized_dollars(rec: dict, trade_cost: Optional[float] = None) -> 
     """
     Extract realized PnL in dollars from a Kalshi settlement record.
 
-    v9.0.7: REWRITTEN against the actual KXBTC15M settlement schema observed in
-    the 2026-06-08 live logs. The real record has NO realized_pnl/profit field.
-    Its keys are:
-        event_ticker, fee_cost, market_result, no_count_fp,
-        no_total_cost_dollars, revenue, settled_time, ticker, value,
-        yes_count_fp, yes_total_cost_dollars
-
-    Reconstruction:
+    v9.0.7: rebuilt against the real KXBTC15M settlement schema. The record has
+    NO realized_pnl/profit field. Reconstruction:
         pnl = (revenue / 100) - yes_total_cost_dollars - no_total_cost_dollars - fee_cost
-
-    `revenue` is returned in CENTS by the Kalshi settlements endpoint (same unit
-    as the balance endpoint which requires /100). The *_dollars cost fields and
-    fee_cost are returned in dollars. Dividing revenue by 100 before subtracting
-    the dollar-denominated costs prevents the ~100× profit inflation bug.
-
-    Direct PnL fields are still tried first in case Kalshi adds them later.
+    revenue is in CENTS; *_dollars cost fields and fee_cost are in dollars.
     """
-    # 1) Direct PnL fields (future-proofing; absent in current schema)
     for k in ("realized_pnl_dollars", "settlement_pnl_dollars", "pnl_dollars"):
         v = _coerce_float(rec.get(k))
         if v is not None:
@@ -1103,12 +943,8 @@ def _extract_realized_dollars(rec: dict, trade_cost: Optional[float] = None) -> 
     for k in ("realized_pnl_cents", "realized_pnl", "settlement_pnl", "pnl"):
         v = _coerce_float(rec.get(k))
         if v is not None:
-            # legacy integer-cent fields divided by 100; dollar fields handled above
             return v / 100.0 if k.endswith("_cents") else v
 
-    # 2) Real KXBTC15M reconstruction: revenue - total cost - fees
-    # Kalshi settlement API returns revenue in cents (same as balance endpoint);
-    # cost/fee fields named *_dollars are already in dollars.
     revenue = _coerce_float(rec.get("revenue"))
     if revenue is not None:
         revenue /= 100.0
@@ -1118,22 +954,14 @@ def _extract_realized_dollars(rec: dict, trade_cost: Optional[float] = None) -> 
         total_cost = yes_cost + no_cost
         if total_cost > 0:
             return round(revenue - total_cost - fee, 4)
-        # No cost recorded on either side. If revenue is also 0 this is an
-        # unfilled/expired maker order (no position taken) → return 0.0 so the
-        # caller's NO-FILL branch handles it instead of counting a phantom loss.
         if revenue == 0.0:
             return 0.0
-        # Cost missing but revenue present — fall back to the matched trade cost.
         if trade_cost is not None and trade_cost > 0:
             return round(revenue - trade_cost - fee, 4)
-        # Revenue present, no cost anywhere: treat as win for W/L counting only.
         return 1.0
 
-    # 3) market_result as a final win/loss signal when no economics present
     mr = str(rec.get("market_result", "")).lower()
     if mr in ("yes", "no"):
-        # Without held-side info here we can only flag presence; caller matches side.
-        # Return None so the caller logs missing economics rather than miscounting.
         return None
 
     return None
@@ -1148,19 +976,7 @@ def _extract_ticker(rec: dict) -> str:
 
 
 def _is_post_boot(rec: dict) -> bool:
-    """
-    True if a settlement record was created at/after this process's boot time.
-
-    v9.0.8: the /portfolio/settlements endpoint ignores created_since and always
-    returns the account-wide last 100 settlements. The unmatched-settlement
-    branch in resolve_open_orders() counts these toward live_wins/live_losses so
-    RECOVERY can exit on pre-restart trades — but with no time gate it ingests
-    days of account history on every boot. Gate: only count a settlement whose
-    timestamp is >= _session_start_ts. A pre-restart trade still in flight
-    settles AFTER boot, so it is preserved; trades settled entirely before this
-    boot (account history) are excluded. Records with a missing/unparseable
-    timestamp are treated as NOT post-boot (conservative).
-    """
+    """True if a settlement record was created at/after this process's boot."""
     if not _session_start_ts:
         return False
     rec_ts = (rec.get("settled_time") or rec.get("created_time")
@@ -1195,14 +1011,13 @@ def _fetch_settled_records(since_ts: str) -> list:
         return []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # RESOLUTION
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def resolve_open_orders() -> None:
     global paper_balance, paper_daily_pnl, consecutive_losses
     global running_pnl, live_wins, live_losses, streak_pause_until
-    global session_wins, session_losses
 
     if not open_orders and not DEMO_MODE:
         pass
@@ -1251,7 +1066,6 @@ def resolve_open_orders() -> None:
             if won:
                 consecutive_losses = 0
                 live_wins += 1
-                session_wins += 1      # v9.0.10: this-session matched trade
                 tg.send_win_notification(
                     profit=trade_pnl, balance=paper_balance,
                     daily_pnl=paper_daily_pnl,
@@ -1261,10 +1075,8 @@ def resolve_open_orders() -> None:
             else:
                 consecutive_losses += 1
                 live_losses += 1
-                session_losses += 1    # v9.0.10: this-session matched trade
                 if consecutive_losses >= MAX_CONSEC_LOSSES:
-                    _trigger_halt(
-                        f"{consecutive_losses} consecutive losses", paper_balance)
+                    streak_pause_until = time.time() + STREAK_PAUSE_SECS
                 tg.send_loss_notification(
                     loss=abs(trade_pnl), balance=paper_balance,
                     daily_pnl=paper_daily_pnl,
@@ -1275,20 +1087,20 @@ def resolve_open_orders() -> None:
 
             ladder_record(won, trade_pnl)
 
-            log.info("📋 PAPER SETTLED │ %s │ %s │ %s │ sim=%s │ bal=$%.2f",
+            log.info("PAPER SETTLED | %s | %s | %s | sim=%s | bal=$%.2f",
                      ticker[-15:], side, result.upper(), sim, paper_balance)
 
         update_live_prior()
         return
 
-    # ── Live ──────────────────────────────────────────────────────────────────
+    # -- Live ------------------------------------------------------------------
     try:
         since_ts = _session_start_ts or (
             datetime.now(timezone.utc) - timedelta(hours=2)
         ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
         records = _fetch_settled_records(since_ts)
-        log.info("RESOLVE │ %d settled, %d open, %d processed",
+        log.info("RESOLVE | %d settled, %d open, %d processed",
                  len(records), len(open_orders), len(_processed_settlement_ids))
 
         ticker_to_oid: dict = {}
@@ -1318,24 +1130,20 @@ def resolve_open_orders() -> None:
             _processed_settlement_ids.add(rec_id)
 
             if not matched_oid:
-                # Pre-restart trade: count toward full W/L so RECOVERY can exit.
-                # v9.0.8: ONLY if settled at/after boot. v9.0.10: these do NOT
-                # feed session_wins/session_losses — the perf guard must not be
-                # seeded by inherited (even if recent) account settlements.
                 if not _is_post_boot(rec):
                     continue
                 pnl_d = _extract_realized_dollars(rec)
                 if pnl_d is not None and pnl_d != 0.0:
                     if pnl_d > 0:
                         live_wins += 1
-                        log.info("UNMATCHED WIN │ %s │ $%.2f (pre-restart)",
+                        log.info("UNMATCHED WIN | %s | $%.2f (pre-restart)",
                                  rec_ticker[-15:], pnl_d)
                     else:
                         live_losses += 1
-                        # v9.0.11: pre-restart settlements are inherited history;
-                        # they update the lifetime counters but must NOT halt the
-                        # fresh session via the consecutive-loss breaker.
-                        log.info("UNMATCHED LOSS │ %s │ $%.2f (pre-restart)",
+                        consecutive_losses += 1
+                        if consecutive_losses >= MAX_CONSEC_LOSSES:
+                            streak_pause_until = time.time() + STREAK_PAUSE_SECS
+                        log.info("UNMATCHED LOSS | %s | $%.2f (pre-restart)",
                                  rec_ticker[-15:], pnl_d)
                     ladder_record(pnl_d > 0, pnl_d)
                     update_live_prior()
@@ -1345,17 +1153,15 @@ def resolve_open_orders() -> None:
             active_tickers.discard(rec_ticker)
             active_tickers.discard(trade.get("ticker", ""))
 
-            # v9.0.6: pass trade cost to _extract_realized_dollars so it can
-            # reconstruct PnL from revenue fields when direct PnL fields absent.
             trade_cost = trade.get("cost")
             pnl_d = _extract_realized_dollars(rec, trade_cost=trade_cost)
             if pnl_d is None:
-                log.warning("RESOLVE │ %s — no pnl field. Keys: %s",
+                log.warning("RESOLVE | %s — no pnl field. Keys: %s",
                             rec_ticker[-15:], list(rec.keys()))
                 continue
 
             if pnl_d == 0.0:
-                log.info("NO-FILL │ %s", rec_ticker[-15:])
+                log.info("NO-FILL | %s", rec_ticker[-15:])
                 for t in trade_history:
                     if t.get("order_id") == matched_oid:
                         t["result"] = "unfilled"
@@ -1379,21 +1185,18 @@ def resolve_open_orders() -> None:
             if won:
                 consecutive_losses = 0
                 live_wins += 1
-                session_wins += 1      # v9.0.10: this-session matched trade
             else:
                 consecutive_losses += 1
                 live_losses += 1
-                session_losses += 1    # v9.0.10: this-session matched trade
                 if consecutive_losses >= MAX_CONSEC_LOSSES:
-                    _trigger_halt(
-                        f"{consecutive_losses} consecutive losses", balance)
+                    streak_pause_until = time.time() + STREAK_PAUSE_SECS
 
             ladder_record(won, pnl)
 
-            wlb = wilson_lower_bound(session_wins, session_wins + session_losses)
-            log.info("✅ SETTLED │ %s │ %s │ $%.2f │ sess=%d/%d │ LB=%.1f%%",
+            wlb = wilson_lower_bound(live_wins, live_wins + live_losses)
+            log.info("SETTLED | %s | %s | $%.2f | WR=%d/%d | LB=%.1f%%",
                      rec_ticker[-15:], result.upper(), pnl,
-                     session_wins, session_wins + session_losses, wlb * 100)
+                     live_wins, live_wins + live_losses, wlb * 100)
 
             if won:
                 tg.send_win_notification(
@@ -1418,7 +1221,7 @@ def resolve_open_orders() -> None:
                 if oid in canceled_ids:
                     trade = open_orders.pop(oid)
                     active_tickers.discard(trade.get("ticker", ""))
-                    log.info("Order canceled │ %s", oid[:12])
+                    log.info("Order canceled | %s", oid[:12])
         except Exception:
             pass
 
@@ -1428,15 +1231,15 @@ def resolve_open_orders() -> None:
         for oid in stale:
             trade = open_orders.pop(oid)
             active_tickers.discard(trade.get("ticker", ""))
-            log.info("Stale purged │ %s", trade.get("ticker", "?")[-15:])
+            log.info("Stale purged | %s", trade.get("ticker", "?")[-15:])
 
     except Exception as e:
         log.warning("Resolution error: %s", e)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # STALE ORDER CANCELLATION
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def cancel_stale_orders() -> None:
     global paper_balance
@@ -1456,20 +1259,20 @@ def cancel_stale_orders() -> None:
                     t["result"] = "canceled"
                     t["pnl"]    = 0.0
                     break
-            log.info("Stale cancel (paper) │ %s │ $%.2f", ticker[-15:], cost)
+            log.info("Stale cancel (paper) | %s | $%.2f", ticker[-15:], cost)
         else:
             try:
-                _delete(f"/portfolio/orders/{oid}")
+                _delete(f"/portfolio/events/orders/{oid}")
                 open_orders.pop(oid)
                 active_tickers.discard(ticker)
-                log.info("Stale cancel (live) │ %s │ %s", ticker[-15:], oid[:12])
+                log.info("Stale cancel (live) | %s | %s", ticker[-15:], oid[:12])
             except Exception as e:
                 log.warning("Stale cancel failed %s: %s", oid[:12], e)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # MARKET DISCOVERY
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 BTC_SERIES = ["KXBTC15M", "KXBTCD", "KXBTC"]
 
@@ -1501,7 +1304,7 @@ def get_active_market() -> Optional[dict]:
                 continue
             valid.sort(key=lambda m: abs(m["yes_mid"] - 50))
             m0 = valid[0]
-            log.info("Market │ %s bid=%dc mid=%dc ask=%dc",
+            log.info("Market | %s bid=%dc mid=%dc ask=%dc",
                      m0.get("ticker"), m0["yes_bid"], m0["yes_mid"], m0["yes_ask"])
             return m0
         except Exception as e:
@@ -1525,111 +1328,55 @@ def minutes_to_expiry(market: dict) -> float:
         return 999.0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # GUARD STACK
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def balance_floor_check(balance: float) -> bool:
     if balance < MIN_BALANCE_FLOOR:
-        log.warning("BALANCE FLOOR │ $%.2f < $%.2f", balance, MIN_BALANCE_FLOOR)
+        log.warning("BALANCE FLOOR | $%.2f < $%.2f", balance, MIN_BALANCE_FLOOR)
         return False
     return True
 
 
-def _utc_day() -> str:
-    """UTC calendar date as YYYY-MM-DD — the trading-day key for halt resets."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
-
-def effective_daily_loss_cap() -> float:
-    """Tighter of the dollar cap and the fraction-of-starting-balance cap.
-
-    v9.0.11: a flat dollar cap is dangerous on a small account ($15 was 31% of
-    the $48 account on 2026-06-18). The fractional cap scales the stop with the
-    bankroll; whichever bites first wins.
-    """
-    cap = MAX_DAILY_LOSS
-    if MAX_DAILY_LOSS_FRACTION > 0 and session_start_balance > 0:
-        cap = min(cap, MAX_DAILY_LOSS_FRACTION * session_start_balance)
-    return cap
-
-
-def _trigger_halt(reason: str, balance: float, permanent: bool = False) -> None:
-    """Halt trading. Daily halts auto-resume next UTC day unless permanent."""
-    global _session_halted, _halt_reason, _halt_day, _halt_permanent, session_state
-    if _session_halted:
-        return
-    _session_halted = True
-    _halt_reason    = reason
-    _halt_day       = _utc_day()
-    _halt_permanent = permanent or not AUTO_RESTART
-    session_state   = SessionState.HALTED
-    mode = "PERMANENT" if _halt_permanent else "auto-resume next UTC day"
-    log.warning("HALT │ %s — %s", reason, mode)
-    telegram_halt(reason, balance, permanent=_halt_permanent)
-
-
-def halt_can_resume() -> bool:
-    """A non-permanent daily halt may resume once the UTC day has rolled over."""
-    return (_session_halted and not _halt_permanent and AUTO_RESTART
-            and _utc_day() != _halt_day)
-
-
-def resume_from_halt(balance: float) -> None:
-    """Clear a daily halt and reset the daily risk counters for the new day."""
-    global _session_halted, _halt_reason, _halt_day, session_state
-    global consecutive_losses, paper_daily_pnl, daily_pnl
-    global session_start_balance, session_stop_threshold, _session_start_ts
-    _session_halted    = False
-    _halt_reason       = ""
-    _halt_day          = ""
-    session_state      = SessionState.ACTIVE
-    consecutive_losses = 0
-    paper_daily_pnl    = 0.0
-    daily_pnl          = 0.0
-    # Re-baseline the session so the daily-loss and drawdown stops measure the
-    # NEW day, not cumulative damage from before the halt.
-    session_start_balance  = balance
-    session_stop_threshold = balance * SESSION_STOP_FRACTION
-    _session_start_ts      = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    log.info("RESUMED │ new UTC day — daily counters reset │ bal=$%.2f", balance)
-    telegram_resume(balance)
-
-
 def daily_loss_check(balance: float) -> bool:
+    global _session_halted
     if _session_halted:
         return False
     pnl = paper_daily_pnl if DEMO_MODE else daily_pnl
-    cap = effective_daily_loss_cap()
-    if pnl <= -cap:
-        log.warning("DAILY LOSS │ $%.2f ≥ cap $%.2f — halted.", abs(pnl), cap)
-        _trigger_halt(f"Daily loss cap ${abs(pnl):.2f}", balance)
+    pct_cap = MAX_DAILY_LOSS_PCT * session_start_balance if session_start_balance > 0 else 0.0
+    loss_cap = min(MAX_DAILY_LOSS, pct_cap) if pct_cap > 0 else MAX_DAILY_LOSS
+    if pnl <= -loss_cap:
+        _session_halted = True
+        log.warning("DAILY LOSS | $%.2f >= cap $%.2f — halted.", abs(pnl), loss_cap)
+        telegram_halt(f"Daily loss cap ${abs(pnl):.2f}", balance)
         return False
     if session_stop_threshold > 0 and balance < session_stop_threshold:
-        log.warning("SESSION STOP │ $%.2f < $%.2f — halted.", balance, session_stop_threshold)
-        _trigger_halt(f"Session stop at ${balance:.2f}", balance)
+        _session_halted = True
+        log.warning("SESSION STOP | $%.2f < $%.2f — halted.", balance, session_stop_threshold)
+        telegram_halt(f"Session stop at ${balance:.2f}", balance)
         return False
     return True
 
 
 def spread_check(bid: int, ask: int) -> bool:
     if ask - bid <= 0:
-        log.info("Spread │ zero/crossed")
+        log.info("Spread | zero/crossed")
         return False
     return True
 
 
 def expiry_guard(mid: int) -> bool:
     if mid > 85 or mid < 15:
-        log.info("Expiry │ %dc near-certain", mid)
+        log.info("Expiry | %dc near-certain", mid)
         return False
     return True
 
 
 def cooldown_check() -> bool:
     elapsed = time.time() - last_trade_ts
-    if elapsed < COOLDOWN_SECS:
-        log.info("Cooldown │ %.0fs remaining", COOLDOWN_SECS - elapsed)
+    if elapsed < 60:
+        log.info("Cooldown | %.0fs remaining", 60 - elapsed)
         return False
     return True
 
@@ -1638,61 +1385,24 @@ def session_quality_check() -> bool:
     score = get_session_score()
     utc_h = datetime.now(timezone.utc).hour
     if score < MIN_SESSION_SCORE:
-        log.info("Session quality │ UTC%d score=%d < %d", utc_h, score, MIN_SESSION_SCORE)
+        log.info("Session quality | UTC%d score=%d < %d", utc_h, score, MIN_SESSION_SCORE)
         return False
     return True
 
 
 def streak_check() -> bool:
-    # v9.0.11: a consecutive-loss streak now HALTS the session (see
-    # resolve_open_orders → _trigger_halt) rather than a brief pause that reset
-    # the counter on expiry. The old 30-min pause was shorter than the ~15-min
-    # market settle cadence, so the streak never accumulated enough to block a
-    # trade — it let five straight losers through on 2026-06-18. The counter
-    # only clears on a win or a new-day auto-resume. This stays as a defensive
-    # gate for any path that bumped the counter without halting.
+    global consecutive_losses
     if consecutive_losses >= MAX_CONSEC_LOSSES:
-        log.info("Streak halt │ %d consec losses", consecutive_losses)
-        return False
+        if time.time() < streak_pause_until:
+            log.info("Streak pause | %d consec losses", consecutive_losses)
+            return False
+        consecutive_losses = 0
     return True
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # ORDER EXECUTION
-# ─────────────────────────────────────────────────────────────────────────────
-
-def build_order_body_v2(ticker: str, direction: str, count: int,
-                        limit_cents: int, client_id: str) -> dict:
-    """Build a Kalshi create-order-v2 request body.
-
-    The v2 endpoint (POST /portfolio/events/orders) is single-book and quotes
-    everything from the YES leg:
-        bid = buy  YES at `price`
-        ask = sell YES at `price`   ==  buy NO at (1 - price)
-
-    `limit_cents` is the price of the chosen *contract* — the YES price for a
-    YES trade, the NO price for a NO trade. A NO trade therefore becomes a YES
-    ask at the complementary price (100 - limit_cents) cents.
-    """
-    if direction.upper() == "YES":
-        side        = "bid"
-        price_cents = limit_cents
-    else:
-        side        = "ask"
-        price_cents = 100 - limit_cents
-    price_cents = max(1, min(99, price_cents))
-
-    return {
-        "ticker":                     ticker,
-        "client_order_id":            client_id,
-        "side":                       side,
-        "count":                      str(count),
-        "price":                      f"{price_cents / 100:.2f}",
-        "time_in_force":              ORDER_TIME_IN_FORCE,
-        "self_trade_prevention_type": SELF_TRADE_PREVENTION,
-        "post_only":                  ORDER_POST_ONLY,
-    }
-
+# -----------------------------------------------------------------------------
 
 def place_order(ticker: str, direction: str, bet_dollars: float,
                 limit_cents: int, win_prob: float, edge: float) -> Optional[str]:
@@ -1702,7 +1412,7 @@ def place_order(ticker: str, direction: str, bet_dollars: float,
         return None
     count = int((bet_dollars * 100) / limit_cents)
     if count < 1:
-        log.info("Order │ 0 contracts at $%.2f @ %dc", bet_dollars, limit_cents)
+        log.info("Order | 0 contracts at $%.2f @ %dc", bet_dollars, limit_cents)
         return None
     cost      = (limit_cents * count) / 100.0
     client_id = f"j5-{uuid.uuid4().hex[:10]}"
@@ -1722,7 +1432,7 @@ def place_order(ticker: str, direction: str, bet_dollars: float,
         }
         trade_history.append(rec)
         open_orders[client_id] = rec
-        log.info("🟡 PAPER │ %s %s │ %d @ %dc │ $%.2f │ bal=$%.2f",
+        log.info("PAPER | %s %s | %d @ %dc | $%.2f | bal=$%.2f",
                  direction, ticker[-15:], count, limit_cents, cost, paper_balance)
         tg.send_trade_entry_notification(
             ticker=ticker, direction=direction, cost=cost,
@@ -1731,14 +1441,23 @@ def place_order(ticker: str, direction: str, bet_dollars: float,
         )
         return client_id
 
-    body = build_order_body_v2(ticker, direction, count, limit_cents, client_id)
+    # Kalshi V2 single-book order model (POST /portfolio/events/orders).
+    is_yes     = direction.upper() == "YES"
+    yes_cents  = limit_cents if is_yes else (100 - limit_cents)
+    body: dict = {
+        "ticker":                     ticker,
+        "client_order_id":            client_id,
+        "side":                       "bid" if is_yes else "ask",
+        "count":                      str(count),
+        "price":                      f"{yes_cents / 100:.4f}",
+        "time_in_force":              "good_till_canceled",
+        "self_trade_prevention_type": "taker_at_cross",
+    }
 
     try:
-        resp     = _post(ORDER_PATH, body)
-        # v2 returns order_id at the top level; tolerate a legacy {"order": …}
-        # envelope too so we never lose the id on a schema tweak.
-        order    = resp.get("order", resp) if isinstance(resp, dict) else {}
-        order_id = order.get("order_id") or resp.get("order_id") or client_id
+        resp     = _post("/portfolio/events/orders", body)
+        order_id = (resp.get("order", {}).get("order_id")
+                    or resp.get("order_id") or client_id)
         last_trade_ts = time.time()
         rec = {
             "time": datetime.now(timezone.utc).isoformat(),
@@ -1751,7 +1470,7 @@ def place_order(ticker: str, direction: str, bet_dollars: float,
         open_orders[order_id] = rec
         active_tickers.add(ticker)
         session_traded_tickers.add(ticker)
-        log.info("✅ ORDER │ %s %s │ %d @ %dc │ $%.2f │ %s",
+        log.info("ORDER | %s %s | %d @ %dc | $%.2f | %s",
                  direction, ticker[-15:], count, limit_cents, bet_dollars, order_id[:12])
         live_bal = get_live_balance()
         tg.send_trade_entry_notification(
@@ -1763,62 +1482,56 @@ def place_order(ticker: str, direction: str, bet_dollars: float,
     except requests.HTTPError as e:
         status = e.response.status_code if e.response is not None else "???"
         body_t = e.response.text[:300] if e.response is not None else str(e)
-        log.error("Order failed │ HTTP %s │ %s", status, body_t)
+        log.error("Order failed | HTTP %s | %s", status, body_t)
         return None
     except Exception as e:
-        log.error("Order failed │ %s", e)
+        log.error("Order failed | %s", e)
         return None
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # TELEGRAM WRAPPERS
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def telegram_boot(balance: float) -> None:
-    mode = "📋 PAPER" if DEMO_MODE else "🔴 LIVE"
+    mode = "PAPER" if DEMO_MODE else "LIVE"
     tg.send_telegram_message(
-        f"🤖 Johnny5 {BOT_VERSION} STARTED\n"
-        f"{mode} │ State: {session_state.value}\n"
+        f"Johnny5 {BOT_VERSION} STARTED\n"
+        f"{mode} | State: {session_state.value}\n"
         f"Balance: ${balance:.2f}\n"
-        f"DailyLoss≤${MAX_DAILY_LOSS:.0f} | Floor=${MIN_BALANCE_FLOOR:.0f}\n"
-        f"MinConf={MIN_CONFIDENCE} | MinWinP={MIN_WIN_PROB*100:.0f}% | R²≥{R2_TREND_THRESHOLD}\n"
-        f"OBDepth≥${MIN_OB_DEPTH:.0f} | OBImb≥{OB_IMBALANCE_THRESH*100:.0f}%\n"
-        f"SessionScore≥{MIN_SESSION_SCORE} | Kelly={KELLY_FRACTION}\n"
-        f"PerfGuard sample: session-scoped (0/0 at boot)"
+        f"DailyLoss<=${MAX_DAILY_LOSS:.0f} | Floor=${MIN_BALANCE_FLOOR:.0f}\n"
+        f"MinConf={MIN_CONFIDENCE} | MinWinP={MIN_WIN_PROB*100:.0f}% | R2>={R2_TREND_THRESHOLD}\n"
+        f"OBDepth>=${MIN_OB_DEPTH:.0f} | OBImb>={OB_IMBALANCE_THRESH*100:.0f}%\n"
+        f"AGREE-gate={'ON' if REQUIRE_AGREE_MOMENTUM else 'OFF'} | "
+        f"Breakeven<={YES_BREAKEVEN_PRICE}c\n"
+        f"SessionScore>={MIN_SESSION_SCORE} | Kelly={KELLY_FRACTION}"
     )
 
 
-def telegram_halt(reason: str, balance: float, permanent: bool = False) -> None:
-    tag = "PERMANENT" if permanent else "auto-resume next UTC day"
+def telegram_halt(reason: str, balance: float) -> None:
     tg.send_telegram_message(
-        f"⛔ HALTED ({tag})\nReason: {reason}\nBalance: ${balance:.2f}"
-    )
-
-
-def telegram_resume(balance: float) -> None:
-    tg.send_telegram_message(
-        f"🟢 RESUMED — new trading day\nDaily counters reset\nBalance: ${balance:.2f}"
+        f"HALTED (PERMANENT)\nReason: {reason}\nBalance: ${balance:.2f}"
     )
 
 
 def telegram_daily_summary(balance: float, pnl: float, wins: int, losses: int) -> None:
     total  = wins + losses
     wr     = wins / total * 100 if total > 0 else 0.0
-    emoji  = "📈" if pnl >= 0 else "📉"
+    emoji  = "UP" if pnl >= 0 else "DOWN"
     ci_str = ""
     if total >= 10:
         wlb    = wilson_lower_bound(wins, total)
         ci_str = f" LB={wlb*100:.0f}%"
     tg.send_telegram_message(
         f"{emoji} Daily Summary\n"
-        f"P&L: ${pnl:+.2f} │ Balance: ${balance:.2f}\n"
+        f"P&L: ${pnl:+.2f} | Balance: ${balance:.2f}\n"
         f"WR: {wr:.0f}%{ci_str} ({wins}W/{losses}L)"
     )
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 # MAIN DECISION ENGINE
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def run_decision(market: dict, balance: float) -> None:
     global last_signal_desc
@@ -1837,10 +1550,10 @@ def run_decision(market: dict, balance: float) -> None:
     if not spread_check(yes_bid, yes_ask):
         return
     if ticker in active_tickers:
-        log.info("Position guard │ %s", ticker[-15:])
+        log.info("Position guard | %s", ticker[-15:])
         return
     if ticker in session_traded_tickers:
-        log.info("Session guard │ already traded %s", ticker[-15:])
+        log.info("Session guard | already traded %s", ticker[-15:])
         last_signal_desc = f"session re-entry ({ticker[-10:]})"
         return
     if not cooldown_check():
@@ -1851,18 +1564,18 @@ def run_decision(market: dict, balance: float) -> None:
         last_signal_desc = f"streak pause ({consecutive_losses}L)"
         return
     if not performance_guard():
-        last_signal_desc = "perf guard (session Wilson LB < 50%)"
+        last_signal_desc = "perf guard (Wilson LB < 50%)"
         return
     if not session_quality_check():
         last_signal_desc = f"session quality UTC{datetime.now(timezone.utc).hour}"
         return
     if len(open_orders) >= MAX_CONCURRENT_POS:
-        log.info("Concurrent │ %d open", len(open_orders))
+        log.info("Concurrent | %d open", len(open_orders))
         return
 
     mins = minutes_to_expiry(market)
     if mins < MIN_MINUTES_TO_EXPIRY:
-        log.info("Expiry imminent │ %.1f min", mins)
+        log.info("Expiry imminent | %.1f min", mins)
         last_signal_desc = "expiry imminent"
         return
 
@@ -1871,11 +1584,8 @@ def run_decision(market: dict, balance: float) -> None:
         return
 
     regime, r_squared, realized_vol = compute_regime()
-    blocked_regimes = {Regime.UNKNOWN, Regime.HIGH_VOL}
-    if not TRADE_RANGING:
-        blocked_regimes.add(Regime.RANGING)
-    if regime in blocked_regimes:
-        log.info("Regime │ %s — no trade", regime.value)
+    if regime in (Regime.UNKNOWN, Regime.RANGING, Regime.HIGH_VOL):
+        log.info("Regime | %s — no trade", regime.value)
         last_signal_desc = f"regime={regime.value}"
         return
 
@@ -1895,21 +1605,30 @@ def run_decision(market: dict, balance: float) -> None:
         last_signal_desc = "OB fading"
         return
 
+    # Direction gate: never bet the order book against the measured trend.
+    if not regime_agrees(regime, ob_dir):
+        log.info("Regime conflict | OB=%s vs %s — no trade", ob_dir, regime.value)
+        last_signal_desc = f"regime conflict OB={ob_dir} {regime.value}"
+        return
+
     momentum_verdict, momentum_adj = compute_momentum(ob_dir)
     if momentum_verdict == "CONFLICT":
-        log.info("Momentum CONFLICT │ OB=%s", ob_dir)
+        log.info("Momentum CONFLICT | OB=%s", ob_dir)
         last_signal_desc = f"CONFLICT OB={ob_dir}"
         return
 
-    if session_state == SessionState.RECOVERY and momentum_verdict != "AGREE":
-        log.info("Recovery │ AGREE required, got %s", momentum_verdict)
-        last_signal_desc = "recovery: AGREE required"
+    # DOCTRINE LAYER 7 (restored v9.3.0): BTC spot momentum must EXPLICITLY
+    # AGREE with the order-book direction. Applies in EVERY session state.
+    if not momentum_gate_ok(momentum_verdict):
+        log.info("Momentum | require AGREE, got %s (OB=%s) — no trade",
+                 momentum_verdict, ob_dir)
+        last_signal_desc = f"momentum {momentum_verdict} (need AGREE)"
         return
 
     win_prob = bayesian_win_prob(ob, momentum_verdict, momentum_adj,
                                   regime, r_squared, realized_vol)
     if win_prob < MIN_WIN_PROB:
-        log.info("WinProb │ %.3f < %.3f", win_prob, MIN_WIN_PROB)
+        log.info("WinProb | %.3f < %.3f", win_prob, MIN_WIN_PROB)
         last_signal_desc = f"win_prob {win_prob:.2f} < {MIN_WIN_PROB:.2f}"
         return
 
@@ -1917,37 +1636,37 @@ def run_decision(market: dict, balance: float) -> None:
     conf = compute_confidence(ob, regime, r_squared, momentum_verdict,
                                win_prob, mins, session_score)
     if conf < MIN_CONFIDENCE:
-        log.info("Confidence │ %.0f < %d", conf, MIN_CONFIDENCE)
+        log.info("Confidence | %.0f < %d", conf, MIN_CONFIDENCE)
         last_signal_desc = f"conf {conf:.0f} < {MIN_CONFIDENCE}"
         return
 
     if ob_dir == "YES":
         if yes_mid > YES_BREAKEVEN_PRICE:
-            log.info("Price guard │ YES %dc > breakeven", yes_mid)
+            log.info("Price guard | YES %dc > breakeven", yes_mid)
             return
         direction      = "YES"
         contract_price = yes_mid
     else:
         no_price = 100 - yes_mid
         if no_price > YES_BREAKEVEN_PRICE:
-            log.info("Price guard │ NO %dc > breakeven", no_price)
+            log.info("Price guard | NO %dc > breakeven", no_price)
             return
         direction      = "NO"
         contract_price = no_price
 
     if not (25 <= contract_price <= 75):
-        log.info("Bias filter │ %dc outside 25-75", contract_price)
+        log.info("Bias filter | %dc outside 25-75", contract_price)
         return
 
     edge = calc_edge(win_prob, contract_price)
     if edge < MIN_EDGE_PCT:
-        log.info("Edge │ %.3f < min %.3f", edge, MIN_EDGE_PCT)
+        log.info("Edge | %.3f < min %.3f", edge, MIN_EDGE_PCT)
         last_signal_desc = f"edge {edge:.3f} < {MIN_EDGE_PCT:.3f}"
         return
 
     bet = kelly_bet(win_prob, contract_price, balance)
     if bet < 0.25:
-        log.info("Kelly │ $%.2f too small", bet)
+        log.info("Kelly | $%.2f too small", bet)
         return
     if balance < bet:
         log.warning("Insufficient balance")
@@ -1961,17 +1680,17 @@ def run_decision(market: dict, balance: float) -> None:
     limit_price = max(1, min(99, limit_price))
 
     if abs(limit_price - contract_price) > 8:
-        log.info("Limit drift │ %dc too far", limit_price)
+        log.info("Limit drift | %dc too far", limit_price)
         return
 
-    sess_total = session_wins + session_losses
-    wlb_str = (f" sWLB={wilson_lower_bound(session_wins, sess_total)*100:.1f}%"
-               if sess_total >= 10 else " sWLB=n/a")
+    total   = live_wins + live_losses
+    wlb_str = (f" WLB={wilson_lower_bound(live_wins, total)*100:.1f}%"
+               if total >= 10 else " WLB=n/a")
 
     log.info(
-        "📋 EDGE JUSTIFICATION │ %s %s @ %dc │ regime=%s(R²=%.2f) │ "
-        "OB=%.1f%% $%.0f │ BTC=%s │ WinP=%.1f%% Edge=%.1f%% Conf=%.0f │ "
-        "Bet=$%.2f │ %.1fmin%s",
+        "EDGE JUSTIFICATION | %s %s @ %dc | regime=%s(R2=%.2f) | "
+        "OB=%.1f%% $%.0f | BTC=%s | WinP=%.1f%% Edge=%.1f%% Conf=%.0f | "
+        "Bet=$%.2f | %.1fmin%s",
         direction, ticker[-15:], contract_price,
         regime.value, r_squared,
         ob["imbalance"] * 100, ob["total_depth"],
@@ -1983,63 +1702,82 @@ def run_decision(market: dict, balance: float) -> None:
     place_order(ticker, direction, bet, limit_price, win_prob, edge)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
+# DAILY SESSION ROLLOVER
+# -----------------------------------------------------------------------------
+
+def maybe_roll_session_day(current_balance: float) -> bool:
+    """Reset the daily risk budget at the UTC day boundary. Returns True on roll."""
+    global _session_day, _session_halted, session_start_balance
+    global session_stop_threshold, daily_pnl, paper_daily_pnl, consecutive_losses
+    global session_state, streak_pause_until
+
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if today == _session_day:
+        return False
+
+    was_halted   = _session_halted
+    _session_day = today
+    _session_halted        = False
+    session_start_balance  = current_balance
+    session_stop_threshold = current_balance * SESSION_STOP_FRACTION
+    daily_pnl              = 0.0
+    paper_daily_pnl        = 0.0
+    consecutive_losses     = 0
+    streak_pause_until     = 0.0
+    session_state          = SessionState.ACTIVE
+    session_traded_tickers.clear()
+
+    log.info("New trading day %s | balance $%.2f | daily budget reset%s",
+             today, current_balance, " (halt cleared)" if was_halted else "")
+    return True
+
+
+# -----------------------------------------------------------------------------
 # MAIN LOOP
-# ─────────────────────────────────────────────────────────────────────────────
+# -----------------------------------------------------------------------------
 
 def main() -> None:
-    # ── CRITICAL GLOBAL DECLARATION RULE ─────────────────────────────────────
-    # The following module-level mutable containers must NEVER appear here:
-    #   open_orders, active_tickers, trade_history, session_traded_tickers,
-    #   _processed_settlement_ids, btc_prices, btc_returns, _prev_ob
-    #
-    # These are mutated IN-PLACE (dict/set/deque methods). Declaring them in
-    # a global statement causes Python to mark every reference inside main()
-    # as a local variable. The set comprehension that reads active_tickers
-    # then raises UnboundLocalError before any local assignment has occurred.
-    # ─────────────────────────────────────────────────────────────────────────
     global session_start_balance, session_stop_threshold, daily_pnl
     global paper_balance, paper_daily_pnl, last_trade_ts, last_daily_summary_ts
     global consecutive_losses, last_signal_desc, last_heartbeat_ts, running_pnl
-    global live_wins, live_losses, session_wins, session_losses, streak_pause_until
+    global live_wins, live_losses, streak_pause_until
     global _last_known_balance, _shutdown_requested, _session_start_ts
     global _session_halted, session_state, recovery_trades
-    global recovery_entry_wins, recovery_entry_losses
+    global recovery_entry_wins, recovery_entry_losses, _session_day
 
     init_base_url()
 
     paper_balance         = float(os.environ.get("PAPER_BALANCE", "25.0"))
     _session_start_ts     = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    _session_day          = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     _session_halted       = False
     session_state         = SessionState.ACTIVE
     recovery_trades       = 0
     recovery_entry_wins   = 0
     recovery_entry_losses = 0
 
-    # In-place resets — no global declaration needed
     session_traded_tickers.clear()
     _processed_settlement_ids.clear()
 
-    log.info("━" * 70)
-    log.info("  JOHNNY5 %s │ %s", BOT_VERSION, "PAPER 🟡" if DEMO_MODE else "LIVE 🔴")
+    log.info("=" * 70)
+    log.info("  JOHNNY5 %s | %s", BOT_VERSION, "PAPER" if DEMO_MODE else "LIVE")
     log.info("  Start: %s", _session_start_ts)
-    log.info("  Regime R²≥%.2f | VolCap=%.3f%% | Circuit=%.2f%%",
+    log.info("  Regime R2>=%.2f | VolCap=%.3f%% | Circuit=%.2f%%",
              R2_TREND_THRESHOLD, VOLATILITY_CAP_PCT, VOL_CIRCUIT_BREAKER)
-    log.info("  OB depth≥$%.0f imb≥%.0f%% | WinP≥%.0f%% Edge≥%.0f%%",
+    log.info("  OB depth>=$%.0f imb>=%.0f%% | WinP>=%.0f%% Edge>=%.0f%%",
              MIN_OB_DEPTH, OB_IMBALANCE_THRESH * 100, MIN_WIN_PROB * 100, MIN_EDGE_PCT * 100)
-    log.info("  Kelly=%.2f cap=%.0f%% | SessionScore≥%d | PerfGuard=session-scoped",
+    log.info("  AGREE-gate=%s | MinConf=%d | Breakeven<=%dc | NEUTRALdrag=%.3f",
+             "ON" if REQUIRE_AGREE_MOMENTUM else "OFF",
+             MIN_CONFIDENCE, YES_BREAKEVEN_PRICE, NEUTRAL_ACCURACY_DRAG)
+    log.info("  Kelly=%.2f cap=%.0f%% | SessionScore>=%d",
              KELLY_FRACTION, MAX_BET_FRACTION * 100, MIN_SESSION_SCORE)
-    log.info("  DailyLoss≤$%.0f/%.0f%% | MaxConsecLoss=%d | AutoRestart=%s",
-             MAX_DAILY_LOSS, MAX_DAILY_LOSS_FRACTION * 100, MAX_CONSEC_LOSSES,
-             "on" if AUTO_RESTART else "off")
-    log.info("━" * 70)
+    log.info("=" * 70)
 
     tg.validate_telegram_connection()
 
     live_wins          = 0
     live_losses        = 0
-    session_wins       = 0      # v9.0.10: perf-guard sample resets each boot
-    session_losses     = 0
     streak_pause_until = 0.0
 
     if DEMO_MODE:
@@ -2052,11 +1790,11 @@ def main() -> None:
             bal = get_live_balance(allow_cached_zero=False)
         except Exception as e:
             log.error("Cannot fetch starting balance — aborting: %s", e)
-            tg.send_telegram_message(f"🛑 Johnny5 {BOT_VERSION} boot failed: balance error")
+            tg.send_telegram_message(f"Johnny5 {BOT_VERSION} boot failed: balance error")
             return
         if bal <= 0.0:
             log.error("Starting balance $0 — aborting")
-            tg.send_telegram_message(f"🛑 Johnny5 {BOT_VERSION} boot failed: balance=$0")
+            tg.send_telegram_message(f"Johnny5 {BOT_VERSION} boot failed: balance=$0")
             return
         _last_known_balance    = bal
         session_start_balance  = bal
@@ -2072,19 +1810,10 @@ def main() -> None:
     while not _shutdown_requested:
         try:
             if _session_halted:
-                if halt_can_resume():
-                    resume_bal = paper_balance if DEMO_MODE else get_live_balance()
-                    resume_from_halt(resume_bal)
-                    # fall through into the normal cycle on the new day
-                elif _halt_permanent:
-                    log.info("Permanently halted (%s) — sleeping %dm.",
-                             _halt_reason or "?", HALT_RECHECK_SECS // 60)
-                    time.sleep(HALT_RECHECK_SECS)
-                    continue
-                else:
-                    log.info("Halted (%s) — auto-resume next UTC day. Recheck in %dm.",
-                             _halt_reason or "?", HALT_RECHECK_SECS // 60)
-                    time.sleep(HALT_RECHECK_SECS)
+                halt_bal = paper_balance if DEMO_MODE else get_live_balance()
+                if not maybe_roll_session_day(halt_bal):
+                    log.info("Halted for the day — paused until UTC rollover.")
+                    time.sleep(300)
                     continue
 
             if time.time() - last_heartbeat_ts >= 900:
@@ -2117,6 +1846,7 @@ def main() -> None:
                 log.info("Expired locks: %s", expired)
 
             current_balance = paper_balance if DEMO_MODE else get_live_balance()
+            maybe_roll_session_day(current_balance)
             update_session_state(current_balance)
             run_decision(market, current_balance)
 
@@ -2131,21 +1861,19 @@ def main() -> None:
                     wins  = sum(1 for t in resolved if t["result"] == "win")
                     total = len(resolved)
                     wr    = wins / total if total > 0 else 0.0
-                    log.info("📋 PAPER │ $%.2f │ PnL=$%+.2f │ WR=%.1f%% │ Prior=%.3f │ %s",
+                    log.info("PAPER | $%.2f | PnL=$%+.2f | WR=%.1f%% | Prior=%.3f | %s",
                              paper_balance, paper_daily_pnl, wr * 100,
                              _live_prior, session_state.value)
                 else:
                     live_bal  = get_live_balance()
                     daily_pnl = live_bal - session_start_balance
                     wlb       = wilson_lower_bound(live_wins, live_wins + live_losses)
-                    sess_total   = session_wins + session_losses
                     trades_since = (live_wins + live_losses) - (recovery_entry_wins + recovery_entry_losses)
                     log.info(
-                        "Portfolio │ $%.2f │ PnL=$%+.2f │ WR=%d/%d LB=%.1f%% │ "
-                        "sess=%d/%d │ Prior=%.3f │ %s%s",
+                        "Portfolio | $%.2f | PnL=$%+.2f | WR=%d/%d LB=%.1f%% | Prior=%.3f | %s"
+                        "%s",
                         live_bal, daily_pnl, live_wins, live_wins + live_losses,
-                        wlb * 100, session_wins, sess_total,
-                        _live_prior, session_state.value,
+                        wlb * 100, _live_prior, session_state.value,
                         f" (rec+{trades_since})" if session_state == SessionState.RECOVERY else "",
                     )
                     if (datetime.now(timezone.utc).hour == 0
@@ -2163,7 +1891,7 @@ def main() -> None:
 
     final = paper_balance if DEMO_MODE else get_live_balance()
     log.info("Shutdown. Final balance: $%.2f", final)
-    tg.send_telegram_message(f"🛑 Johnny5 {BOT_VERSION} stopped. Final: ${final:.2f}")
+    tg.send_telegram_message(f"Johnny5 {BOT_VERSION} stopped. Final: ${final:.2f}")
 
 
 if __name__ == "__main__":
