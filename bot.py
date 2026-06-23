@@ -1,6 +1,34 @@
 """
-JOHNNY5-KALSHI-AUTO  v9.3.0  —  Production Build
+JOHNNY5-KALSHI-AUTO  v9.3.1  —  Production Build
 "No disassemble."
+
+v9.3.1 — HALT LOGIC: never halt/pause after a single loss
+  Reported behaviour: the bot stops trading after ONE losing trade.
+
+  Two code-level paths could produce that, both fixed here without loosening
+  the real daily/session stops:
+
+  1. STREAK PAUSE armed by a single loss.
+     streak_check() / the loss-settlement handlers arm a 30-min pause when
+     consecutive_losses >= MAX_CONSEC_LOSSES. A "consecutive-loss" pause is by
+     definition >= 2 losses; if MAX_CONSEC_LOSSES is set to 1 in the Railway
+     env, every isolated loss arms the pause and the bot looks halted.
+     FIX: MAX_CONSEC_LOSSES is now floored at 2 in code, so one loss can never
+     arm the streak pause regardless of the env value.
+
+  2. DAILY-LOSS CAP tighter than one full-stake trade.
+     daily_loss_check() used loss_cap = min(MAX_DAILY_LOSS, 6%*start_balance).
+     On a small account the 6% clause can fall to/below a single position's
+     cost (e.g. $1.50 on a $25 start), so a loss could trip the PERMANENT daily
+     halt. A daily stop tighter than one trade is incoherent.
+     FIX: loss_cap is floored just above the largest single stake we can place
+     (TRADE_SIZE_DOLLARS capped by MAX_BET_FRACTION*start_balance), so a single
+     loss can never breach the daily cap. The fixed MAX_DAILY_LOSS dollar value
+     still governs as the binding cap; nothing is loosened above it.
+
+  No other logic, thresholds, sizing, or endpoints changed. Audit categories
+  1-6 (kwargs, globals, paper arithmetic, balance-fetch, heartbeat PnL,
+  resolution endpoint) were re-verified clean against v9.3.0.
 
 v9.3.0 — DOCTRINE RESTORE: stop the NEUTRAL-momentum bleed
 
@@ -46,7 +74,7 @@ v9.0.7 — SETTLEMENT SCHEMA CORRECTED:
 
 from __future__ import annotations
 
-BOT_VERSION = "9.3.0"
+BOT_VERSION = "9.3.1"
 
 import base64
 import logging
@@ -147,7 +175,9 @@ MIN_BALANCE_FLOOR     = _env_float("MIN_BALANCE_FLOOR", 5.0)
 MAX_DAILY_LOSS        = _env_float("MAX_DAILY_LOSS_DOLLARS", 15.0)
 MAX_DAILY_LOSS_PCT    = _env_float("MAX_DAILY_LOSS_PCT", 0.06)
 SESSION_STOP_FRACTION = _env_float("SESSION_STOP_FRACTION", 0.40)
-MAX_CONSEC_LOSSES     = _env_int("MAX_CONSEC_LOSSES", 2)
+# v9.3.1: floored at 2. A "consecutive-loss" pause is meaningless below 2; a
+# value of 1 would arm the 30-min streak pause after a single isolated loss.
+MAX_CONSEC_LOSSES     = max(2, _env_int("MAX_CONSEC_LOSSES", 2))
 STREAK_PAUSE_SECS     = _env_int("STREAK_PAUSE_SECS", 1800)
 STALE_ORDER_TIMEOUT   = _env_int("STALE_ORDER_TIMEOUT", 300)
 MAX_CONCURRENT_POS    = _env_int("MAX_CONCURRENT_POS", 1)
@@ -1346,6 +1376,14 @@ def daily_loss_check(balance: float) -> bool:
     pnl = paper_daily_pnl if DEMO_MODE else daily_pnl
     pct_cap = MAX_DAILY_LOSS_PCT * session_start_balance if session_start_balance > 0 else 0.0
     loss_cap = min(MAX_DAILY_LOSS, pct_cap) if pct_cap > 0 else MAX_DAILY_LOSS
+    # v9.3.1: a daily cap tighter than a single full-stake trade halts the day
+    # after ONE loss, which is incoherent. Floor it just above the largest stake
+    # we can actually place this session (the same ceiling kelly_bet uses).
+    # The fixed MAX_DAILY_LOSS still binds above this floor — nothing is loosened
+    # beyond the documented dollar cap.
+    max_single_stake = (min(TRADE_SIZE_CAP, session_start_balance * MAX_BET_FRACTION)
+                        if session_start_balance > 0 else TRADE_SIZE_CAP)
+    loss_cap = min(MAX_DAILY_LOSS, max(loss_cap, max_single_stake * 1.5))
     if pnl <= -loss_cap:
         _session_halted = True
         log.warning("DAILY LOSS | $%.2f >= cap $%.2f — halted.", abs(pnl), loss_cap)
