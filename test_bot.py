@@ -619,6 +619,91 @@ class TestNormalizePem:
             bot._normalize_pem("not a pem at all")
 
 
+class TestAlwaysYesMode:
+    """ALWAYS-YES $1 strategy: forced YES, fixed $1.00, all signals bypassed."""
+
+    def setup_method(self):
+        bot.open_orders.clear()
+        bot.active_tickers.clear()
+        bot.session_traded_tickers.clear()
+        bot.trade_history.clear()
+        bot.paper_balance = 25.0
+        bot.paper_daily_pnl = 0.0
+        bot.session_start_balance = 25.0
+        bot.session_stop_threshold = 0.0
+        bot._session_halted = False
+        bot.last_trade_ts = -9999.0
+        bot.consecutive_losses = 0
+
+    def _market(self, ticker="KXBTC15M-TEST", bid=45, ask=55):
+        from datetime import datetime, timezone, timedelta
+        close = (datetime.now(timezone.utc) + timedelta(minutes=14)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        return {"ticker": ticker, "yes_bid": bid, "yes_ask": ask,
+                "yes_mid": (bid + ask) // 2, "close_time": close}
+
+    def test_constant_is_one_dollar(self):
+        assert bot.ALWAYS_YES_TRADE_DOLLARS == 1.00
+
+    def test_places_yes_for_one_dollar(self, monkeypatch):
+        monkeypatch.setattr(bot, "ALWAYS_YES_MODE", True)
+        monkeypatch.setattr(bot, "DEMO_MODE", True)
+        monkeypatch.setattr(bot, "MAX_CONCURRENT_POS", 1)
+        bot.run_decision(self._market(), 25.0)
+        assert len(bot.open_orders) == 1
+        rec = next(iter(bot.open_orders.values()))
+        assert rec["side"] == "YES"
+        assert rec["cost"] <= 1.00 + 1e-9
+
+    def test_cost_never_exceeds_one_dollar_any_price(self, monkeypatch):
+        monkeypatch.setattr(bot, "ALWAYS_YES_MODE", True)
+        monkeypatch.setattr(bot, "DEMO_MODE", True)
+        monkeypatch.setattr(bot, "MAX_CONCURRENT_POS", 1)
+        for bid, ask in [(2, 4), (20, 30), (48, 52), (70, 80), (95, 98)]:
+            self.setup_method()
+            bot.run_decision(self._market(ticker=f"KXBTC15M-{bid}", bid=bid, ask=ask), 25.0)
+            for rec in bot.open_orders.values():
+                assert rec["cost"] <= 1.00 + 1e-9, f"cost {rec['cost']} at {bid}/{ask}"
+
+    def test_ignores_trade_size_cap(self, monkeypatch):
+        # Even with a large configured TRADE_SIZE / Kelly, the mode caps at $1.
+        monkeypatch.setattr(bot, "ALWAYS_YES_MODE", True)
+        monkeypatch.setattr(bot, "DEMO_MODE", True)
+        monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 500.0)
+        monkeypatch.setattr(bot, "KELLY_FRACTION", 1.0)
+        monkeypatch.setattr(bot, "MAX_BET_FRACTION", 1.0)
+        monkeypatch.setattr(bot, "MAX_CONCURRENT_POS", 1)
+        bot.run_decision(self._market(), 25.0)
+        rec = next(iter(bot.open_orders.values()))
+        assert rec["cost"] <= 1.00 + 1e-9
+
+    def test_duplicate_ticker_blocked(self, monkeypatch):
+        monkeypatch.setattr(bot, "ALWAYS_YES_MODE", True)
+        monkeypatch.setattr(bot, "DEMO_MODE", True)
+        monkeypatch.setattr(bot, "MAX_CONCURRENT_POS", 5)
+        bot.session_traded_tickers.add("KXBTC15M-TEST")
+        bot.run_decision(self._market(ticker="KXBTC15M-TEST"), 25.0)
+        assert len(bot.open_orders) == 0
+
+    def test_balance_floor_blocks(self, monkeypatch):
+        monkeypatch.setattr(bot, "ALWAYS_YES_MODE", True)
+        monkeypatch.setattr(bot, "DEMO_MODE", True)
+        monkeypatch.setattr(bot, "MIN_BALANCE_FLOOR", 5.0)
+        bot.run_decision(self._market(), 2.0)
+        assert len(bot.open_orders) == 0
+
+    def test_disabled_falls_through_to_normal(self, monkeypatch):
+        # With the flag off, run_always_yes must NOT fire; normal path runs and
+        # (with no BTC price history / regime) places nothing.
+        monkeypatch.setattr(bot, "ALWAYS_YES_MODE", False)
+        monkeypatch.setattr(bot, "DEMO_MODE", True)
+        called = {"v": False}
+        monkeypatch.setattr(bot, "run_always_yes",
+                            lambda *a, **k: called.__setitem__("v", True))
+        bot.run_decision(self._market(), 25.0)
+        assert called["v"] is False
+
+
 class TestPaperModeAccounting:
     def test_win_net_is_positive_profit(self):
         count = 4; cost = 50 * count / 100.0
