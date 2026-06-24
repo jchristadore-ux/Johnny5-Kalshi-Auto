@@ -136,7 +136,8 @@ Upload all files to a new GitHub repo. Commit to `main`.
 | `KALSHI_PRIVATE_KEY_PEM` | required | Full PEM. Replace newlines with `\n` if needed |
 | `DEMO_MODE` | `true` | Set `false` for live trading |
 | `TRADER_MODE` | `quant` | Only `quant` is recommended for live |
-| `TRADE_SIZE_DOLLARS` | `5` | Max dollars per trade |
+| `ALWAYS_YES_MODE` | `false` | Opt-in override. When `true`, bypasses **all** models, indicators, confidence, edge and direction logic and buys **YES** for a fixed **$1.00** on every eligible 15-min market. Ignores `TRADE_SIZE_DOLLARS`, Kelly and the ladder. Set back to `false` to fully restore normal trading. The $1.00 size is hard-coded and cannot be raised via env |
+| `TRADE_SIZE_DOLLARS` | `5` | Max dollars per trade (ignored when `ALWAYS_YES_MODE=true`) |
 | `MAX_DAILY_LOSS_DOLLARS` | `15` | Dollar stop loss per day |
 | `MAX_DAILY_LOSS_FRACTION` | `0.15` | Daily loss cap as a fraction of session-start balance; effective cap is the tighter of this and the dollar cap (0 disables) |
 | `AUTO_RESTART` | `true` | Auto-resume daily halts at the next UTC day rollover |

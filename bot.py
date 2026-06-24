@@ -170,6 +170,20 @@ KELLY_RECOVERY_MULT = _env_float("KELLY_RECOVERY_MULT", 0.50)
 
 LADDER_ENABLED = _env_bool("LADDER_ENABLED", False)
 
+# -- ALWAYS-YES $1 STRATEGY ---------------------------------------------------
+# Optional override mode. When ALWAYS_YES_MODE=true, the bot ignores EVERY
+# prediction model, indicator, confidence score, edge calculation, and
+# direction-selection step. It buys YES on every eligible 15-minute market for
+# a FIXED $1.00 of capital — no Kelly, no bankroll scaling, no ladder, no
+# TRADE_SIZE influence. Capital-safety guards (market validation, duplicate /
+# position tracking, balance floor, daily-loss cap, concurrency cap, settlement
+# tracking) are preserved. Toggle entirely via the env var — no code edits.
+#
+# ALWAYS_YES_TRADE_DOLLARS is an intentionally HARD-CODED constant, not an env
+# read, so the per-trade ceiling in this mode can never be widened from Railway.
+ALWAYS_YES_MODE          = _env_bool("ALWAYS_YES_MODE", False)
+ALWAYS_YES_TRADE_DOLLARS = 1.00
+
 # -- Risk controls ------------------------------------------------------------
 MIN_BALANCE_FLOOR     = _env_float("MIN_BALANCE_FLOOR", 5.0)
 MAX_DAILY_LOSS        = _env_float("MAX_DAILY_LOSS_DOLLARS", 15.0)
@@ -1533,6 +1547,17 @@ def place_order(ticker: str, direction: str, bet_dollars: float,
 
 def telegram_boot(balance: float) -> None:
     mode = "PAPER" if DEMO_MODE else "LIVE"
+    if ALWAYS_YES_MODE:
+        tg.send_telegram_message(
+            f"Johnny5 {BOT_VERSION} STARTED\n"
+            f"{mode} | State: {session_state.value}\n"
+            f"** ALWAYS-YES $1 STRATEGY ACTIVE **\n"
+            f"All models/indicators/confidence BYPASSED.\n"
+            f"Buys YES @ fixed ${ALWAYS_YES_TRADE_DOLLARS:.2f} per market.\n"
+            f"Balance: ${balance:.2f}\n"
+            f"DailyLoss<=${MAX_DAILY_LOSS:.0f} | Floor=${MIN_BALANCE_FLOOR:.0f}"
+        )
+        return
     tg.send_telegram_message(
         f"Johnny5 {BOT_VERSION} STARTED\n"
         f"{mode} | State: {session_state.value}\n"
@@ -1568,11 +1593,88 @@ def telegram_daily_summary(balance: float, pnl: float, wins: int, losses: int) -
 
 
 # -----------------------------------------------------------------------------
+# ALWAYS-YES $1 STRATEGY
+#
+# A complete, self-contained execution path used ONLY when ALWAYS_YES_MODE is
+# true. It deliberately bypasses the entire signal stack — regime, order book,
+# momentum, Bayesian win-prob, confidence, edge, direction selection, Kelly /
+# bankroll sizing and the laddering overlay — and buys YES for a fixed $1.00.
+#
+# It still runs the capital-safety / bookkeeping guards that have nothing to do
+# with prediction quality: market validation, duplicate & position tracking,
+# cooldown, balance floor, daily-loss / session-stop cap and the concurrency
+# cap. Settlement / result tracking is unchanged because every order flows
+# through the same place_order() -> open_orders -> resolve_open_orders() path.
+# -----------------------------------------------------------------------------
+
+def run_always_yes(market: dict, balance: float) -> None:
+    global last_signal_desc
+
+    ticker  = market["ticker"]
+    yes_bid = market.get("yes_bid", 0)
+    yes_ask = market.get("yes_ask", 0)
+
+    # -- Market validation (preserved) ----------------------------------------
+    if yes_bid <= 0 or yes_ask <= 0 or yes_bid >= yes_ask:
+        return
+    if not spread_check(yes_bid, yes_ask):
+        return
+
+    # -- Capital-safety guards (preserved) ------------------------------------
+    if not balance_floor_check(balance):
+        return
+    if not daily_loss_check(balance):
+        return
+
+    # -- Duplicate / position tracking (preserved) ----------------------------
+    if ticker in active_tickers:
+        log.info("ALWAYS-YES | position guard | %s", ticker[-15:])
+        return
+    if ticker in session_traded_tickers:
+        log.info("ALWAYS-YES | session guard | already traded %s", ticker[-15:])
+        last_signal_desc = f"ALWAYS-YES re-entry ({ticker[-10:]})"
+        return
+    if not cooldown_check():
+        return
+    if len(open_orders) >= MAX_CONCURRENT_POS:
+        log.info("ALWAYS-YES | concurrent | %d open", len(open_orders))
+        return
+
+    mins = minutes_to_expiry(market)
+    if mins < MIN_MINUTES_TO_EXPIRY:
+        log.info("ALWAYS-YES | expiry imminent | %.1f min", mins)
+        last_signal_desc = "ALWAYS-YES expiry imminent"
+        return
+
+    # -- Forced YES, fixed $1.00 ----------------------------------------------
+    # bet is hard-capped at the $1.00 constant and at the live balance. Inside
+    # place_order the contract count is floored (int), so the realized cost is
+    # ALWAYS <= bet — it can never round up past $1.00.
+    bet         = min(ALWAYS_YES_TRADE_DOLLARS, balance)
+    limit_price = max(1, min(99, max(1, min(yes_bid + 1, yes_ask - 1))))
+
+    log.warning(
+        "ALWAYS-YES MODE ACTIVE | forcing YES $%.2f on %s @ %dc | "
+        "ALL prediction/confidence/edge/sizing logic BYPASSED | %.1fmin",
+        bet, ticker[-15:], limit_price, mins,
+    )
+    last_signal_desc = f"ALWAYS-YES $1.00 YES ({ticker[-10:]})"
+    place_order(ticker, "YES", bet, limit_price, win_prob=0.0, edge=0.0)
+
+
+# -----------------------------------------------------------------------------
 # MAIN DECISION ENGINE
 # -----------------------------------------------------------------------------
 
 def run_decision(market: dict, balance: float) -> None:
     global last_signal_desc
+
+    # ALWAYS-YES $1 strategy short-circuits the entire signal stack below. When
+    # the env flag is off (default) execution falls through to the normal,
+    # unchanged strategy — flipping the variable fully restores standard trading.
+    if ALWAYS_YES_MODE:
+        run_always_yes(market, balance)
+        return
 
     ticker  = market["ticker"]
     yes_bid = market.get("yes_bid", 0)
@@ -1801,15 +1903,25 @@ def main() -> None:
     log.info("=" * 70)
     log.info("  JOHNNY5 %s | %s", BOT_VERSION, "PAPER" if DEMO_MODE else "LIVE")
     log.info("  Start: %s", _session_start_ts)
-    log.info("  Regime R2>=%.2f | VolCap=%.3f%% | Circuit=%.2f%%",
-             R2_TREND_THRESHOLD, VOLATILITY_CAP_PCT, VOL_CIRCUIT_BREAKER)
-    log.info("  OB depth>=$%.0f imb>=%.0f%% | WinP>=%.0f%% Edge>=%.0f%%",
-             MIN_OB_DEPTH, OB_IMBALANCE_THRESH * 100, MIN_WIN_PROB * 100, MIN_EDGE_PCT * 100)
-    log.info("  AGREE-gate=%s | MinConf=%d | Breakeven<=%dc | NEUTRALdrag=%.3f",
-             "ON" if REQUIRE_AGREE_MOMENTUM else "OFF",
-             MIN_CONFIDENCE, YES_BREAKEVEN_PRICE, NEUTRAL_ACCURACY_DRAG)
-    log.info("  Kelly=%.2f cap=%.0f%% | SessionScore>=%d",
-             KELLY_FRACTION, MAX_BET_FRACTION * 100, MIN_SESSION_SCORE)
+    if ALWAYS_YES_MODE:
+        log.warning("  *** ALWAYS-YES $1 STRATEGY ACTIVE ***")
+        log.warning("  All prediction models, indicators, confidence scores,")
+        log.warning("  edge calcs and direction selection are BYPASSED.")
+        log.warning("  Action: buy YES @ fixed $%.2f on every eligible market.",
+                    ALWAYS_YES_TRADE_DOLLARS)
+        log.warning("  Safety preserved: validation, dup/position guard, balance")
+        log.warning("  floor=$%.0f, daily-loss cap=$%.0f, concurrency=%d.",
+                    MIN_BALANCE_FLOOR, MAX_DAILY_LOSS, MAX_CONCURRENT_POS)
+    else:
+        log.info("  Regime R2>=%.2f | VolCap=%.3f%% | Circuit=%.2f%%",
+                 R2_TREND_THRESHOLD, VOLATILITY_CAP_PCT, VOL_CIRCUIT_BREAKER)
+        log.info("  OB depth>=$%.0f imb>=%.0f%% | WinP>=%.0f%% Edge>=%.0f%%",
+                 MIN_OB_DEPTH, OB_IMBALANCE_THRESH * 100, MIN_WIN_PROB * 100, MIN_EDGE_PCT * 100)
+        log.info("  AGREE-gate=%s | MinConf=%d | Breakeven<=%dc | NEUTRALdrag=%.3f",
+                 "ON" if REQUIRE_AGREE_MOMENTUM else "OFF",
+                 MIN_CONFIDENCE, YES_BREAKEVEN_PRICE, NEUTRAL_ACCURACY_DRAG)
+        log.info("  Kelly=%.2f cap=%.0f%% | SessionScore>=%d",
+                 KELLY_FRACTION, MAX_BET_FRACTION * 100, MIN_SESSION_SCORE)
     log.info("=" * 70)
 
     tg.validate_telegram_connection()
