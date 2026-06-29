@@ -1,7 +1,29 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  JOHNNY5-KALSHI-AUTO  v9.5.0  —  Production Build                            ║
+║  JOHNNY5-KALSHI-AUTO  v9.6.0  —  Production Build                            ║
 ║  "No disassemble."                                                           ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  v9.6.0 — DAILY DOUBLING GOAL (opt-in, owner directive).                     ║
+║                                                                              ║
+║  When DAILY_GOAL_ENABLED, the bot targets doubling the balance it opened the ║
+║  UTC day with, then HALTS NEW ENTRIES for the rest of that day once the 2×   ║
+║  target is reached (open trades still settle). At the next UTC rollover the  ║
+║  new, higher balance becomes the baseline and the target resets, so the goal ║
+║  compounds day over day with no intervention.                               ║
+║                                                                              ║
+║  Sizing is GOAL-GAP driven: each trade = remaining gap to today's target ÷   ║
+║  DAILY_GOAL_TRADES_TO_TARGET, clamped to [DAILY_GOAL_MIN_STAKE, a %-of-      ║
+║  balance cap (DAILY_GOAL_MAX_STAKE_FRACTION), an optional hard dollar cap,   ║
+║  cash on hand]. The %-cap scales hands-off as the account compounds — no     ║
+║  fixed dollar ceiling to babysit. Defaults are the "Balanced" profile        ║
+║  (×2/day, gap÷5 trades, 40% cap). The Kelly edge gate and ALL entry-quality  ║
+║  gates are UNCHANGED — goal mode sets the STAKE and a daily target/halt; it  ║
+║  never relaxes which trades qualify.                                        ║
+║                                                                              ║
+║  RAILWAY: DAILY_GOAL_ENABLED=true to switch on. Optional overrides:          ║
+║  DAILY_GOAL_MULTIPLE (2.0), DAILY_GOAL_TRADES_TO_TARGET (5),                 ║
+║  DAILY_GOAL_MAX_STAKE_FRACTION (0.40), DAILY_GOAL_MIN_STAKE (1.0),           ║
+║  DAILY_GOAL_MAX_STAKE (0 = no hard cap). Leave DEMO_MODE=true to paper-test. ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  v9.5.0 — RECOVERY MODE: two-tier position sizing (owner directive).         ║
 ║                                                                              ║
@@ -238,7 +260,7 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "9.5.0"
+BOT_VERSION = "9.6.0"
 
 import base64
 import json
@@ -368,6 +390,47 @@ LADDER_ENABLED = _env_bool("LADDER_ENABLED", False)
 # stay active throughout. Set 0 to disable the pause. No effect unless the ladder
 # is enabled.
 RECOVERY_LADDER_PAUSE_TRADES = _env_int("RECOVERY_LADDER_PAUSE_TRADES", 5)
+
+# ── Daily doubling goal (opt-in — v9.6.0) ─────────────────────────────────────
+# When DAILY_GOAL_ENABLED, the bot targets DOUBLING the balance it started the
+# UTC day with, then HALTS new entries for the rest of that day (settlement of
+# any open trade still proceeds). At the next UTC rollover the new (higher)
+# balance becomes the baseline and the 2× target resets — so the goal compounds
+# day over day with no intervention.
+#
+# Sizing is GOAL-GAP driven (see daily_goal_stake): each trade is the remaining
+# gap to today's target spread over DAILY_GOAL_TRADES_TO_TARGET expected winning
+# trades, clamped to [DAILY_GOAL_MIN_STAKE, fraction-of-balance cap, optional
+# hard dollar cap, cash on hand]. This auto-scales as the account compounds and
+# shrinks as the gap closes through the day — no fixed dollar cap to babysit.
+#
+# Defaults are the "Balanced" risk profile (owner directive): ~5 winning trades
+# to the target, each trade capped at 40% of the live balance. The Kelly edge
+# gate and ALL entry-quality gates remain UNCHANGED — goal mode changes the
+# STAKE and adds a daily target/halt; it never relaxes which trades qualify.
+#
+# Disabled by default so live behaviour is unchanged until DAILY_GOAL_ENABLED is
+# set true on Railway. When goal mode is on it OWNS sizing (it overrides the
+# flat NORMAL/RECOVERY stake and the ladder overlay for that trade).
+DAILY_GOAL_ENABLED            = _env_bool("DAILY_GOAL_ENABLED", False)
+DAILY_GOAL_MULTIPLE           = _env_float("DAILY_GOAL_MULTIPLE", 2.0)
+DAILY_GOAL_TRADES_TO_TARGET   = _env_int("DAILY_GOAL_TRADES_TO_TARGET", 5)
+DAILY_GOAL_MIN_STAKE          = _env_float("DAILY_GOAL_MIN_STAKE", 1.0)
+# Operating per-trade ceiling = this fraction of the LIVE balance (scales hands-
+# off as the account doubles). 0 disables the fraction cap (then only the hard
+# dollar cap / cash on hand bind).
+DAILY_GOAL_MAX_STAKE_FRACTION = _env_float("DAILY_GOAL_MAX_STAKE_FRACTION", 0.40)
+# Optional ABSOLUTE hard dollar ceiling on a single goal-mode trade. 0 = no hard
+# cap (recommended — let the % cap scale). Set >0 only if you want a fixed safety
+# ceiling, but note it must be raised as the balance compounds or it will throttle.
+DAILY_GOAL_MAX_STAKE          = _env_float("DAILY_GOAL_MAX_STAKE", 0.0)
+# Persist today's goal baseline/target so an in-container restart RESUMES the
+# same day's target instead of re-baselining to the restart-time balance (which
+# would move the goalpost). Same Railway caveat as recovery: mount a Volume and
+# point DAILY_GOAL_STATE_PATH at it for the state to survive a redeploy; without
+# one, a redeploy re-baselines to the current balance (a safe default).
+DAILY_GOAL_STATE_PATH         = os.environ.get("DAILY_GOAL_STATE_PATH", "daily_goal_state.json")
+DAILY_GOAL_PERSIST            = _env_bool("DAILY_GOAL_PERSIST", True)
 
 # ── Risk controls ─────────────────────────────────────────────────────────────
 MIN_BALANCE_FLOOR     = _env_float("MIN_BALANCE_FLOOR", 5.0)
@@ -599,6 +662,13 @@ _session_day:          str          = ""
 _session_halted:       bool         = False
 _shutdown_requested:   bool         = False
 _last_known_balance:   float        = 0.0
+
+# Daily doubling goal (v9.6.0). Baseline + 2× target are set on boot and re-set
+# at each UTC rollover; _daily_goal_reached latches the per-day halt (and is
+# cleared at rollover) so the "goal reached" alert fires once per day.
+daily_goal_start_balance: float = 0.0
+daily_goal_target:        float = 0.0
+_daily_goal_reached:      bool  = False
 
 _prev_ob: dict = {}
 
@@ -1228,6 +1298,38 @@ def ladder_record(won: bool, pnl: float) -> None:
             log.warning("Ladder record error: %s", e)
 
 
+def daily_goal_stake(balance: float) -> float:
+    """Goal-gap sizing for the daily-doubling mode (v9.6.0).
+
+    Sizes a trade as the remaining gap to today's 2× target, spread over
+    DAILY_GOAL_TRADES_TO_TARGET expected winning trades, then clamped to:
+        • a floor of DAILY_GOAL_MIN_STAKE,
+        • a ceiling of DAILY_GOAL_MAX_STAKE_FRACTION × balance (scales hands-off),
+        • an optional hard dollar ceiling DAILY_GOAL_MAX_STAKE (0 = disabled),
+        • the cash on hand (can never stake more than the account holds).
+
+    Returns 0.0 when the target is already met (the daily-goal halt blocks entry
+    in that case anyway) or when the gap rounds below a placeable amount.
+    """
+    gap = daily_goal_target - balance
+    if gap <= 0.0:
+        return 0.0
+    n   = max(1, DAILY_GOAL_TRADES_TO_TARGET)
+    raw = gap / n
+
+    cap = balance
+    if DAILY_GOAL_MAX_STAKE_FRACTION > 0.0:
+        cap = min(cap, DAILY_GOAL_MAX_STAKE_FRACTION * balance)
+    if DAILY_GOAL_MAX_STAKE > 0.0:
+        cap = min(cap, DAILY_GOAL_MAX_STAKE)
+
+    stake = min(raw, cap)
+    # Apply the floor, but never stake more than the cash on hand.
+    stake = max(stake, min(DAILY_GOAL_MIN_STAKE, balance))
+    stake = min(stake, balance)
+    return round(stake, 2)
+
+
 def kelly_bet(win_prob: float, contract_price_cents: int, balance: float) -> float:
     if contract_price_cents <= 0 or contract_price_cents >= 100:
         return 0.0
@@ -1242,6 +1344,14 @@ def kelly_bet(win_prob: float, contract_price_cents: int, balance: float) -> flo
     # (NORMAL_TRADE_SIZE normally, RECOVERY_TRADE_SIZE while in recovery).
     if full_kelly <= 0.0:
         return 0.0
+
+    # v9.6.0: daily-doubling mode OWNS sizing — goal-gap stake overrides the flat
+    # NORMAL/RECOVERY size and the ladder overlay. The Kelly edge gate above still
+    # decides IF a trade exists; this only sets how much. The daily-goal halt
+    # (daily_goal_check) blocks entry once the target is met.
+    if DAILY_GOAL_ENABLED:
+        return daily_goal_stake(balance)
+
     size     = active_trade_size()
     base_bet = round(min(size, balance), 2)
 
@@ -1843,6 +1953,90 @@ def daily_loss_check(balance: float) -> bool:
     return True
 
 
+def daily_goal_check(balance: float) -> bool:
+    """Daily-doubling backstop (v9.6.0). Returns False (block NEW entries) once
+    the day's 2× target is reached; the latch is cleared at the UTC rollover so
+    trading auto-resumes the next day against the new, higher target. Open trades
+    still settle while halted. No-op unless DAILY_GOAL_ENABLED.
+    """
+    global _daily_goal_reached
+    if not DAILY_GOAL_ENABLED or daily_goal_target <= 0.0:
+        return True
+    if balance >= daily_goal_target:
+        if not _daily_goal_reached:
+            _daily_goal_reached = True
+            _save_daily_goal()
+            log.info("🎯 DAILY GOAL │ $%.2f ≥ target $%.2f — halting new entries "
+                     "until UTC rollover.", balance, daily_goal_target)
+            tg.send_telegram_message(
+                f"🎯 DAILY GOAL REACHED\n"
+                f"Balance ${balance:.2f} ≥ target ${daily_goal_target:.2f} "
+                f"(start ${daily_goal_start_balance:.2f})\n"
+                f"Trading paused until the next UTC day."
+            )
+        return False
+    return True
+
+
+def _save_daily_goal() -> None:
+    """Atomically persist today's goal state so a restart resumes the same day."""
+    if not (DAILY_GOAL_ENABLED and DAILY_GOAL_PERSIST):
+        return
+    try:
+        tmp = f"{DAILY_GOAL_STATE_PATH}.tmp"
+        with open(tmp, "w") as f:
+            json.dump({
+                "day":           _session_day,
+                "start_balance": daily_goal_start_balance,
+                "target":        daily_goal_target,
+                "reached":       _daily_goal_reached,
+            }, f)
+        os.replace(tmp, DAILY_GOAL_STATE_PATH)   # atomic on POSIX
+    except OSError as e:
+        log.warning("Daily goal │ state save failed: %s", e)
+
+
+def set_daily_goal(balance: float) -> None:
+    """(Re)baseline the daily-doubling target to `balance` and clear the per-day
+    goal halt. Called at each UTC rollover so the 2× target compounds off each
+    day's opening balance. Safe to call when goal mode is disabled — both
+    daily_goal_check() and kelly_bet() gate on DAILY_GOAL_ENABLED.
+    """
+    global daily_goal_start_balance, daily_goal_target, _daily_goal_reached
+    daily_goal_start_balance = round(balance, 2)
+    daily_goal_target        = round(balance * DAILY_GOAL_MULTIPLE, 2)
+    _daily_goal_reached      = False
+    _save_daily_goal()
+
+
+def reconcile_daily_goal_on_boot(balance: float) -> None:
+    """Restore today's persisted goal target on boot so an in-container restart
+    does not move the goalpost; if there is no state for the current UTC day,
+    set a fresh target off the current balance. No-op when goal mode is off.
+    """
+    global daily_goal_start_balance, daily_goal_target, _daily_goal_reached
+    if not DAILY_GOAL_ENABLED:
+        return
+    today = _session_day or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if DAILY_GOAL_PERSIST:
+        try:
+            with open(DAILY_GOAL_STATE_PATH) as f:
+                d = json.load(f)
+        except (OSError, ValueError):
+            d = None
+        if d and d.get("day") == today and float(d.get("target", 0) or 0) > 0:
+            daily_goal_start_balance = float(d.get("start_balance", balance) or balance)
+            daily_goal_target        = float(d["target"])
+            _daily_goal_reached      = bool(d.get("reached", False))
+            log.info("🎯 Daily goal boot │ RESUMING today's target $%.2f "
+                     "(start $%.2f, reached=%s).",
+                     daily_goal_target, daily_goal_start_balance, _daily_goal_reached)
+            return
+    set_daily_goal(balance)
+    log.info("🎯 Daily goal boot │ new target $%.2f (start $%.2f).",
+             daily_goal_target, daily_goal_start_balance)
+
+
 def spread_check(bid: int, ask: int) -> bool:
     if ask - bid <= 0:
         log.info("Spread │ zero/crossed")
@@ -2004,6 +2198,9 @@ def telegram_boot(balance: float) -> None:
         f"AGREE-gate={'ON' if REQUIRE_AGREE_MOMENTUM else 'OFF'} | "
         f"Breakeven≤{YES_BREAKEVEN_PRICE}c\n"
         f"SessionScore≥{MIN_SESSION_SCORE} | Kelly={KELLY_FRACTION}"
+        + (f"\n🎯 Daily goal: ${balance:.2f} → ${daily_goal_target:.2f} "
+           f"(×{DAILY_GOAL_MULTIPLE:.2f}/day), halt on reach"
+           if DAILY_GOAL_ENABLED else "")
     )
 
 
@@ -2056,6 +2253,10 @@ def run_decision(market: dict, balance: float) -> None:
     if not cooldown_check():
         return
     if not daily_loss_check(balance):
+        return
+    if not daily_goal_check(balance):
+        last_signal_desc = (f"daily goal reached "
+                            f"(${balance:.2f}≥${daily_goal_target:.2f})")
         return
     if not streak_check():
         last_signal_desc = f"streak pause ({consecutive_losses}L)"
@@ -2231,6 +2432,7 @@ def maybe_roll_session_day(current_balance: float) -> bool:
     global _session_day, _session_halted, session_start_balance
     global session_stop_threshold, daily_pnl, paper_daily_pnl, consecutive_losses
     global session_state, streak_pause_until, live_daily_realized
+    global daily_goal_start_balance, daily_goal_target, _daily_goal_reached
 
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if today == _session_day:
@@ -2249,8 +2451,13 @@ def maybe_roll_session_day(current_balance: float) -> bool:
     session_state          = SessionState.ACTIVE
     session_traded_tickers.clear()
 
-    log.info("🔄 New trading day %s │ balance $%.2f │ daily budget reset%s",
-             today, current_balance, " (halt cleared)" if was_halted else "")
+    # v9.6.0: re-baseline the daily-doubling target to today's opening balance
+    # (which compounds yesterday's gains) and clear the per-day goal halt.
+    set_daily_goal(current_balance)
+
+    log.info("🔄 New trading day %s │ balance $%.2f │ daily budget reset%s%s",
+             today, current_balance, " (halt cleared)" if was_halted else "",
+             (" │ goal→$%.2f" % daily_goal_target) if DAILY_GOAL_ENABLED else "")
     return True
 
 
@@ -2309,6 +2516,12 @@ def main() -> None:
              " (RECOVERY active, target $%.2f)" % recovery.target_balance
              if recovery.active else "")
     log.info("  Kelly=%.2f | SessionScore≥%d", KELLY_FRACTION, MIN_SESSION_SCORE)
+    if DAILY_GOAL_ENABLED:
+        log.info("  🎯 Daily goal: ×%.2f/day | gap÷%d trades | cap=%.0f%% bal%s | min=$%.2f",
+                 DAILY_GOAL_MULTIPLE, DAILY_GOAL_TRADES_TO_TARGET,
+                 DAILY_GOAL_MAX_STAKE_FRACTION * 100,
+                 (" / $%.0f hard" % DAILY_GOAL_MAX_STAKE) if DAILY_GOAL_MAX_STAKE > 0 else "",
+                 DAILY_GOAL_MIN_STAKE)
     log.info("━" * 70)
 
     tg.validate_telegram_connection()
@@ -2322,6 +2535,7 @@ def main() -> None:
         session_start_balance  = paper_balance
         session_stop_threshold = paper_balance * SESSION_STOP_FRACTION
         recovery.reconcile_on_boot(paper_balance)
+        reconcile_daily_goal_on_boot(paper_balance)
         telegram_boot(paper_balance)
     else:
         try:
@@ -2343,6 +2557,7 @@ def main() -> None:
         running_pnl        = 0.0
         live_daily_realized = 0.0
         recovery.reconcile_on_boot(bal)
+        reconcile_daily_goal_on_boot(bal)
         telegram_boot(bal)
 
     resolve_cycle = 0
@@ -2435,6 +2650,15 @@ def main() -> None:
 
                 if recovery.active:
                     log.info(recovery.status_line(current_balance))
+
+                if DAILY_GOAL_ENABLED and daily_goal_target > 0:
+                    gb   = paper_balance if DEMO_MODE else _last_known_balance
+                    span = daily_goal_target - daily_goal_start_balance
+                    pct  = ((gb - daily_goal_start_balance) / span * 100.0
+                            if span > 0 else 0.0)
+                    log.info("🎯 Daily goal │ $%.2f → $%.2f │ %.0f%%%s",
+                             gb, daily_goal_target, max(0.0, pct),
+                             " │ REACHED (paused)" if _daily_goal_reached else "")
 
             time.sleep(POLL_INTERVAL)
 
