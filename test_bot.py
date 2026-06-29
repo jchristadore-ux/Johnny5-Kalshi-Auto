@@ -1,5 +1,5 @@
 """
-test_bot.py — Pytest suite for Johnny5-Kalshi-Auto v9.3.0
+test_bot.py — Pytest suite for Johnny5-Kalshi-Auto v9.5.0
 
 Covers:
   P0: All risk controls
@@ -131,75 +131,52 @@ class TestRestoredThresholds:
     def test_neutral_drag_restored(self):
         assert bot.NEUTRAL_ACCURACY_DRAG == 0.02
 
-    def test_trade_size_is_5(self):
-        assert bot.TRADE_SIZE_CAP == 5.0
+    def test_normal_trade_size_default(self):
+        # v9.5.0: TRADE_SIZE_CAP is gone; NORMAL_TRADE_SIZE falls back to the
+        # legacy TRADE_SIZE_DOLLARS so existing configs keep working.
+        assert bot.NORMAL_TRADE_SIZE == 5.0
 
-    def test_max_bet_fraction_is_004(self):
-        assert bot.MAX_BET_FRACTION == 0.04
+    def test_recovery_trade_size_default(self):
+        assert bot.RECOVERY_TRADE_SIZE == 100.0
+
+    def test_trade_size_cap_removed(self):
+        assert not hasattr(bot, "TRADE_SIZE_CAP")
 
     def test_max_concurrent_is_1(self):
         assert bot.MAX_CONCURRENT_POS == 1
 
 
-class TestBalanceFloorCheck:
-    def test_below_floor(self, monkeypatch):
-        monkeypatch.setattr(bot, "MIN_BALANCE_FLOOR", 5.0)
-        assert bot.balance_floor_check(4.99) is False
-
-    def test_at_floor(self, monkeypatch):
-        monkeypatch.setattr(bot, "MIN_BALANCE_FLOOR", 5.0)
-        assert bot.balance_floor_check(5.00) is True
-
-    def test_above_floor(self, monkeypatch):
-        monkeypatch.setattr(bot, "MIN_BALANCE_FLOOR", 5.0)
-        assert bot.balance_floor_check(100.0) is True
-
-    def test_zero(self, monkeypatch):
-        monkeypatch.setattr(bot, "MIN_BALANCE_FLOOR", 5.0)
-        assert bot.balance_floor_check(0.0) is False
+class TestBalanceFloorRemoved:
+    # v9.4.0 (owner directive): the balance floor was removed — drawdown must
+    # never shrink/halt the stake. The only auto-hold is the streak pause; the
+    # 40% session stop remains as a catastrophic backstop (see TestDailyLossCheck).
+    def test_balance_floor_check_removed(self):
+        assert not hasattr(bot, "balance_floor_check")
 
 
 class TestDailyLossCheck:
+    # v9.4.0: the % and $ daily-loss caps were removed. daily_loss_check now only
+    # enforces the 40% SESSION_STOP_FRACTION backstop and the _session_halted flag.
     def setup_method(self):
         bot._session_halted = False
 
-    def test_within_limit(self, monkeypatch):
+    def test_large_daily_loss_no_longer_halts(self, monkeypatch):
+        # A loss far past the old caps must NOT halt while above the session stop.
         monkeypatch.setattr(bot, "DEMO_MODE", True)
-        monkeypatch.setattr(bot, "paper_daily_pnl", -10.0)
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS", 20.0)
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS_PCT", 0.06)
-        monkeypatch.setattr(bot, "session_start_balance", 0.0)
-        monkeypatch.setattr(bot, "session_stop_threshold", 0.0)
-        assert bot.daily_loss_check(15.0) is True
-
-    def test_at_limit(self, monkeypatch):
-        monkeypatch.setattr(bot, "DEMO_MODE", True)
-        monkeypatch.setattr(bot, "paper_daily_pnl", -20.0)
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS", 20.0)
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS_PCT", 0.06)
-        monkeypatch.setattr(bot, "session_start_balance", 0.0)
-        monkeypatch.setattr(bot, "session_stop_threshold", 0.0)
-        assert bot.daily_loss_check(5.0) is False
+        monkeypatch.setattr(bot, "paper_daily_pnl", -500.0)
+        monkeypatch.setattr(bot, "session_start_balance", 2000.0)
+        monkeypatch.setattr(bot, "session_stop_threshold", 800.0)
+        assert bot.daily_loss_check(1500.0) is True
 
     def test_session_stop_triggers(self, monkeypatch):
         monkeypatch.setattr(bot, "DEMO_MODE", True)
-        monkeypatch.setattr(bot, "paper_daily_pnl", 0.0)
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS", 100.0)
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS_PCT", 0.0)
-        monkeypatch.setattr(bot, "session_start_balance", 0.0)
         monkeypatch.setattr(bot, "session_stop_threshold", 12.50)
         assert bot.daily_loss_check(10.0) is False
 
-    def test_pct_cap_binds_before_dollar_cap(self, monkeypatch):
+    def test_above_session_stop_ok(self, monkeypatch):
         monkeypatch.setattr(bot, "DEMO_MODE", True)
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS", 1000.0)
-        monkeypatch.setattr(bot, "MAX_DAILY_LOSS_PCT", 0.06)
-        monkeypatch.setattr(bot, "session_start_balance", 2000.0)
-        monkeypatch.setattr(bot, "session_stop_threshold", 0.0)
-        monkeypatch.setattr(bot, "paper_daily_pnl", -100.0)
-        assert bot.daily_loss_check(1900.0) is True
-        monkeypatch.setattr(bot, "paper_daily_pnl", -130.0)
-        assert bot.daily_loss_check(1870.0) is False
+        monkeypatch.setattr(bot, "session_stop_threshold", 12.50)
+        assert bot.daily_loss_check(13.0) is True
 
     def test_halted_flag_blocks(self, monkeypatch):
         monkeypatch.setattr(bot, "_session_halted", True)
@@ -287,41 +264,48 @@ class TestCalcEdge:
 
 
 class TestKellyBet:
-    def test_positive_edge_returns_bet(self, monkeypatch):
-        monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 5.0)
-        monkeypatch.setattr(bot, "KELLY_FRACTION", 0.35)
-        monkeypatch.setattr(bot, "MAX_BET_FRACTION", 0.10)
-        monkeypatch.setattr(bot, "session_state", SessionState.ACTIVE)
+    # v9.4.1 + v9.5.0: Kelly is ONLY an edge gate (positive full_kelly = positive
+    # expectancy). The stake itself is the flat active_trade_size() — no Kelly,
+    # balance, or MAX_BET_FRACTION down-scaling — clamped only by cash on hand.
+    # active_trade_size() is NORMAL_TRADE_SIZE normally, RECOVERY_TRADE_SIZE while
+    # recovery is active.
+    def setup_method(self):
+        bot.recovery.active = False
+
+    def teardown_method(self):
+        bot.recovery.active = False
+
+    def test_positive_edge_returns_flat_stake(self, monkeypatch):
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 5.0)
+        bot.recovery.active = False
         bet = bot.kelly_bet(0.70, 50, 25.0)
-        assert bet > 0
-        assert bet <= 5.0
+        assert bet == 5.0
 
     def test_no_edge_returns_zero(self, monkeypatch):
-        monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 5.0)
-        monkeypatch.setattr(bot, "KELLY_FRACTION", 0.35)
-        monkeypatch.setattr(bot, "MAX_BET_FRACTION", 0.10)
-        monkeypatch.setattr(bot, "session_state", SessionState.ACTIVE)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 5.0)
+        bot.recovery.active = False
         assert bot.kelly_bet(0.30, 50, 25.0) == 0.0
 
-    def test_recovery_halves_kelly(self, monkeypatch):
-        monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 100.0)
-        monkeypatch.setattr(bot, "KELLY_FRACTION", 0.30)
-        monkeypatch.setattr(bot, "KELLY_RECOVERY_MULT", 0.50)
-        monkeypatch.setattr(bot, "MAX_BET_FRACTION", 0.50)
-        monkeypatch.setattr(bot, "session_state", SessionState.ACTIVE)
-        bet_active = bot.kelly_bet(0.70, 50, 100.0)
-        monkeypatch.setattr(bot, "session_state", SessionState.RECOVERY)
-        bet_recovery = bot.kelly_bet(0.70, 50, 100.0)
-        assert bet_recovery < bet_active
-        assert abs(bet_recovery - bet_active * 0.50) < 0.01
+    def test_clamped_to_cash_on_hand(self, monkeypatch):
+        # Below the stake size the bot goes all-in (cannot stake more than held).
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        bot.recovery.active = False
+        assert bot.kelly_bet(0.70, 50, 300.0) == 300.0
 
-    def test_capped_at_bet_fraction(self, monkeypatch):
-        monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 1_000.0)
-        monkeypatch.setattr(bot, "KELLY_FRACTION", 1.0)
-        monkeypatch.setattr(bot, "MAX_BET_FRACTION", 0.04)
-        monkeypatch.setattr(bot, "session_state", SessionState.ACTIVE)
-        bet = bot.kelly_bet(0.90, 40, 1_000.0)
-        assert bet <= 1_000.0 * 0.04 + 0.01
+    def test_recovery_mode_uses_recovery_size(self, monkeypatch):
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+        bot.recovery.active = True
+        assert bot.kelly_bet(0.70, 50, 1_000.0) == 100.0
+        bot.recovery.active = False
+        assert bot.kelly_bet(0.70, 50, 1_000.0) == 500.0
+
+    def test_flat_stake_independent_of_balance(self, monkeypatch):
+        # No balance scaling: the stake is the same at $600 and $5000 balance.
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        bot.recovery.active = False
+        assert bot.kelly_bet(0.90, 40, 600.0) == 500.0
+        assert bot.kelly_bet(0.90, 40, 5_000.0) == 500.0
 
 
 class TestComputeMomentum:
@@ -334,8 +318,9 @@ class TestComputeMomentum:
         assert verdict == "NEUTRAL"
 
     def test_agree_yes_btc_up(self, monkeypatch):
+        # v9.3.2: needs MOMENTUM_LOOKBACK+1 samples to compute (default 6 → 7).
         monkeypatch.setattr(bot, "MOMENTUM_THRESH_PCT", 0.15)
-        for p in [50000, 50050, 50100, 50200, 50300]:
+        for p in [50000, 50050, 50100, 50150, 50200, 50250, 50300]:
             bot.btc_prices.append(p)
         verdict, adj = bot.compute_momentum("YES")
         assert verdict == "AGREE"
@@ -343,9 +328,28 @@ class TestComputeMomentum:
 
     def test_conflict_yes_btc_down(self, monkeypatch):
         monkeypatch.setattr(bot, "MOMENTUM_THRESH_PCT", 0.15)
-        for p in [50000, 49900, 49800, 49700, 49500]:
+        for p in [50000, 49950, 49900, 49850, 49800, 49750, 49700]:
             bot.btc_prices.append(p)
         assert bot.compute_momentum("YES")[0] == "CONFLICT"
+
+    def test_consistent_small_drift_is_agree(self, monkeypatch):
+        # v9.3.3: a smooth, gentle drift has high regression R² over the window
+        # and is now treated as a REAL trend (AGREE) even though its %-magnitude
+        # is below MOMENTUM_THRESH_PCT. This is the bug fix that unblocked trades.
+        monkeypatch.setattr(bot, "MOMENTUM_THRESH_PCT", 5.0)   # disable magnitude path
+        monkeypatch.setattr(bot, "MOMENTUM_R2_MIN", 0.55)
+        for p in [50000, 50002, 50004, 50006, 50008, 50010, 50012]:
+            bot.btc_prices.append(p)
+        assert bot.compute_momentum("YES")[0] == "AGREE"
+
+    def test_choppy_is_neutral(self, monkeypatch):
+        # NEUTRAL requires BOTH inconsistent (low R²) AND small (sub-threshold):
+        # genuine chop the doctrine rejects.
+        monkeypatch.setattr(bot, "MOMENTUM_THRESH_PCT", 0.15)
+        monkeypatch.setattr(bot, "MOMENTUM_R2_MIN", 0.55)
+        for p in [50000, 50040, 49980, 50030, 49985, 50020, 50000]:
+            bot.btc_prices.append(p)
+        assert bot.compute_momentum("YES")[0] == "NEUTRAL"
 
     def test_neutral_flat(self, monkeypatch):
         monkeypatch.setattr(bot, "MOMENTUM_THRESH_PCT", 0.15)
@@ -619,91 +623,6 @@ class TestNormalizePem:
             bot._normalize_pem("not a pem at all")
 
 
-class TestAlwaysYesMode:
-    """ALWAYS-YES $1 strategy: forced YES, fixed $1.00, all signals bypassed."""
-
-    def setup_method(self):
-        bot.open_orders.clear()
-        bot.active_tickers.clear()
-        bot.session_traded_tickers.clear()
-        bot.trade_history.clear()
-        bot.paper_balance = 25.0
-        bot.paper_daily_pnl = 0.0
-        bot.session_start_balance = 25.0
-        bot.session_stop_threshold = 0.0
-        bot._session_halted = False
-        bot.last_trade_ts = -9999.0
-        bot.consecutive_losses = 0
-
-    def _market(self, ticker="KXBTC15M-TEST", bid=45, ask=55):
-        from datetime import datetime, timezone, timedelta
-        close = (datetime.now(timezone.utc) + timedelta(minutes=14)).strftime(
-            "%Y-%m-%dT%H:%M:%SZ")
-        return {"ticker": ticker, "yes_bid": bid, "yes_ask": ask,
-                "yes_mid": (bid + ask) // 2, "close_time": close}
-
-    def test_constant_is_one_dollar(self):
-        assert bot.ALWAYS_YES_TRADE_DOLLARS == 1.00
-
-    def test_places_yes_for_one_dollar(self, monkeypatch):
-        monkeypatch.setattr(bot, "ALWAYS_YES_MODE", True)
-        monkeypatch.setattr(bot, "DEMO_MODE", True)
-        monkeypatch.setattr(bot, "MAX_CONCURRENT_POS", 1)
-        bot.run_decision(self._market(), 25.0)
-        assert len(bot.open_orders) == 1
-        rec = next(iter(bot.open_orders.values()))
-        assert rec["side"] == "YES"
-        assert rec["cost"] <= 1.00 + 1e-9
-
-    def test_cost_never_exceeds_one_dollar_any_price(self, monkeypatch):
-        monkeypatch.setattr(bot, "ALWAYS_YES_MODE", True)
-        monkeypatch.setattr(bot, "DEMO_MODE", True)
-        monkeypatch.setattr(bot, "MAX_CONCURRENT_POS", 1)
-        for bid, ask in [(2, 4), (20, 30), (48, 52), (70, 80), (95, 98)]:
-            self.setup_method()
-            bot.run_decision(self._market(ticker=f"KXBTC15M-{bid}", bid=bid, ask=ask), 25.0)
-            for rec in bot.open_orders.values():
-                assert rec["cost"] <= 1.00 + 1e-9, f"cost {rec['cost']} at {bid}/{ask}"
-
-    def test_ignores_trade_size_cap(self, monkeypatch):
-        # Even with a large configured TRADE_SIZE / Kelly, the mode caps at $1.
-        monkeypatch.setattr(bot, "ALWAYS_YES_MODE", True)
-        monkeypatch.setattr(bot, "DEMO_MODE", True)
-        monkeypatch.setattr(bot, "TRADE_SIZE_CAP", 500.0)
-        monkeypatch.setattr(bot, "KELLY_FRACTION", 1.0)
-        monkeypatch.setattr(bot, "MAX_BET_FRACTION", 1.0)
-        monkeypatch.setattr(bot, "MAX_CONCURRENT_POS", 1)
-        bot.run_decision(self._market(), 25.0)
-        rec = next(iter(bot.open_orders.values()))
-        assert rec["cost"] <= 1.00 + 1e-9
-
-    def test_duplicate_ticker_blocked(self, monkeypatch):
-        monkeypatch.setattr(bot, "ALWAYS_YES_MODE", True)
-        monkeypatch.setattr(bot, "DEMO_MODE", True)
-        monkeypatch.setattr(bot, "MAX_CONCURRENT_POS", 5)
-        bot.session_traded_tickers.add("KXBTC15M-TEST")
-        bot.run_decision(self._market(ticker="KXBTC15M-TEST"), 25.0)
-        assert len(bot.open_orders) == 0
-
-    def test_balance_floor_blocks(self, monkeypatch):
-        monkeypatch.setattr(bot, "ALWAYS_YES_MODE", True)
-        monkeypatch.setattr(bot, "DEMO_MODE", True)
-        monkeypatch.setattr(bot, "MIN_BALANCE_FLOOR", 5.0)
-        bot.run_decision(self._market(), 2.0)
-        assert len(bot.open_orders) == 0
-
-    def test_disabled_falls_through_to_normal(self, monkeypatch):
-        # With the flag off, run_always_yes must NOT fire; normal path runs and
-        # (with no BTC price history / regime) places nothing.
-        monkeypatch.setattr(bot, "ALWAYS_YES_MODE", False)
-        monkeypatch.setattr(bot, "DEMO_MODE", True)
-        called = {"v": False}
-        monkeypatch.setattr(bot, "run_always_yes",
-                            lambda *a, **k: called.__setitem__("v", True))
-        bot.run_decision(self._market(), 25.0)
-        assert called["v"] is False
-
-
 class TestPaperModeAccounting:
     def test_win_net_is_positive_profit(self):
         count = 4; cost = 50 * count / 100.0
@@ -726,57 +645,169 @@ class TestPaperModeAccounting:
         assert buggy - start == 0.0
 
 
-class TestUpdateSessionState:
-    def setup_method(self):
+_TEST_RECOVERY_PATH = "/tmp/_j5_test_recovery.json"
+
+
+def _fresh_recovery():
+    # persist=False → never touches disk, so tests don't pollute the repo.
+    return bot.RecoveryState(_TEST_RECOVERY_PATH, False)
+
+
+def _silence_telegram(monkeypatch):
+    monkeypatch.setattr(bot.tg, "send_telegram_message", lambda *a, **k: True)
+
+
+class TestUpdateSessionStateNoop:
+    # v9.4.0: the 10%-drawdown RECOVERY state machine that halved Kelly sizing was
+    # removed by owner directive. update_session_state() is now a no-op so the
+    # session stays ACTIVE; two-tier sizing is handled by RecoveryState instead.
+    def test_update_session_state_keeps_active(self):
         bot.session_state = SessionState.ACTIVE
-        bot.recovery_entry_wins = 0
-        bot.recovery_entry_losses = 0
-        bot.recovery_entered_ts = 0.0
-        bot.live_wins = 0
-        bot.live_losses = 0
-
-    def _no_telegram(self, monkeypatch):
-        monkeypatch.setattr(bot.tg, "send_telegram_message", lambda *a, **k: True)
-
-    def test_entry_stamps_recovery_time(self, monkeypatch):
-        self._no_telegram(monkeypatch)
-        monkeypatch.setattr(bot, "session_start_balance", 2000.0)
-        monkeypatch.setattr(bot, "RECOVERY_TRIGGER_PCT", 0.10)
-        bot.session_state = SessionState.ACTIVE
-        bot.update_session_state(1750.0)
-        assert bot.session_state == SessionState.RECOVERY
-        assert bot.recovery_entered_ts > 0.0
-
-    def test_timeout_forces_exit(self, monkeypatch):
-        self._no_telegram(monkeypatch)
-        monkeypatch.setattr(bot, "session_start_balance", 2000.0)
-        monkeypatch.setattr(bot, "RECOVERY_TRIGGER_PCT", 0.10)
-        monkeypatch.setattr(bot, "RECOVERY_MAX_SECS", 3600)
-        bot.session_state = SessionState.RECOVERY
-        bot.recovery_entered_ts = time.time() - 7200
-        bot.update_session_state(1750.0)
+        bot.update_session_state(1.0)        # huge drawdown vs any start balance
         assert bot.session_state == SessionState.ACTIVE
 
-    def test_zero_timestamp_is_initialized_not_instant_exit(self, monkeypatch):
-        self._no_telegram(monkeypatch)
-        monkeypatch.setattr(bot, "session_start_balance", 2000.0)
-        monkeypatch.setattr(bot, "RECOVERY_TRIGGER_PCT", 0.10)
-        monkeypatch.setattr(bot, "RECOVERY_MAX_SECS", 3600)
-        bot.session_state = SessionState.RECOVERY
-        bot.recovery_entered_ts = 0.0
-        bot.update_session_state(1750.0)
-        assert bot.session_state == SessionState.RECOVERY
-        assert bot.recovery_entered_ts > 0.0
 
-    def test_balance_heal_still_exits(self, monkeypatch):
-        self._no_telegram(monkeypatch)
-        monkeypatch.setattr(bot, "session_start_balance", 2000.0)
-        monkeypatch.setattr(bot, "RECOVERY_TRIGGER_PCT", 0.10)
-        monkeypatch.setattr(bot, "RECOVERY_MAX_SECS", 3600)
-        bot.session_state = SessionState.RECOVERY
-        bot.recovery_entered_ts = time.time() - 60
-        bot.update_session_state(1850.0)
-        assert bot.session_state == SessionState.ACTIVE
+class TestActiveTradeSize:
+    # active_trade_size() is the single source of truth for the per-trade stake.
+    def test_normal_when_recovery_inactive(self, monkeypatch):
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+        monkeypatch.setattr(bot, "recovery", _fresh_recovery())
+        assert bot.active_trade_size() == 500.0
+
+    def test_recovery_when_active(self, monkeypatch):
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+        r = _fresh_recovery()
+        r.active = True
+        r.target_balance = 2000.0
+        monkeypatch.setattr(bot, "recovery", r)
+        assert bot.active_trade_size() == 100.0
+
+
+class TestRecoveryState:
+    # v9.5.0 two-tier sizing: enter on a settled full-size loss (target = exact
+    # pre-trade balance), exit when balance climbs back to target.
+    def test_enter_sets_target(self, monkeypatch):
+        _silence_telegram(monkeypatch)
+        r = _fresh_recovery()
+        assert r.enter(target_balance=2000.0, current_balance=1900.0) is True
+        assert r.active is True
+        assert r.target_balance == 2000.0
+
+    def test_enter_noop_when_already_active(self, monkeypatch):
+        _silence_telegram(monkeypatch)
+        r = _fresh_recovery()
+        r.enter(2000.0, 1900.0)
+        # A further loss while recovering must NOT move the target.
+        assert r.enter(1800.0, 1700.0) is False
+        assert r.target_balance == 2000.0
+
+    def test_enter_noop_when_already_at_target(self, monkeypatch):
+        _silence_telegram(monkeypatch)
+        r = _fresh_recovery()
+        assert r.enter(target_balance=2000.0, current_balance=2000.0) is False
+        assert r.active is False
+
+    def test_enter_rejects_bad_target(self, monkeypatch):
+        _silence_telegram(monkeypatch)
+        r = _fresh_recovery()
+        assert r.enter(target_balance=0.0, current_balance=100.0) is False
+        assert r.enter(target_balance=None, current_balance=100.0) is False
+        assert r.active is False
+
+    def test_maybe_exit_only_at_target(self, monkeypatch):
+        _silence_telegram(monkeypatch)
+        r = _fresh_recovery()
+        r.enter(2000.0, 1900.0)
+        assert r.maybe_exit(1999.99) is False
+        assert r.active is True
+        assert r.maybe_exit(2000.0) is True
+        assert r.active is False
+        assert r.target_balance == 0.0
+
+    def test_reconcile_clears_corrupt_target(self, monkeypatch):
+        _silence_telegram(monkeypatch)
+        r = _fresh_recovery()
+        r.active, r.target_balance = True, 0.0
+        r.reconcile_on_boot(500.0)
+        assert r.active is False
+
+    def test_reconcile_exits_if_already_recovered(self, monkeypatch):
+        _silence_telegram(monkeypatch)
+        r = _fresh_recovery()
+        r.active, r.target_balance = True, 1000.0
+        r.reconcile_on_boot(1500.0)
+        assert r.active is False
+
+    def test_reconcile_resumes_mid_recovery(self, monkeypatch):
+        _silence_telegram(monkeypatch)
+        r = _fresh_recovery()
+        r.active, r.target_balance = True, 2000.0
+        r.reconcile_on_boot(1500.0)
+        assert r.active is True
+
+
+class TestOnTradeSettled:
+    # Recovery ENTRY hook: only a normal-mode (full-size) LOSS arms recovery.
+    def _install(self, monkeypatch):
+        r = _fresh_recovery()
+        monkeypatch.setattr(bot, "recovery", r)
+        return r
+
+    def test_full_size_loss_arms_recovery(self, monkeypatch):
+        _silence_telegram(monkeypatch)
+        r = self._install(monkeypatch)
+        trade = {"mode_at_entry": "normal", "balance_before": 2000.0}
+        bot.on_trade_settled(won=False, trade_rec=trade, current_balance=1900.0)
+        assert r.active is True
+        assert r.target_balance == 2000.0
+
+    def test_win_does_not_arm(self, monkeypatch):
+        _silence_telegram(monkeypatch)
+        r = self._install(monkeypatch)
+        trade = {"mode_at_entry": "normal", "balance_before": 2000.0}
+        bot.on_trade_settled(won=True, trade_rec=trade, current_balance=2100.0)
+        assert r.active is False
+
+    def test_recovery_size_loss_does_not_arm(self, monkeypatch):
+        _silence_telegram(monkeypatch)
+        r = self._install(monkeypatch)
+        trade = {"mode_at_entry": "recovery", "balance_before": 2000.0}
+        bot.on_trade_settled(won=False, trade_rec=trade, current_balance=1900.0)
+        assert r.active is False
+
+
+class TestLadderSizeUpPause:
+    # v9.5.0: after a recovery exit the ladder holds size-up at baseline for N
+    # settled trades; downside guardrails stay active.
+    def test_pause_caps_size_up(self):
+        from ladder import StakeLadder, LadderConfig
+        cfg = LadderConfig.from_env()
+        cfg.persist = False
+        cfg.min_trades = 0
+        ladder = StakeLadder(cfg=cfg)
+        # Force a hot win-rate that would normally size up above baseline.
+        for _ in range(cfg.window):
+            ladder.tracker.record(True)
+        ladder.pause_size_up(3)
+        capped = ladder.get_stake(100.0)
+        assert capped.multiplier <= 1.0
+        assert capped.stake <= 100.0
+
+    def test_pause_counts_down_per_settled_trade(self):
+        from ladder import StakeLadder, LadderConfig
+        cfg = LadderConfig.from_env()
+        cfg.persist = False
+        ladder = StakeLadder(cfg=cfg)
+        ladder.pause_size_up(2)
+        assert ladder.size_up_pause_trades == 2
+        ladder.on_trade_result(won=True, pnl=1.0)
+        assert ladder.size_up_pause_trades == 1
+        ladder.on_trade_result(won=True, pnl=1.0)
+        assert ladder.size_up_pause_trades == 0
+        ladder.on_trade_result(won=True, pnl=1.0)
+        assert ladder.size_up_pause_trades == 0
 
 
 class TestSessionDayRollover:
