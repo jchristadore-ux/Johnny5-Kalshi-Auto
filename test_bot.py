@@ -748,6 +748,45 @@ class TestRecoveryState:
         assert r.active is True
 
 
+class TestRecoveryModeToggle:
+    # v9.6.1: master ON/OFF switch. When disabled, recovery can never arm, sizing
+    # stays NORMAL, and any stale persisted active state is cleared on boot.
+    def _disabled(self):
+        return bot.RecoveryState(_TEST_RECOVERY_PATH, False, enabled=False)
+
+    def test_enter_noop_when_disabled(self, monkeypatch):
+        _silence_telegram(monkeypatch)
+        r = self._disabled()
+        assert r.enter(target_balance=2000.0, current_balance=1900.0) is False
+        assert r.active is False
+
+    def test_active_trade_size_stays_normal_when_disabled(self, monkeypatch):
+        _silence_telegram(monkeypatch)
+        monkeypatch.setattr(bot, "NORMAL_TRADE_SIZE", 500.0)
+        monkeypatch.setattr(bot, "RECOVERY_TRADE_SIZE", 100.0)
+        r = self._disabled()
+        # A full-size loss must not arm recovery while the mode is off.
+        monkeypatch.setattr(bot, "recovery", r)
+        trade = {"mode_at_entry": "normal", "balance_before": 2000.0}
+        bot.on_trade_settled(won=False, trade_rec=trade, current_balance=1900.0)
+        assert r.active is False
+        assert bot.active_trade_size() == 500.0
+
+    def test_reconcile_clears_stale_active_when_disabled(self, monkeypatch):
+        _silence_telegram(monkeypatch)
+        r = self._disabled()
+        # Simulate a stale active flag carried in from a prior enabled run.
+        r.active, r.target_balance = True, 2000.0
+        r.reconcile_on_boot(1500.0)
+        assert r.active is False
+        assert r.target_balance == 0.0
+
+    def test_enabled_by_default(self):
+        # The class default keeps the v9.5.0 recovery unit tests valid.
+        r = bot.RecoveryState(_TEST_RECOVERY_PATH, False)
+        assert r.enabled is True
+
+
 class TestOnTradeSettled:
     # Recovery ENTRY hook: only a normal-mode (full-size) LOSS arms recovery.
     def _install(self, monkeypatch):

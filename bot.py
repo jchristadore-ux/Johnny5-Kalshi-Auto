@@ -1,7 +1,16 @@
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║  JOHNNY5-KALSHI-AUTO  v9.6.0  —  Production Build                            ║
+║  JOHNNY5-KALSHI-AUTO  v9.6.1  —  Production Build                            ║
 ║  "No disassemble."                                                           ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  v9.6.1 — RECOVERY MODE TOGGLE (owner directive).                            ║
+║                                                                              ║
+║  Recovery Mode is now a master ON/OFF switch via RECOVERY_MODE_ENABLED.      ║
+║  This build's sole purpose is to DOUBLE the balance daily (see DAILY GOAL),  ║
+║  so recovery sizing is DISABLED by default: a full-size loss never drops the ║
+║  stake or arms a recovery target, and any stale persisted recovery state is  ║
+║  cleared on boot. Set RECOVERY_MODE_ENABLED=true to restore the full v9.5.0  ║
+║  two-tier recovery behaviour below — no other change required.               ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  v9.6.0 — DAILY DOUBLING GOAL (opt-in, owner directive).                     ║
 ║                                                                              ║
@@ -260,7 +269,7 @@
 
 from __future__ import annotations
 
-BOT_VERSION = "9.6.0"
+BOT_VERSION = "9.6.1"
 
 import base64
 import json
@@ -375,6 +384,12 @@ KELLY_RECOVERY_MULT = _env_float("KELLY_RECOVERY_MULT", 0.50)
 # (boot reconciliation makes this a safe, non-stuck default).
 RECOVERY_STATE_PATH = os.environ.get("RECOVERY_STATE_PATH", "recovery_state.json")
 RECOVERY_PERSIST    = _env_bool("RECOVERY_PERSIST", True)
+# Master ON/OFF switch for Recovery Mode. This build's sole purpose is to DOUBLE
+# the balance every day (see DAILY_GOAL below), so two-tier recovery sizing is
+# DISABLED by default — a full-size loss never drops the stake or arms a recovery
+# target; sizing stays NORMAL/goal-driven. Set RECOVERY_MODE_ENABLED=true to
+# restore the v9.5.0 recovery behaviour without any other change.
+RECOVERY_MODE_ENABLED = _env_bool("RECOVERY_MODE_ENABLED", False)
 
 
 # ── Laddering stake overlay (opt-in) ──────────────────────────────────────────
@@ -710,19 +725,25 @@ class RecoveryState:
 
     SCHEMA = 1
 
-    def __init__(self, path: str, persist: bool) -> None:
+    def __init__(self, path: str, persist: bool, enabled: bool = True) -> None:
         self.active:         bool  = False
         self.target_balance: float = 0.0
+        self.enabled        = enabled
         self._path    = path
         self._persist = persist
-        if self._persist:
+        # Only rehydrate persisted state when the mode is enabled — a stale
+        # active=true file from a prior enabled run must never silently put a
+        # disabled build back into recovery sizing.
+        if self._persist and self.enabled:
             self._load()
 
     # ── transitions ──────────────────────────────────────────────────────────
     def enter(self, target_balance: float, current_balance: float) -> bool:
-        """Activate recovery with the given target. No-op if already active or
-        the target is not a usable, not-already-met value. Returns True on a
-        real activation."""
+        """Activate recovery with the given target. No-op if recovery is
+        disabled, already active, or the target is not a usable, not-already-met
+        value. Returns True on a real activation."""
+        if not self.enabled:
+            return False
         if self.active:
             return False
         if target_balance is None or target_balance <= 0.0:
@@ -774,6 +795,15 @@ class RecoveryState:
     def reconcile_on_boot(self, current_balance: float) -> None:
         """Self-heal persisted state at startup so the bot can never resume into
         a stuck or nonsensical recovery."""
+        if not self.enabled:
+            # Mode is off: clear any lingering active flag and stay at NORMAL.
+            if self.active:
+                log.info("Recovery boot │ mode DISABLED — clearing stale active "
+                         "state, staying at NORMAL sizing.")
+                self.active         = False
+                self.target_balance = 0.0
+                self._save()
+            return
         if not self.active:
             return
         if self.target_balance <= 0.0:
@@ -822,7 +852,7 @@ class RecoveryState:
         self.target_balance = float(d.get("target_balance", 0.0) or 0.0)
 
 
-recovery = RecoveryState(RECOVERY_STATE_PATH, RECOVERY_PERSIST)
+recovery = RecoveryState(RECOVERY_STATE_PATH, RECOVERY_PERSIST, RECOVERY_MODE_ENABLED)
 
 
 def active_trade_size() -> float:
@@ -2511,10 +2541,14 @@ def main() -> None:
              MIN_CONFIDENCE, YES_BREAKEVEN_PRICE, NEUTRAL_ACCURACY_DRAG)
     log.info("  Momentum lookback=%d intervals | thresh≥%.2f%% or R²≥%.2f",
              MOMENTUM_LOOKBACK, MOMENTUM_THRESH_PCT, MOMENTUM_R2_MIN)
-    log.info("  Sizing: normal=$%.0f recovery=$%.0f | active=$%.0f%s",
-             NORMAL_TRADE_SIZE, RECOVERY_TRADE_SIZE, active_trade_size(),
-             " (RECOVERY active, target $%.2f)" % recovery.target_balance
-             if recovery.active else "")
+    if recovery.enabled:
+        log.info("  Sizing: normal=$%.0f recovery=$%.0f | active=$%.0f%s",
+                 NORMAL_TRADE_SIZE, RECOVERY_TRADE_SIZE, active_trade_size(),
+                 " (RECOVERY active, target $%.2f)" % recovery.target_balance
+                 if recovery.active else "")
+    else:
+        log.info("  Sizing: normal=$%.0f | RECOVERY MODE OFF (daily-doubling build)",
+                 NORMAL_TRADE_SIZE)
     log.info("  Kelly=%.2f | SessionScore≥%d", KELLY_FRACTION, MIN_SESSION_SCORE)
     if DAILY_GOAL_ENABLED:
         log.info("  🎯 Daily goal: ×%.2f/day | gap÷%d trades | cap=%.0f%% bal%s | min=$%.2f",
