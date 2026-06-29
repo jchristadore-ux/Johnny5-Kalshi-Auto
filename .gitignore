@@ -24,6 +24,9 @@ build/
 
 # Runtime state
 ladder_state.json
+recovery_state.json
+daily_goal_state.json
+*.json.tmp
 
 # OS
 .DS_Store

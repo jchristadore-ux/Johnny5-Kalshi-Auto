@@ -837,3 +837,164 @@ class TestSessionDayRollover:
         assert bot.consecutive_losses == 0
         assert bot.session_state == SessionState.ACTIVE
         assert "KXBTC15M-OLD" not in bot.session_traded_tickers
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# v9.6.0 — DAILY DOUBLING GOAL
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSetDailyGoal:
+    def test_sets_start_target_and_clears_reached(self, monkeypatch):
+        monkeypatch.setattr(bot, "DAILY_GOAL_MULTIPLE", 2.0)
+        bot._daily_goal_reached = True
+        bot.set_daily_goal(22.78)
+        assert bot.daily_goal_start_balance == 22.78
+        assert bot.daily_goal_target == 45.56
+        assert bot._daily_goal_reached is False
+
+    def test_multiple_is_configurable(self, monkeypatch):
+        monkeypatch.setattr(bot, "DAILY_GOAL_MULTIPLE", 1.5)
+        bot.set_daily_goal(100.0)
+        assert bot.daily_goal_target == 150.0
+
+
+class TestDailyGoalCheck:
+    def setup_method(self):
+        bot._daily_goal_reached = False
+
+    def _silence(self, monkeypatch):
+        monkeypatch.setattr(bot.tg, "send_telegram_message", lambda *a, **k: True)
+
+    def test_disabled_is_noop(self, monkeypatch):
+        monkeypatch.setattr(bot, "DAILY_GOAL_ENABLED", False)
+        monkeypatch.setattr(bot, "daily_goal_target", 45.56)
+        assert bot.daily_goal_check(1000.0) is True
+
+    def test_below_target_allows(self, monkeypatch):
+        monkeypatch.setattr(bot, "DAILY_GOAL_ENABLED", True)
+        monkeypatch.setattr(bot, "daily_goal_target", 45.56)
+        assert bot.daily_goal_check(45.55) is True
+
+    def test_at_or_above_target_halts(self, monkeypatch):
+        self._silence(monkeypatch)
+        monkeypatch.setattr(bot, "DAILY_GOAL_ENABLED", True)
+        monkeypatch.setattr(bot, "DAILY_GOAL_PERSIST", False)  # don't write cwd
+        monkeypatch.setattr(bot, "daily_goal_start_balance", 22.78)
+        monkeypatch.setattr(bot, "daily_goal_target", 45.56)
+        assert bot.daily_goal_check(45.56) is False
+        assert bot._daily_goal_reached is True
+        # still halted once latched
+        assert bot.daily_goal_check(50.0) is False
+
+    def test_zero_target_is_noop(self, monkeypatch):
+        monkeypatch.setattr(bot, "DAILY_GOAL_ENABLED", True)
+        monkeypatch.setattr(bot, "daily_goal_target", 0.0)
+        assert bot.daily_goal_check(0.0) is True
+
+
+class TestDailyGoalStake:
+    def _cfg(self, monkeypatch, target, frac=0.40, n=5, mn=1.0, hard=0.0):
+        monkeypatch.setattr(bot, "daily_goal_target", target)
+        monkeypatch.setattr(bot, "DAILY_GOAL_MAX_STAKE_FRACTION", frac)
+        monkeypatch.setattr(bot, "DAILY_GOAL_TRADES_TO_TARGET", n)
+        monkeypatch.setattr(bot, "DAILY_GOAL_MIN_STAKE", mn)
+        monkeypatch.setattr(bot, "DAILY_GOAL_MAX_STAKE", hard)
+
+    def test_gap_over_n_within_range(self, monkeypatch):
+        # $22.78 → target $45.56, gap $22.78 ÷ 5 = $4.56 (< 40% cap of $9.11).
+        self._cfg(monkeypatch, target=45.56)
+        assert bot.daily_goal_stake(22.78) == 4.56
+
+    def test_fraction_cap_binds(self, monkeypatch):
+        # Huge gap → raw far exceeds the 40% balance cap → capped at $9.11.
+        self._cfg(monkeypatch, target=10_000.0)
+        assert bot.daily_goal_stake(22.78) == round(0.40 * 22.78, 2)
+
+    def test_hard_dollar_cap_binds(self, monkeypatch):
+        self._cfg(monkeypatch, target=10_000.0, frac=0.0, hard=10.0)
+        assert bot.daily_goal_stake(500.0) == 10.0
+
+    def test_min_stake_floor(self, monkeypatch):
+        # Tiny gap → raw below the $1 floor → floored to $1.
+        self._cfg(monkeypatch, target=101.0)
+        assert bot.daily_goal_stake(100.0) == 1.0
+
+    def test_clamped_to_cash_on_hand(self, monkeypatch):
+        # Balance below the floor → can never stake more than cash held.
+        self._cfg(monkeypatch, target=100.0)
+        assert bot.daily_goal_stake(0.50) == 0.50
+
+    def test_zero_when_target_met(self, monkeypatch):
+        self._cfg(monkeypatch, target=45.56)
+        assert bot.daily_goal_stake(45.56) == 0.0
+        assert bot.daily_goal_stake(50.0) == 0.0
+
+
+class TestKellyBetGoalMode:
+    def setup_method(self):
+        bot.recovery.active = False
+
+    def test_uses_goal_stake_when_enabled(self, monkeypatch):
+        monkeypatch.setattr(bot, "DAILY_GOAL_ENABLED", True)
+        monkeypatch.setattr(bot, "daily_goal_target", 45.56)
+        monkeypatch.setattr(bot, "DAILY_GOAL_MAX_STAKE_FRACTION", 0.40)
+        monkeypatch.setattr(bot, "DAILY_GOAL_TRADES_TO_TARGET", 5)
+        monkeypatch.setattr(bot, "DAILY_GOAL_MIN_STAKE", 1.0)
+        monkeypatch.setattr(bot, "DAILY_GOAL_MAX_STAKE", 0.0)
+        # positive edge → returns the goal-gap stake, not the flat size
+        assert bot.kelly_bet(0.70, 50, 22.78) == 4.56
+
+    def test_no_edge_still_zero_in_goal_mode(self, monkeypatch):
+        monkeypatch.setattr(bot, "DAILY_GOAL_ENABLED", True)
+        monkeypatch.setattr(bot, "daily_goal_target", 45.56)
+        assert bot.kelly_bet(0.30, 50, 22.78) == 0.0
+
+
+class TestDailyGoalPersistence:
+    def setup_method(self):
+        self.path = "/tmp/_j5_test_daily_goal.json"
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+
+    def teardown_method(self):
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+
+    def test_resumes_same_day_target(self, monkeypatch):
+        monkeypatch.setattr(bot, "DAILY_GOAL_ENABLED", True)
+        monkeypatch.setattr(bot, "DAILY_GOAL_PERSIST", True)
+        monkeypatch.setattr(bot, "DAILY_GOAL_STATE_PATH", self.path)
+        today = bot.datetime.now(bot.timezone.utc).strftime("%Y-%m-%d")
+        monkeypatch.setattr(bot, "_session_day", today)
+        # Establish the day's target off a $22.78 open, then "restart" at $40.
+        bot.set_daily_goal(22.78)
+        assert bot.daily_goal_target == 45.56
+        bot.reconcile_daily_goal_on_boot(40.0)
+        # Target must NOT move to 2×$40 — the day's goalpost is fixed.
+        assert bot.daily_goal_target == 45.56
+        assert bot.daily_goal_start_balance == 22.78
+
+    def test_fresh_target_on_new_day(self, monkeypatch):
+        monkeypatch.setattr(bot, "DAILY_GOAL_ENABLED", True)
+        monkeypatch.setattr(bot, "DAILY_GOAL_PERSIST", True)
+        monkeypatch.setattr(bot, "DAILY_GOAL_MULTIPLE", 2.0)
+        monkeypatch.setattr(bot, "DAILY_GOAL_STATE_PATH", self.path)
+        # Persist a target stamped for a PRIOR day.
+        monkeypatch.setattr(bot, "_session_day", "2026-06-01")
+        bot.set_daily_goal(22.78)
+        # Boot on a different day → re-baseline to current balance.
+        monkeypatch.setattr(bot, "_session_day",
+                            bot.datetime.now(bot.timezone.utc).strftime("%Y-%m-%d"))
+        bot.reconcile_daily_goal_on_boot(50.0)
+        assert bot.daily_goal_target == 100.0
+        assert bot.daily_goal_start_balance == 50.0
+
+    def test_disabled_is_noop(self, monkeypatch):
+        monkeypatch.setattr(bot, "DAILY_GOAL_ENABLED", False)
+        bot.daily_goal_target = 999.0
+        bot.reconcile_daily_goal_on_boot(50.0)
+        assert bot.daily_goal_target == 999.0   # untouched when disabled
