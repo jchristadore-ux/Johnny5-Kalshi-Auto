@@ -330,6 +330,11 @@ class StakeLadder:
         self.cooldown_until: float = 0.0
         self.cooldown_cycle: int   = -1   # tracker.cycles value when cooldown ends
         self.vol_spike:      bool  = False
+        # Number of upcoming settled trades during which the win-rate SIZE-UP is
+        # suppressed (multiplier capped at baseline 1.0). Downside guardrails are
+        # unaffected. Used by the bot to make the ladder re-prove its edge after a
+        # recovery-mode exit. Counts down one per settled trade.
+        self.size_up_pause_trades: int = 0
 
         if self.cfg.persist:
             self._load()
@@ -354,6 +359,13 @@ class StakeLadder:
 
         win_rate    = tracker.win_rate
         base_mult, tier = StakeManager.tier_for(win_rate)
+
+        # Size-up pause (e.g. just after a recovery-mode exit): cap the tier
+        # multiplier at baseline so a hot win-rate cannot scale the stake up
+        # until the edge is re-proven. Guards below can still demote it.
+        if self.size_up_pause_trades > 0 and base_mult > 1.0:
+            tier      = f"{tier}(size-up paused {self.size_up_pause_trades})"
+            base_mult = 1.0
 
         guard = self.guards.apply(
             base_multiplier = base_mult,
@@ -388,6 +400,10 @@ class StakeLadder:
         self.tracker.record(won)
         self.daily_pnl += float(pnl)
 
+        # A size-up pause is measured in settled trades — count this one down.
+        if self.size_up_pause_trades > 0:
+            self.size_up_pause_trades -= 1
+
         if not won:
             # Cooling: after a loss, hold at baseline for a time delay AND at
             # least `cooldown_cycles` trade cycles (whichever is longer). This
@@ -410,6 +426,24 @@ class StakeLadder:
     def set_vol_spike(self, active: bool) -> None:
         """Feed an external volatility-spike flag (caps stake at baseline)."""
         self.vol_spike = bool(active)
+
+    def pause_size_up(self, n_trades: int) -> None:
+        """Suppress the win-rate SIZE-UP for the next ``n_trades`` settled
+        trades (multiplier capped at baseline 1.0). Downside guardrails — loss
+        streak demote, drawdown, vol-spike, cooldown — remain fully active.
+
+        Used after a recovery-mode exit so the ladder re-proves its edge on
+        fresh data before it can scale the stake back above baseline. Extends
+        (never shortens) any pause already in effect.
+        """
+        n = max(0, int(n_trades))
+        if n <= 0:
+            return
+        self.size_up_pause_trades = max(self.size_up_pause_trades, n)
+        log.info("LADDER │ size-up paused for next %d settled trades.",
+                 self.size_up_pause_trades)
+        if self.cfg.persist:
+            self._save()
 
     def reset_daily(self) -> None:
         self.daily_pnl = 0.0
@@ -444,6 +478,7 @@ class StakeLadder:
                     "daily_key":      self.daily_key,
                     "cooldown_until": self.cooldown_until,
                     "cooldown_cycle": self.cooldown_cycle,
+                    "size_up_pause_trades": self.size_up_pause_trades,
                 }, f)
         except OSError as e:
             log.warning("LADDER │ state save failed: %s", e)
@@ -459,6 +494,7 @@ class StakeLadder:
         self.daily_key      = d.get("daily_key", self._today())
         self.cooldown_until = float(d.get("cooldown_until", 0.0))
         self.cooldown_cycle = int(d.get("cooldown_cycle", -1))
+        self.size_up_pause_trades = int(d.get("size_up_pause_trades", 0))
         # A persisted daily_pnl from a previous UTC day must not linger.
         self._roll_day_if_needed()
 
